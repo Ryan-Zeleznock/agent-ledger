@@ -11,6 +11,7 @@ const LOADERS = {
   report: () => import("../src/report/contract.js"),
   upstream: () => import("../src/upstream/contract.js"),
   front: () => import("../src/front/contract.js"),
+  hooks: () => import("../src/hooks/contract.js"),
   pipeline: () => import("../src/pipeline/contract.js"),
 } as const;
 const MODULES = Object.keys(LOADERS) as (keyof typeof LOADERS)[];
