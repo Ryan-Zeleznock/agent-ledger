@@ -24,26 +24,44 @@ export interface ToolCall {
 
 // ---------- Server identity: built-in tools live in a namespace MCP can never produce (spec §8) ----------
 
+/** The coding agents whose hooks the collector understands (spec §3; ADR-005 added Codex). */
+export const HOOK_AGENTS = ["claude-code", "codex"] as const;
+export type HookAgent = (typeof HOOK_AGENTS)[number];
 /**
- * Registry-key namespace for an agent runtime's built-in tools. The separator is `:`, which Claude Code strips
- * from every MCP callable name: `claude mcp add` accepts only `[A-Za-z0-9_-]` in a server name, and any other
- * character in a plugin or configured server name is replaced with `_` before the `mcp__<server>__<tool>`
- * name reaches a hook (https://code.claude.com/docs/en/mcp, read 2026-09-29). So no `mcp__...` tool name
- * can ever split into a server segment containing `:`, and `mcp__claude-code__Read` maps to server
- * `claude-code`, never to BUILTIN_SERVER.
+ * Registry-key namespace for an agent runtime's built-in tools. The separator is `:`, which neither agent lets
+ * through to a hook's `mcp__<server>__<tool>` name (both verified 2026-09-29):
+ * - Claude Code: `claude mcp add` accepts only `[A-Za-z0-9_-]` in a server name and any other character in a
+ *   plugin or configured server name is replaced with `_` (https://code.claude.com/docs/en/mcp).
+ * - Codex: `codex mcp add` accepts `[A-Za-z0-9_:@/.-]`, so `builtin:codex` IS a legal raw server name there, but
+ *   the hook sees the model-visible name, built by `sanitize_responses_api_tool_name`, which keeps only ASCII
+ *   alphanumerics and `_` and replaces everything else (`:` and even `-`) with `_`, then adds `mcp__`
+ *   (codex-rs/codex-mcp/src/mcp/mod.rs, codex-rs/core/src/tools/handlers/mcp.rs). So `builtin:codex` arrives as
+ *   `mcp__builtin_codex__<tool>`: server `builtin_codex`, which normalises to a RESERVED name and is refused.
+ * So no `mcp__...` tool name from either agent can split into a server segment containing `:`.
  */
 export const BUILTIN_NAMESPACE = "builtin:" as const;
-/** Claude Code's own tools (Read, Edit, Bash, ...), as the hook collector names them. The only legal registry key with a `:`. */
-export const BUILTIN_SERVER = "builtin:claude-code" as const;
-/** What an MCP server name may look like in Claude Code. A registry key that is not BUILTIN_SERVER must match. */
+/** One reserved key per agent: its built-in tools (Bash, Edit, apply_patch, ...), as that agent's hook names them. */
+export const BUILTIN_SERVERS = { "claude-code": "builtin:claude-code", codex: "builtin:codex" } as const satisfies Record<HookAgent, `${typeof BUILTIN_NAMESPACE}${HookAgent}`>;
+export const BUILTIN_SERVER_KEYS = [BUILTIN_SERVERS["claude-code"], BUILTIN_SERVERS.codex] as const;
+export type BuiltinServer = (typeof BUILTIN_SERVER_KEYS)[number];
+/** Claude Code's own tools (Read, Edit, Bash, ...). Kept as the short name; equals BUILTIN_SERVERS["claude-code"]. */
+export const BUILTIN_SERVER = BUILTIN_SERVERS["claude-code"];
+/** Codex's own tools (Bash, apply_patch, update_plan, ...). Equals BUILTIN_SERVERS.codex. */
+export const BUILTIN_CODEX_SERVER = BUILTIN_SERVERS.codex;
+/**
+ * What an MCP server segment may look like in a hook's tool name. Claude Code: `[A-Za-z0-9_-]`; Codex: the subset
+ * `[A-Za-z0-9_]` (its sanitiser turns `-` into `_`, so a Codex registry key is written the sanitised way, e.g.
+ * `brave_search`). A registry key that is not in BUILTIN_SERVER_KEYS must match.
+ */
 export const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]+$/;
 /**
- * Names that collide with the built-in namespace once normalised. Normalisation = lowercase, then drop every
- * character outside [a-z0-9]. `claude-code`, `Claude_Code`, `builtin_claude-code`, `builtin:claude-code` and
- * `mcp__builtin_claude-code__Bash`'s server segment all land here. The loader refuses such a key; the hook
- * collector refuses (throws → supervisor deny) a call whose MCP server segment normalises to one of them.
+ * Names that collide with a built-in namespace once normalised. Normalisation = lowercase, then drop every
+ * character outside [a-z0-9]. `claude-code`, `Claude_Code`, `builtin_claude-code`, `codex`, `builtin_codex`,
+ * `builtin:codex` and the server segment of `mcp__builtin_codex__Bash` all land here. The loader refuses such a
+ * key; the hook collector refuses (throws → watchdog deny) a call whose MCP server segment normalises to one of
+ * them, under EITHER agent (a Codex MCP server named `claude-code` is refused too, and vice versa).
  */
-export const RESERVED_SERVER_NAMES = ["claudecode", "builtinclaudecode"] as const;
+export const RESERVED_SERVER_NAMES = ["claudecode", "builtinclaudecode", "codex", "builtincodex"] as const;
 /**
  * Object keys the registry loader refuses for servers and tools, on top of anything that is `in Object.prototype`.
  * Lookups use own properties only (`Object.hasOwn` or Map), so `github/constructor` is unreviewed, not a hit.

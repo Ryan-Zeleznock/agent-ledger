@@ -3,7 +3,9 @@
 // (ADR-002); when they land, the tables move onto them and this file is deleted (test/todo/policy.todo.md).
 import { CLASS_DECISION, CLASS_RANK, TOOL_CLASSES, type ToolClass, type ToolEntry, type ToolRegistry } from "../../src/policy/contract.js";
 import { MCP_TOOL_PREFIX } from "../../src/hooks/contract.js";
-import { BUILTIN_SERVER, MCP_SERVER_NAME_RE, RESERVED_KEYS, RESERVED_SERVER_NAMES, type PolicyDecision } from "../../src/types/index.js";
+import { BUILTIN_SERVERS, BUILTIN_SERVER_KEYS, MCP_SERVER_NAME_RE, RESERVED_KEYS, RESERVED_SERVER_NAMES, type HookAgent, type PolicyDecision } from "../../src/types/index.js";
+
+const isBuiltinKey = (server: string) => (BUILTIN_SERVER_KEYS as readonly string[]).includes(server);
 
 export type Args = Record<string, unknown>;
 const re = (p: string) => new RegExp(p, "i");
@@ -24,7 +26,7 @@ export function validate(reg: ToolRegistry): string[] {
   const seenServers = new Map<string, string>();
   for (const [server, s] of Object.entries(reg.servers)) {
     if (isReservedKey(server)) problems.push(`${server}: reserved key`);
-    if (server !== BUILTIN_SERVER) {
+    if (!isBuiltinKey(server)) {
       if (!MCP_SERVER_NAME_RE.test(server)) problems.push(`${server}: not an MCP server name`);
       if (isReservedServerName(server)) problems.push(`${server}: collides with the builtin namespace`);
     }
@@ -69,10 +71,10 @@ export function decide(reg: ToolRegistry, server: string, tool: string, args: Ar
 
 /**
  * hooks.toIncomingCall naming rule: `mcp__<server>__<tool>` splits at the first `__` after the prefix; a server
- * segment that normalises to a reserved name throws; `mcp_server` without the prefix throws; anything else is
- * a built-in on BUILTIN_SERVER.
+ * segment that normalises to a reserved name throws (either agent's reserved names, under either agent);
+ * `mcp_server` without the prefix throws (Claude Code only); anything else is a built-in on BUILTIN_SERVERS[agent].
  */
-export function splitToolName(toolName: string, hasMcpProvenance = false): { server: string; tool: string } {
+export function splitToolName(toolName: string, hasMcpProvenance = false, agent: HookAgent = "claude-code"): { server: string; tool: string } {
   if (toolName.startsWith(MCP_TOOL_PREFIX)) {
     const rest = toolName.slice(MCP_TOOL_PREFIX.length);
     const i = rest.indexOf("__");
@@ -82,5 +84,5 @@ export function splitToolName(toolName: string, hasMcpProvenance = false): { ser
     return { server, tool };
   }
   if (hasMcpProvenance) throw new Error(`mcp_server present on a non-MCP tool name: ${toolName}`);
-  return { server: BUILTIN_SERVER, tool: toolName };
+  return { server: BUILTIN_SERVERS[agent], tool: toolName };
 }

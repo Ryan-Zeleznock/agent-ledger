@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
-  APPROVAL_DECISIONS, BUILTIN_NAMESPACE, BUILTIN_SERVER, HOOK_DECISIONS, RESERVED_KEYS, RESERVED_SERVER_NAMES, RISKS, VERDICTS,
-  type ApprovalChannel, type ApprovalResult, type HookDecision, type IncomingCall, type LedgerRecord, type ToolCall, type ToolInfo, type UnsealedRecord,
+  APPROVAL_DECISIONS, BUILTIN_CODEX_SERVER, BUILTIN_NAMESPACE, BUILTIN_SERVER, BUILTIN_SERVERS, BUILTIN_SERVER_KEYS, HOOK_AGENTS, HOOK_DECISIONS,
+  RESERVED_KEYS, RESERVED_SERVER_NAMES, RISKS, VERDICTS,
+  type ApprovalChannel, type ApprovalResult, type HookAgent, type HookDecision, type IncomingCall, type LedgerRecord, type ToolCall, type ToolInfo, type UnsealedRecord,
 } from "../src/types/index.js";
 import { notImplemented } from "../src/types/not-implemented.js";
 
@@ -53,11 +54,17 @@ describe("types", () => {
     const delegated: ApprovalResult = { callId: "c1", decision: "delegated", decidedAt: "2026-09-29T00:00:00Z", channel: "hook-ask" };
     expect([down.decision, delegated.channel]).toEqual(["unavailable", "hook-ask"]);
   });
-  it("exports the reserved identity constants (Astra spec v2 findings 1 and 3)", () => {
+  it("exports the reserved identity constants (Astra spec v2 findings 1 and 3; ADR-005 Codex)", () => {
     expect(BUILTIN_SERVER).toBe("builtin:claude-code");
     expect(BUILTIN_SERVER.startsWith(BUILTIN_NAMESPACE)).toBe(true);
+    expect(HOOK_AGENTS).toEqual(["claude-code", "codex"]);
+    expect(BUILTIN_SERVERS).toEqual({ "claude-code": "builtin:claude-code", codex: "builtin:codex" });
+    expect(BUILTIN_SERVER_KEYS).toEqual(["builtin:claude-code", "builtin:codex"]);
+    for (const k of BUILTIN_SERVER_KEYS) expect(k.startsWith(BUILTIN_NAMESPACE), k).toBe(true);
+    const agent: HookAgent = "codex";
+    expect(BUILTIN_SERVERS[agent]).toBe(BUILTIN_CODEX_SERVER);
     expect(RESERVED_KEYS).toEqual(["__proto__", "constructor", "prototype"]);
-    expect(RESERVED_SERVER_NAMES).toEqual(["claudecode", "builtinclaudecode"]);
+    expect(RESERVED_SERVER_NAMES).toEqual(["claudecode", "builtinclaudecode", "codex", "builtincodex"]);
   });
   it("LedgerRecord shape compiles, with the chain fields the ledger seals", () => {
     const unsealed: UnsealedRecord = {

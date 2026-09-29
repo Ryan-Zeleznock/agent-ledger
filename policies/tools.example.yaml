@@ -41,8 +41,8 @@ servers:
   # Claude Code's built-in tools, which never touch MCP. The key lives in the reserved `builtin:` namespace: MCP
   # server names can only contain [A-Za-z0-9_-] (anything else becomes `_` in the mcp__<server>__<tool> name), so
   # no MCP tool can ever map here. `mcp__claude-code__Read` is server `claude-code`, an unrelated MCP server, and
-  # the loader refuses a server key that even normalises to `claude-code` or `builtin-claude-code`. Keys are
-  # case-sensitive; two keys that differ only by case are refused too.
+  # the loader refuses a server key that even normalises to `claude-code`, `builtin-claude-code`, `codex` or
+  # `builtin-codex`. Keys are case-sensitive; two keys that differ only by case are refused too.
   "builtin:claude-code":
     trusted: true
     tools:
@@ -78,3 +78,30 @@ servers:
         note: >
           A shell can do anything (rm -rf, git push --force, curl | sh), and its intent is not visible from the
           tool name, so the whole tool is risky. Per-command carve-outs are a later, reviewed feature, not a regex.
+  # Codex's built-in tools (ADR-005), named as Codex's hooks name them (verified 2026-09-29 at
+  # https://learn.chatgpt.com/docs/hooks "Tool coverage" and "PreToolUse"). Same reserved namespace: Codex's own
+  # `codex mcp add` allows `:` in a raw server name, but every hook-visible MCP name is sanitised to [A-Za-z0-9_]
+  # first, so a server named `builtin:codex` reaches a hook as `mcp__builtin_codex__<tool>` and is refused. Codex MCP
+  # registry keys are therefore written in sanitised form (`brave_search`, not `brave-search`).
+  # Note: `Edit` and `Write` are matcher aliases in Codex config; the event always says `apply_patch`, so that is the
+  # row. Hosted tools (WebSearch) never reach hooks and cannot be listed. There is no PostToolUseFailure in Codex.
+  "builtin:codex":
+    trusted: true
+    tools:
+      update_plan:
+        class: read
+        reviewedBy: ryan
+        reviewedAt: 2026-09-29
+        note: Updates the agent's visible plan only; touches no file and no network.
+      apply_patch:
+        class: write
+        reviewedBy: ryan
+        reviewedAt: 2026-09-29
+        note: All file edits in Codex go through apply_patch (tool_input.command carries the patch). Logged, no approval.
+      Bash:
+        class: risky
+        reviewedBy: ryan
+        reviewedAt: 2026-09-29
+        note: >
+          Shell commands and unified exec (exec_command) both arrive as Bash. Same reasoning as Claude Code's Bash.
+          Under Codex, risky means DENY unless a Slack approval channel is configured: Codex hooks cannot "ask".

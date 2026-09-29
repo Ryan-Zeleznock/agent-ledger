@@ -29,8 +29,8 @@ export interface ServerEntry {
 }
 /**
  * Server keys are matched CASE-SENSITIVELY and by own property only (`Object.hasOwn`, or a Map built by the loader).
- * A key is either exactly BUILTIN_SERVER (`builtin:claude-code`, the one legal key with a `:`) or an MCP server
- * name matching MCP_SERVER_NAME_RE. See loadRegistry for what is refused.
+ * A key is either exactly one of BUILTIN_SERVER_KEYS (`builtin:claude-code`, `builtin:codex`: the only legal keys with
+ * a `:`) or an MCP server name matching MCP_SERVER_NAME_RE. See loadRegistry for what is refused.
  */
 export interface ToolRegistry { version: 1; servers: Record<string, ServerEntry>; }
 
@@ -50,9 +50,10 @@ export const CLASS_DECISION: Record<ToolClass, Pick<PolicyDecision, "verdict" | 
  * - unknown version, an unknown field, a class outside TOOL_CLASSES, a missing reviewedBy/reviewedAt;
  * - an escalation whose `to` does not rank above the row's class;
  * - a server or tool key in RESERVED_KEYS (`__proto__`, `constructor`, `prototype`) or `in Object.prototype`;
- * - a server key that is neither BUILTIN_SERVER nor a match for MCP_SERVER_NAME_RE (so any other `:` is refused);
- * - a server key that is not BUILTIN_SERVER but normalises (lowercase, strip non-[a-z0-9]) to a name in
- *   RESERVED_SERVER_NAMES: `claude-code`, `Claude_Code`, `builtin_claude-code` are all impersonations;
+ * - a server key that is neither in BUILTIN_SERVER_KEYS nor a match for MCP_SERVER_NAME_RE (so any other `:` is refused);
+ * - a server key that is not in BUILTIN_SERVER_KEYS but normalises (lowercase, strip non-[a-z0-9]) to a name in
+ *   RESERVED_SERVER_NAMES: `claude-code`, `Claude_Code`, `builtin_claude-code`, `codex`, `builtin_codex` are all
+ *   impersonations, whichever agent the registry serves;
  * - two server keys, or two tool keys under one server, that are equal case-insensitively (`github` + `GitHub`).
  *   Lookups stay case-sensitive; the refusal exists so a case twin can never be mistaken for a reviewed row.
  */
