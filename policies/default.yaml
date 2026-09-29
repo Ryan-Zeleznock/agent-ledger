@@ -1,6 +1,23 @@
 version: 1
-defaultVerdict: allow
+# Rules are evaluated top to bottom; the first match wins. Unmatched calls get defaultDecision.
+defaultDecision:
+  verdict: allow
+  risk: write
+  ruleId: default
+  reason: Unclassified action, logged
 rules:
+  # Read tools first, so a name like list_roles or get_deploy_status is never escalated by the risky rules.
+  - id: read-only
+    match: { tool: "^(get|list|read|search|describe|fetch|query)_" }
+    verdict: allow
+    risk: read
+    reason: Read-only action, logged
+  # Nonprod exception before risky-prod-deploy: only a known nonprod environment is allowed through.
+  - id: nonprod-deploy
+    match: { tool: "(deploy|release|merge)", argPattern: { environment: "^(dev|development|test|staging|sandbox)$" } }
+    verdict: allow
+    risk: write
+    reason: Deploy to a nonprod environment, logged
   - id: risky-delete
     match: { tool: "(delete|remove|destroy|drop|purge)" }
     verdict: require_approval
@@ -21,11 +38,12 @@ rules:
     verdict: require_approval
     risk: risky
     reason: Permission change
+  # No argPattern: a deploy with an unknown, missing, or prod environment requires approval.
   - id: risky-prod-deploy
-    match: { tool: "(deploy|release|merge)", argPattern: { environment: "^prod" } }
+    match: { tool: "(deploy|release|merge)" }
     verdict: require_approval
     risk: risky
-    reason: Production change
+    reason: Production or unknown-environment change
   - id: default-write
     match: { tool: "(create|update|write|edit|put|set)" }
     verdict: allow
