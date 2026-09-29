@@ -1,9 +1,13 @@
 # hooks
-**Job:** Turn a Claude Code `PreToolUse` / `PostToolUse` hook event (stdin JSON) into an `IncomingCall`, and turn the pipeline's `HookDecision` back into the exact `hookSpecificOutput` JSON Claude Code expects
+**Job:** Turn a Claude Code `PreToolUse` / `PostToolUse` / `PostToolUseFailure` hook event (stdin JSON) into an `IncomingCall` or an `Outcome`, turn the pipeline's `HookDecision` back into the exact `hookSpecificOutput` JSON Claude Code expects, and run the PreToolUse handler under a fail-closed supervisor
 **Depends on:** types only (the pipeline is wired in by the `hook` command after Gate 2, not by import)
 **Does NOT:** decide anything, execute tools, or read the registry
-**Spec:** docs/spec.md §3, 6
+**Spec:** docs/spec.md §3, 6, 7
 
 Why it exists: an MCP proxy never sees Claude Code's built-in tools (Bash, Edit, Write, WebFetch). Hooks fire for every tool, built-in and MCP, and can be enforced through managed settings (`allowManagedHooksOnly`). Local mode is therefore hook collector + MCP proxy.
 
-Wire format verified 2026-09-29 against https://code.claude.com/docs/en/hooks; fixtures in `test/fixtures/claude-code-*.json` pin it. Built-in tools map to server `claude-code`; `mcp__<server>__<tool>` maps to `<server>/<tool>`.
+Wire format verified 2026-09-29 against https://code.claude.com/docs/en/hooks; fixtures in `test/fixtures/claude-code-*.json` pin it (PreToolUse, PostToolUse, PostToolUseFailure).
+
+**Naming.** Built-in tools map to server `builtin:claude-code` (`BUILTIN_SERVER`). `mcp__<server>__<tool>` maps to `<server>/<tool>`, server segment verbatim. MCP can never produce a `:` in a server segment (Claude Code allows only `[A-Za-z0-9_-]` in server names and rewrites anything else to `_`, https://code.claude.com/docs/en/mcp), so `mcp__claude-code__Read` is `claude-code/Read`, an unreviewed MCP tool, never a built-in. A server segment that normalises to `claudecode` or `builtinclaudecode` is refused outright (throw → deny). A tool event with `mcp_server` provenance but no `mcp__` prefix is refused too.
+
+**Fail-closed supervisor** (`runHookSupervised`). Verified: for PreToolUse only exit 2 or a JSON `deny` blocks; exit 0 without a decision, exit 1, other codes, unparseable stdout, a timed-out hook, and a hook that can't start all let the call continue. So the `hook` command never runs a handler bare: the supervisor turns a thrown error, malformed stdin, an unhandled rejection, or a missed internal deadline (`DEFAULT_DEADLINE_MS`, below the configured `timeout` of `HOOK_TIMEOUT_S`) into a JSON deny **plus exit 2**. Residual limits it cannot close: a missing or non-executable binary and a process killed by the OS produce no output, and Claude Code continues. Mitigation is outside the hook: managed settings with `allowManagedHooksOnly` (https://code.claude.com/docs/en/settings-reference#allowmanagedhooksonly) so the hook entry can't be removed by the user, plus a `SessionStart` health check that records a heartbeat in the ledger so a session with tool calls and no heartbeat stands out in the report.
