@@ -27,7 +27,15 @@ export interface ServerEntry {
   trusted: boolean;
   tools: Record<string, ToolEntry>;
 }
+/**
+ * Server keys are matched CASE-SENSITIVELY and by own property only (`Object.hasOwn`, or a Map built by the loader).
+ * A key is either exactly BUILTIN_SERVER (`builtin:claude-code`, the one legal key with a `:`) or an MCP server
+ * name matching MCP_SERVER_NAME_RE. See loadRegistry for what is refused.
+ */
 export interface ToolRegistry { version: 1; servers: Record<string, ServerEntry>; }
+
+/** Key normalisation used only for collision checks: lowercase, then drop every character outside [a-z0-9]. */
+export const NORMALISE_FOR_COLLISION = "lowercase; strip /[^a-z0-9]/g" as const;
 
 /** Verdict and risk for each effective class. Unknown server or tool -> require_approval / unreviewed. */
 export const CLASS_DECISION: Record<ToolClass, Pick<PolicyDecision, "verdict" | "risk">> = {
@@ -37,15 +45,25 @@ export const CLASS_DECISION: Record<ToolClass, Pick<PolicyDecision, "verdict" | 
 };
 
 /**
- * Parses and validates the YAML registry. Refuses to load (throws) on: unknown version, an unknown field, a class
- * outside TOOL_CLASSES, a missing reviewedBy/reviewedAt, or an escalation whose `to` does not rank above the row's class.
+ * Parses and validates the YAML registry (parsed with the yaml library's `mapAsMap` so no key ever lands on an
+ * object prototype; duplicate YAML keys are already a parse error). Refuses to load (throws) on:
+ * - unknown version, an unknown field, a class outside TOOL_CLASSES, a missing reviewedBy/reviewedAt;
+ * - an escalation whose `to` does not rank above the row's class;
+ * - a server or tool key in RESERVED_KEYS (`__proto__`, `constructor`, `prototype`) or `in Object.prototype`;
+ * - a server key that is neither BUILTIN_SERVER nor a match for MCP_SERVER_NAME_RE (so any other `:` is refused);
+ * - a server key that is not BUILTIN_SERVER but normalises (lowercase, strip non-[a-z0-9]) to a name in
+ *   RESERVED_SERVER_NAMES: `claude-code`, `Claude_Code`, `builtin_claude-code` are all impersonations;
+ * - two server keys, or two tool keys under one server, that are equal case-insensitively (`github` + `GitHub`).
+ *   Lookups stay case-sensitive; the refusal exists so a case twin can never be mistaken for a reviewed row.
  */
 export function loadRegistry(path: string): Promise<ToolRegistry> { throw notImplemented("policy.loadRegistry"); }
 
 /**
  * ruleId is `registry:<server>/<tool>` for a plain row, `registry:<server>/<tool>#escalate:<index>` when an
  * escalation fired, and `unreviewed:<server>/<tool>` when the server or the tool is not in the registry.
- * Invariant: the effective class is max(row.class, every matching escalation.to). Nothing downgrades.
+ * Lookups are exact, case-sensitive, own-property only (`Object.hasOwn`): a `server` or `tool` of `constructor`,
+ * `__proto__`, or `toString` is unreviewed, and `claude-code/Read` (an MCP server named claude-code) never sees the
+ * `builtin:claude-code` rows. Invariant: the effective class is max(row.class, every matching escalation.to).
  */
 export function evaluate(registry: ToolRegistry, call: ToolCall): PolicyDecision { throw notImplemented("policy.evaluate"); }
 

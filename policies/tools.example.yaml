@@ -38,9 +38,12 @@ servers:
         escalateWhen:
           - argPattern: { branch: "^(main|master|release/.*)$" }
             to: risky
-  # Pseudo-server for Claude Code's built-in tools, which never touch MCP. The hook collector (src/hooks/) maps
-  # a built-in tool_name to server "claude-code" and a tool_name of the form mcp__<server>__<tool> to <server>/<tool>.
-  claude-code:
+  # Claude Code's built-in tools, which never touch MCP. The key lives in the reserved `builtin:` namespace: MCP
+  # server names can only contain [A-Za-z0-9_-] (anything else becomes `_` in the mcp__<server>__<tool> name), so
+  # no MCP tool can ever map here. `mcp__claude-code__Read` is server `claude-code`, an unrelated MCP server, and
+  # the loader refuses a server key that even normalises to `claude-code` or `builtin-claude-code`. Keys are
+  # case-sensitive; two keys that differ only by case are refused too.
+  "builtin:claude-code":
     trusted: true
     tools:
       Read:

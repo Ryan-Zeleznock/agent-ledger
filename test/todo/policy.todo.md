@@ -1,10 +1,14 @@
 # policy: tests to write after Gate 2
 - [ ] `loadRegistry` parses policies/tools.example.yaml and refuses: unknown version, unknown field, class outside read|write|risky, missing reviewedBy/reviewedAt, duplicate tool (YAML), escalation `to` not above the base class (write→write, risky→write)
+- [ ] `loadRegistry` refuses reserved keys (Astra spec v2 #3): server or tool named `__proto__`, `constructor`, `prototype`, `toString`, `hasOwnProperty`; the parsed structure has no key on any prototype (parse with `mapAsMap`, or assert `Object.getPrototypeOf(servers) === Object.prototype` and every key is own)
+- [ ] `loadRegistry` refuses namespace impersonation (Astra spec v2 #1): server keys `claude-code`, `Claude_Code`, `builtin_claude-code`, `builtin-claude-code`, `Builtin:claude-code`, `builtin:codex` (any `:` other than the exact `builtin:claude-code`), and any key failing `MCP_SERVER_NAME_RE`; accepts `claude-code-helper`
+- [ ] `loadRegistry` refuses two server keys, or two tool keys under one server, equal case-insensitively (`github`/`GitHub`, `Read`/`read`)
 - [ ] `evaluate`: unknown server → require_approval/unreviewed, ruleId `unreviewed:<server>/<tool>`; unknown tool on a known server → same
+- [ ] `evaluate` is own-property and case-sensitive: `github/constructor`, `github/__proto__`, `github/toString`, server `constructor`, server `__proto__`, `GitHub/list_repos`, `github/List_Repos` → unreviewed; `claude-code/Read` (an MCP server) never sees the `builtin:claude-code` rows
 - [ ] `evaluate`: reviewed read → allow/read; write → allow/write; risky → require_approval/risky; ruleId `registry:<server>/<tool>`
-- [ ] `evaluate`: escalateWhen with every argPattern matching raises write→risky and names `#escalate:<i>`; a partial match does not; a missing arg never matches; arguments never lower a class (`deploy_production({environment:"dev"})` on a risky row stays risky)
+- [ ] `evaluate`: escalateWhen with every argPattern matching raises write→risky and names `#escalate:<i>`; a partial match does not; a missing arg never matches; an argPattern key that is a prototype name matches only an own argument; arguments never lower a class (`deploy_production({environment:"dev"})` on a risky row stays risky)
 - [ ] `evaluate` ignores `trusted` (a trusted server's unreviewed tool is still unreviewed)
 - [ ] regression rows (Astra round 2): `get_then_deploy`, `wipe_bucket`, `terminate_instance`, `push_to_main`, `deploy_production({environment:"dev"})` on servers/tools not in the registry → require_approval/unreviewed
-- [ ] the registry table in test/registry.test.ts moves onto the real evaluate() and the test-only helper is deleted
+- [ ] the registry table in test/registry.test.ts moves onto the real loadRegistry/evaluate and test/helpers/registry-eval.ts is deleted
 - [ ] `suggestClass`: name pattern only for untrusted servers (annotations ignored even when present); annotations join for trusted servers; disagreement → higher class, both sources listed; no match → default (risky)
 - [ ] `suggestClass` output is never written to the registry by any code path (reviewedBy is required and comes from a human)

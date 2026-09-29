@@ -1,53 +1,21 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { parse } from "yaml";
-import { CLASS_DECISION, CLASS_RANK, TOOL_CLASSES, type Escalation, type ToolClass, type ToolEntry, type ToolRegistry } from "../src/policy/contract.js";
-import type { PolicyDecision } from "../src/types/index.js";
+import { CLASS_DECISION, CLASS_RANK, type Escalation, type ToolClass, type ToolRegistry } from "../src/policy/contract.js";
+import { BUILTIN_SERVER, MCP_SERVER_NAME_RE, RESERVED_KEYS, RESERVED_SERVER_NAMES } from "../src/types/index.js";
+import { decide, isReservedKey, isReservedServerName, normalise, splitToolName, validate, type Args } from "./helpers/registry-eval.js";
 
-// TEST-ONLY validator + evaluator over the real registry YAML, mirroring the contract's documented semantics. The
-// product functions (src/policy loadRegistry/evaluate) stay stubs until Gate 2 (ADR-002); when they land, the
-// tables below move onto them and these helpers go away (test/todo/policy.todo.md).
-type Args = Record<string, unknown>;
-const re = (p: string) => new RegExp(p, "i");
-const argsMatch = (patterns: Record<string, string>, args: Args) =>
-  Object.entries(patterns).every(([k, p]) => k in args && re(p).test(String(args[k])));
-const isClass = (c: unknown): c is ToolClass => (TOOL_CLASSES as readonly unknown[]).includes(c);
-
-/** Schema check for the invariant "nothing downgrades": returns the problems a loader would refuse on. */
-function validate(reg: ToolRegistry): string[] {
-  const problems: string[] = [];
-  if (reg.version !== 1) problems.push("version");
-  for (const [server, s] of Object.entries(reg.servers)) {
-    if (typeof s.trusted !== "boolean") problems.push(`${server}: trusted`);
-    for (const [tool, t] of Object.entries(s.tools)) {
-      const at = `${server}/${tool}`;
-      if (!isClass(t.class)) problems.push(`${at}: class`);
-      if (!t.reviewedBy || !t.reviewedAt) problems.push(`${at}: review`);
-      for (const [i, e] of (t.escalateWhen ?? []).entries()) {
-        if (!isClass(e.to) || !isClass(t.class) || CLASS_RANK[e.to] <= CLASS_RANK[t.class]) problems.push(`${at}#escalate:${i}: to must rank above ${t.class}`);
-      }
-    }
-  }
-  return problems;
-}
-
-function decide(reg: ToolRegistry, server: string, tool: string, args: Args = {}): PolicyDecision {
-  const row: ToolEntry | undefined = reg.servers[server]?.tools[tool];
-  if (!row) return { verdict: "require_approval", risk: "unreviewed", ruleId: `unreviewed:${server}/${tool}`, reason: "Tool not in the reviewed registry" };
-  let cls: ToolClass = row.class;
-  let ruleId = `registry:${server}/${tool}`;
-  for (const [i, e] of (row.escalateWhen ?? []).entries()) {
-    if (argsMatch(e.argPattern, args) && CLASS_RANK[e.to] > CLASS_RANK[cls]) { cls = e.to; ruleId = `registry:${server}/${tool}#escalate:${i}`; }
-  }
-  return { ...CLASS_DECISION[cls], ruleId, reason: row.note ?? `Reviewed ${cls} by ${row.reviewedBy}` };
-}
-
+// Tables over the real registry YAML through the TEST-ONLY evaluator in test/helpers/registry-eval.ts, which
+// mirrors the contracts' documented semantics. Product functions stay stubs until Gate 2 (ADR-002).
 const registry = parse(readFileSync("policies/tools.example.yaml", "utf8")) as ToolRegistry;
+const row = (cls: ToolClass = "read", extra: object = {}) => ({ class: cls, reviewedBy: "ryan", reviewedAt: "2026-09-29", ...extra });
+const reg = (servers: ToolRegistry["servers"]): ToolRegistry => ({ version: 1, servers });
 
 describe("policies/tools.example.yaml (ADR-004 registry)", () => {
-  it("parses as version 1 with the github and claude-code servers", () => {
+  it("parses as version 1 with the github server and the builtin:claude-code pseudo-server", () => {
     expect(registry.version).toBe(1);
-    expect(Object.keys(registry.servers).sort()).toEqual(["claude-code", "github"]);
+    expect(Object.keys(registry.servers).sort()).toEqual([BUILTIN_SERVER, "github"]);
+    expect(BUILTIN_SERVER).toBe("builtin:claude-code");
     expect(registry.servers["github"]!.trusted).toBe(true);
   });
   it("every row has a reviewer, a date, and a known class; the example validates", () => {
@@ -58,7 +26,7 @@ describe("policies/tools.example.yaml (ADR-004 registry)", () => {
     }
   });
   it("classifies the example rows as documented", () => {
-    const gh = registry.servers["github"]!.tools, cc = registry.servers["claude-code"]!.tools;
+    const gh = registry.servers["github"]!.tools, cc = registry.servers[BUILTIN_SERVER]!.tools;
     expect(gh["list_repos"]!.class).toBe("read");
     expect(gh["create_issue"]!.class).toBe("write");
     expect(gh["delete_repo"]!.class).toBe("risky");
@@ -79,24 +47,63 @@ describe("policies/tools.example.yaml (ADR-004 registry)", () => {
   });
 
   describe("schema rejects downgrades (the loader refuses these registries)", () => {
-    const withEscalation = (cls: ToolClass, to: Escalation["to"]): ToolRegistry => ({
-      version: 1,
-      servers: { s: { trusted: false, tools: { t: { class: cls, reviewedBy: "ryan", reviewedAt: "2026-09-29", escalateWhen: [{ argPattern: { env: "dev" }, to }] } } } },
-    });
+    const withEscalation = (cls: ToolClass, to: Escalation["to"]) => reg({ s: { trusted: false, tools: { t: row(cls, { escalateWhen: [{ argPattern: { env: "dev" }, to }] }) } } });
     it("write -> write is refused (no-op escalation)", () => { expect(validate(withEscalation("write", "write"))).toEqual(["s/t#escalate:0: to must rank above write"]); });
     it("risky -> write is refused (would lower)", () => { expect(validate(withEscalation("risky", "write"))).toEqual(["s/t#escalate:0: to must rank above risky"]); });
     it("risky -> risky is refused", () => { expect(validate(withEscalation("risky", "risky")).length).toBe(1); });
     it("`to: read` is not a legal escalation target at all", () => {
-      const bad = withEscalation("write", "read" as unknown as Escalation["to"]);
-      expect(validate(bad).length).toBe(1);
+      expect(validate(withEscalation("write", "read" as unknown as Escalation["to"])).length).toBe(1);
     });
     it("read -> write and write -> risky are accepted", () => {
       expect(validate(withEscalation("read", "write"))).toEqual([]);
       expect(validate(withEscalation("write", "risky"))).toEqual([]);
     });
     it("a row without reviewer or date is refused", () => {
-      const r: ToolRegistry = { version: 1, servers: { s: { trusted: true, tools: { t: { class: "read", reviewedBy: "", reviewedAt: "" } } } } };
-      expect(validate(r)).toEqual(["s/t: review"]);
+      expect(validate(reg({ s: { trusted: true, tools: { t: { class: "read", reviewedBy: "", reviewedAt: "" } } } }))).toEqual(["s/t: review"]);
+    });
+  });
+
+  describe("schema rejects identity tricks (Astra spec v2 findings 1 and 3)", () => {
+    it("the builtin namespace uses a separator MCP server names cannot contain", () => {
+      expect(BUILTIN_SERVER).toContain(":");
+      expect(MCP_SERVER_NAME_RE.test(BUILTIN_SERVER)).toBe(false);
+      for (const ok of ["github", "brave-search", "plugin_my-plugin_db", "GitHub", "a_b-c9"]) expect(MCP_SERVER_NAME_RE.test(ok), ok).toBe(true);
+      for (const bad of ["builtin:claude-code", "my server", "a.b", "x/y", ""]) expect(MCP_SERVER_NAME_RE.test(bad), bad).toBe(false);
+    });
+    it.each(["claude-code", "Claude-Code", "claude_code", "CLAUDE_CODE", "builtin_claude-code", "builtin-claude-code", "builtin:claude-code", "claudecode"])(
+      "an MCP server key %s collides with the builtin namespace and is refused", (name) => {
+        expect(isReservedServerName(name)).toBe(true);
+        if (name !== BUILTIN_SERVER) expect(validate(reg({ [name]: { trusted: true, tools: { Read: row() } } }))).toContain(`${name}: collides with the builtin namespace`);
+      });
+    it("normalisation is lowercase + strip non-alphanumerics, and honest names survive it", () => {
+      expect(normalise("Builtin:Claude-Code")).toBe("builtinclaudecode");
+      expect(RESERVED_SERVER_NAMES).toEqual(["claudecode", "builtinclaudecode"]);
+      for (const ok of ["github", "claude-code-helper", "codex", "builtin-tools"]) expect(isReservedServerName(ok), ok).toBe(false);
+    });
+    it("only the exact builtin key may contain a colon", () => {
+      expect(validate(reg({ [BUILTIN_SERVER]: { trusted: true, tools: { Read: row() } } }))).toEqual([]);
+      expect(validate(reg({ "builtin:codex": { trusted: true, tools: { Read: row() } } }))).toEqual(["builtin:codex: not an MCP server name"]);
+      expect(validate(reg({ "Builtin:claude-code": { trusted: true, tools: { Read: row() } } }))).toEqual([
+        "Builtin:claude-code: not an MCP server name", "Builtin:claude-code: collides with the builtin namespace",
+      ]);
+    });
+    it("two server keys or two tool keys that differ only by case are refused; lookups stay case-sensitive", () => {
+      expect(validate(reg({ github: { trusted: true, tools: { list_repos: row() } }, GitHub: { trusted: true, tools: { x: row() } } })))
+        .toEqual(["GitHub: differs only by case from github"]);
+      expect(validate(reg({ s: { trusted: true, tools: { Read: row(), read: row("risky") } } }))).toEqual(["s/read: differs only by case from Read"]);
+      expect(decide(registry, "GitHub", "list_repos")).toMatchObject({ verdict: "require_approval", risk: "unreviewed", ruleId: "unreviewed:GitHub/list_repos" });
+      expect(decide(registry, "github", "List_Repos")).toMatchObject({ verdict: "require_approval", risk: "unreviewed" });
+    });
+    it.each([...RESERVED_KEYS, "toString", "hasOwnProperty", "valueOf"])("%s is refused as a server key and as a tool key", (key) => {
+      expect(isReservedKey(key)).toBe(true);
+      expect(validate(reg({ [key]: { trusted: true, tools: { t: row() } } }))).toContain(`${key}: reserved key`);
+      expect(validate(reg({ s: { trusted: true, tools: { [key]: row() } } }))).toContain(`s/${key}: reserved key`);
+    });
+    it("a YAML `__proto__` server parses as an own property (yaml 2.9.1) and is still refused", () => {
+      const r = parse("version: 1\nservers:\n  __proto__:\n    trusted: true\n    tools: { t: { class: read, reviewedBy: ryan, reviewedAt: 2026-09-29 } }\n") as ToolRegistry;
+      expect(Object.hasOwn(r.servers, "__proto__")).toBe(true);
+      expect(Object.getPrototypeOf(r.servers)).toBe(Object.prototype);
+      expect(validate(r)).toContain("__proto__: reserved key");
     });
   });
 
@@ -106,15 +113,15 @@ describe("policies/tools.example.yaml (ADR-004 registry)", () => {
       ["aws", "list_buckets", {}, "require_approval", "unreviewed", "unreviewed:aws/list_buckets"],
       // unknown tool on a known server -> unreviewed, even when the server is trusted
       ["github", "list_branches", {}, "require_approval", "unreviewed", "unreviewed:github/list_branches"],
-      ["claude-code", "NotebookEdit", {}, "require_approval", "unreviewed", "unreviewed:claude-code/NotebookEdit"],
+      [BUILTIN_SERVER, "NotebookEdit", {}, "require_approval", "unreviewed", "unreviewed:builtin:claude-code/NotebookEdit"],
       // reviewed rows
       ["github", "list_repos", {}, "allow", "read", "registry:github/list_repos"],
       ["github", "create_issue", {}, "allow", "write", "registry:github/create_issue"],
       ["github", "delete_repo", {}, "require_approval", "risky", "registry:github/delete_repo"],
       ["github", "merge_pull_request", { environment: "dev" }, "require_approval", "risky", "registry:github/merge_pull_request"],
-      ["claude-code", "Read", {}, "allow", "read", "registry:claude-code/Read"],
-      ["claude-code", "Edit", {}, "allow", "write", "registry:claude-code/Edit"],
-      ["claude-code", "Bash", { command: "ls" }, "require_approval", "risky", "registry:claude-code/Bash"],
+      [BUILTIN_SERVER, "Read", {}, "allow", "read", "registry:builtin:claude-code/Read"],
+      [BUILTIN_SERVER, "Edit", {}, "allow", "write", "registry:builtin:claude-code/Edit"],
+      [BUILTIN_SERVER, "Bash", { command: "ls" }, "require_approval", "risky", "registry:builtin:claude-code/Bash"],
       // escalation raises write -> risky when every pattern matches; otherwise the base class stands
       ["github", "update_branch_protection", { branch: "main" }, "require_approval", "risky", "registry:github/update_branch_protection#escalate:0"],
       ["github", "update_branch_protection", { branch: "release/1.2" }, "require_approval", "risky", "registry:github/update_branch_protection#escalate:0"],
@@ -129,6 +136,18 @@ describe("policies/tools.example.yaml (ADR-004 registry)", () => {
       ["deploy", "deploy_app", { environment: "dev", target: "prod" }, "require_approval", "unreviewed", "unreviewed:deploy/deploy_app"],
       ["mail", "get_then_transfer_funds", {}, "require_approval", "unreviewed", "unreviewed:mail/get_then_transfer_funds"],
       ["mail", "reply_to_email", {}, "require_approval", "unreviewed", "unreviewed:mail/reply_to_email"],
+      // Astra spec v2 finding 1: an MCP server named like the builtins never inherits the builtin rows
+      ["claude-code", "Read", {}, "require_approval", "unreviewed", "unreviewed:claude-code/Read"],
+      ["claude-code", "Edit", {}, "require_approval", "unreviewed", "unreviewed:claude-code/Edit"],
+      ["builtin_claude-code", "Bash", {}, "require_approval", "unreviewed", "unreviewed:builtin_claude-code/Bash"],
+      ["Builtin:claude-code", "Read", {}, "require_approval", "unreviewed", "unreviewed:Builtin:claude-code/Read"],
+      // Astra spec v2 finding 3: prototype names are unreviewed, not hits
+      ["github", "constructor", {}, "require_approval", "unreviewed", "unreviewed:github/constructor"],
+      ["github", "__proto__", {}, "require_approval", "unreviewed", "unreviewed:github/__proto__"],
+      ["github", "toString", {}, "require_approval", "unreviewed", "unreviewed:github/toString"],
+      ["constructor", "Read", {}, "require_approval", "unreviewed", "unreviewed:constructor/Read"],
+      ["__proto__", "Read", {}, "require_approval", "unreviewed", "unreviewed:__proto__/Read"],
+      ["prototype", "Read", {}, "require_approval", "unreviewed", "unreviewed:prototype/Read"],
     ];
     it.each(cases)("%s/%s(%j) → %s/%s via %s", (server, tool, args, verdict, risk, ruleId) => {
       expect(decide(registry, server, tool, args)).toMatchObject({ verdict, risk, ruleId });
@@ -140,9 +159,40 @@ describe("policies/tools.example.yaml (ADR-004 registry)", () => {
       }
     });
     it("the evaluator ignores an escalation that would lower the class, even if one slipped past the loader", () => {
-      const reg: ToolRegistry = { version: 1, servers: { s: { trusted: true, tools: { t: { class: "risky", reviewedBy: "ryan", reviewedAt: "2026-09-29", escalateWhen: [{ argPattern: { environment: "^dev$" }, to: "write" }] } } } } };
-      expect(validate(reg).length).toBe(1);
-      expect(decide(reg, "s", "t", { environment: "dev" })).toMatchObject({ verdict: "require_approval", risk: "risky", ruleId: "registry:s/t" });
+      const r = reg({ s: { trusted: true, tools: { t: row("risky", { escalateWhen: [{ argPattern: { environment: "^dev$" }, to: "write" }] }) } } });
+      expect(validate(r).length).toBe(1);
+      expect(decide(r, "s", "t", { environment: "dev" })).toMatchObject({ verdict: "require_approval", risk: "risky", ruleId: "registry:s/t" });
+    });
+    it("an argPattern key that is a prototype name only matches an own argument", () => {
+      const r = reg({ s: { trusted: true, tools: { t: row("write", { escalateWhen: [{ argPattern: { constructor: ".*" }, to: "risky" }] }) } } });
+      expect(decide(r, "s", "t", { x: 1 })).toMatchObject({ verdict: "allow", risk: "write" });
+      expect(decide(r, "s", "t", { constructor: "y" })).toMatchObject({ verdict: "require_approval", risk: "risky" });
+    });
+  });
+
+  describe("hook tool-name split feeding the registry (spec §6)", () => {
+    it("built-ins land on the reserved namespace, MCP names on their own server, and the two never meet", () => {
+      expect(splitToolName("Bash")).toEqual({ server: BUILTIN_SERVER, tool: "Bash" });
+      expect(splitToolName("mcp__github__create_issue")).toEqual({ server: "github", tool: "create_issue" });
+      expect(splitToolName("mcp__plugin_my-plugin_db__query")).toEqual({ server: "plugin_my-plugin_db", tool: "query" });
+      expect(splitToolName("mcp__srv__a__b")).toEqual({ server: "srv", tool: "a__b" });
+    });
+    it.each(["mcp__claude-code__Read", "mcp__claude-code__Edit", "mcp__builtin_claude-code__Bash", "mcp__Claude_Code__Bash", "mcp__builtin:claude-code__Read"])(
+      "%s is refused by the collector (throw → supervisor deny); the reachable spellings are unreviewed anyway", (name) => {
+        expect(() => splitToolName(name)).toThrow(/impersonates/);
+        const server = name.slice("mcp__".length, name.indexOf("__", "mcp__".length));
+        // A `:` cannot survive Claude Code's name sanitisation, so only the throw defends that spelling; every
+        // spelling MCP can actually produce also misses the builtin rows by key.
+        if (server.includes(":")) return;
+        expect(server).not.toBe(BUILTIN_SERVER);
+        expect(decide(registry, server, "Read")).toMatchObject({ verdict: "require_approval", risk: "unreviewed" });
+      });
+    it("a name with mcp_server provenance but no mcp__ prefix is refused", () => {
+      expect(() => splitToolName("Read", true)).toThrow(/mcp_server/);
+      expect(splitToolName("Read", false)).toEqual({ server: BUILTIN_SERVER, tool: "Read" });
+    });
+    it("a malformed MCP name is refused rather than guessed", () => {
+      for (const bad of ["mcp__", "mcp____x", "mcp__srv", "mcp__srv__"]) expect(() => splitToolName(bad), bad).toThrow(/malformed/);
     });
   });
 });
