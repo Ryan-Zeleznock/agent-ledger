@@ -4,6 +4,10 @@
 - [ ] ledger down + read call → allowed and buffered
 - [ ] the intent record is written before upstream runs
 - [ ] runtime test: a ToolCall built from an IncomingCall has no credential property (explicit field projection, never a spread); a stored LedgerRecord JSON never contains the credential value
-- [ ] `decide()` never calls upstream; writes the intent record before returning; maps allow → allow, deny/timeout → deny, require_approval without an approval channel → ask
-- [ ] `recordOutcome(callId)` appends an outcome record chained to the intent record with that callId; an unknown callId is recorded as an orphan outcome, not dropped
+- [ ] `decide()` never calls upstream; writes the intent record before returning; maps allow → allow, deny/timeout/unavailable → deny, require_approval with `approvals.kind === "hook-ask"` → ask with an intent record whose approval says `delegated`
+- [ ] `decide()` with Slack: approved risky → the intent record (carrying `approved`, approver, callId) is persisted FIRST, then `allow` is returned; if `ledger.append` rejects after the approval, the answer is `deny` and no allow is ever emitted (Astra spec v2 #4)
+- [ ] `decide()` with Slack `unavailable` (fake channel rejects with a network error) → `deny`, intent record has `decision: "unavailable"`, outcome `blocked`
+- [ ] `createPipeline` with `approvals.kind === "hook-ask"` refuses to expose `handle` (proxy mode has no terminal to ask in)
+- [ ] `recordOutcome(callId)` appends an outcome record chained to the intent record with that callId; `status: "error"` from PostToolUseFailure keeps `errorClass` and `durationMs`; an unknown callId is recorded as an orphan outcome, not dropped
+- [ ] registry lookups inside the pipeline are own-property and case-sensitive (`github/constructor` → unreviewed; `claude-code/Read` from an MCP server → unreviewed, never the builtin row)
 - [ ] `deps.registry` is the only policy input; the pipeline has no code path that reads suggestions.yaml
