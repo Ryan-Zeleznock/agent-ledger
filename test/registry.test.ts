@@ -215,7 +215,7 @@ describe("policies/tools.example.yaml (ADR-004 registry)", () => {
       expect(splitToolName("mcp__srv__a__b")).toEqual({ server: "srv", tool: "a__b" });
     });
     it.each(["mcp__claude-code__Read", "mcp__claude-code__Edit", "mcp__builtin_claude-code__Bash", "mcp__Claude_Code__Bash", "mcp__builtin:claude-code__Read"])(
-      "%s is refused by the collector (throw → supervisor deny); the reachable spellings are unreviewed anyway", (name) => {
+      "%s is refused by the collector (throw → watchdog deny); the reachable spellings are unreviewed anyway", (name) => {
         expect(() => splitToolName(name)).toThrow(/impersonates/);
         const server = name.slice("mcp__".length, name.indexOf("__", "mcp__".length));
         // A `:` cannot survive Claude Code's name sanitisation, so only the throw defends that spelling; every

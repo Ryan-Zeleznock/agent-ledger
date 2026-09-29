@@ -1,9 +1,10 @@
 # Agent Ledger: Framework Spec (v2)
 
-**Date:** 2026-09-29 · **Status:** v2 fix round (Astra findings 1-6), awaiting Astra re-review · **Author:** Ryan + Fable
+**Date:** 2026-09-29 · **Status:** v2 watchdog round (Astra supervisor P1/P1/P2) + Codex adapter (ADR-005), awaiting Astra review · **Author:** Ryan + Fable
 **Brain:** `~/Desktop/AgentLedger/` (read `_state.md` first)
 **Changed in v2:** ADR-004 reviewed allowlist (§7, §8); MCP 2026-07-28 (§3, §4); hook collector for coding agents (§3, §4, §6); RFC 8785 hashing and IETF draft field alignment (§5). Every external format below was checked against its primary source on 2026-09-29; the URLs are inline and the findings are in the vault (`diligence-2026-09-28.md`, "Verified by Fable").
 **Changed in the v2 fix round (2026-09-29, after Astra's gate FAIL):** built-in tools moved to the reserved `builtin:claude-code` namespace and the loader refuses impersonating or case-twin keys (§6, §8); fail-closed hook supervisor and an honest list of what it cannot catch (§7); own-property registry lookups and refused prototype keys (§8); `ApprovalChannel` union with `hook-ask`, `unavailable` → deny, allow only after the intent record persists (§5, §6, §7); `PostToolUseFailure` event and `error` outcome mapping (§3, §6); the IETF draft alignment is now stated as conceptual, not byte-compatible (§5).
+**Changed in the watchdog round (2026-09-29, after Astra's re-review):** the in-process supervisor is replaced by a **two-process watchdog** that owns stdout, kills a stalled handler on its own timer, validates and re-serialises the handler's payload, and exits 2 on every deny and every failure path, config errors included (§7); **Codex** joins local mode through the same `src/hooks/` module with an `agent` discriminator and the reserved `builtin:codex` namespace (ADR-005; §3, §4, §6, §8); Codex's unsupported `ask` maps to `deny` (§6). Verifications: `diligence-2026-09-28.md`, "Verified by Fable (supervisor + Codex)".
 
 ## 1. What this is
 
@@ -30,22 +31,28 @@ ADR-002 still holds, so this phase delivers **no business logic**. It delivers:
 
 | Mode | Collector | Runs where | Ledger backend | Evidence strength |
 |---|---|---|---|---|
-| **Local** | **Hook collector** (Claude Code `PreToolUse`/`PostToolUse`/`PostToolUseFailure`) **plus** MCP proxy over stdio | Developer laptop | Append-only JSONL file | Visibility. Per-user hooks can be edited; org-wide managed hooks cannot be disabled by the user. |
+| **Local** | **Hook collector** for **Claude Code** (`PreToolUse`/`PostToolUse`/`PostToolUseFailure`) and **Codex** (`PreToolUse`/`PostToolUse`), **plus** MCP proxy over stdio | Developer laptop | Append-only JSONL file | Visibility. Per-user hooks can be edited; admin-managed hooks cannot be disabled by the user (Claude Code managed settings; Codex `requirements.toml`). |
 | **Server** | MCP proxy over Streamable HTTP | Docker container anywhere: laptop, homelab, VM, or the customer's cloud | Postgres | Audit-grade. The proxy holds the credentials, so the agent can't go around it. |
 
 **Why two collectors in local mode.** An MCP proxy never sees a coding agent's built-in tools (Claude Code's
-Bash, Edit, Write, WebFetch). Claude Code hooks fire for every tool, built-in and MCP, can answer
-`allow | deny | ask`, and can be enforced through managed settings (`allowManagedHooksOnly`), so the hook
-collector is the primary local collector and the MCP proxy covers agents that only speak MCP.
-Source: https://code.claude.com/docs/en/hooks (read 2026-09-29).
+Bash, Edit, Write, WebFetch; Codex's Bash, apply_patch). Hooks fire for built-in and MCP tools in both agents and
+can be enforced by an admin, so the hook collector is the primary local collector and the MCP proxy covers agents
+that only speak MCP. Sources: https://code.claude.com/docs/en/hooks and https://learn.chatgpt.com/docs/hooks (read 2026-09-29).
 
-**Codex.** Verified 2026-09-29 at https://learn.chatgpt.com/docs/hooks (redirect target of
-developers.openai.com/codex/hooks): Codex hooks are **enabled by default, not experimental**, use the same
-`session_id`/`tool_name`/`tool_input`/`tool_use_id`/`tool_response` fields plus `turn_id`, accept the same
-`hookSpecificOutput.permissionDecision` output block, and can be enforced through `requirements.toml`
-(`allow_managed_hooks_only`). That contradicts the "Codex hooks are experimental" assumption in the diligence
-note. Codex stays **MCP-proxy-only in this spec version as a scoping decision**, not a technical limitation; a
-Codex hook adapter looks like a small variant of `src/hooks/` and is Ryan's call (open question in `_state.md`).
+**Both coding agents, one module (ADR-005).** `src/hooks/` serves Claude Code and Codex through an
+`agent: "claude-code" | "codex"` argument on `parseHookInput`, `toIncomingCall`, `toOutcome` and
+`formatPreToolUseOutput`, and one watchdog (§7). Verified 2026-09-29 against https://learn.chatgpt.com/docs/hooks
+and the generated schemas in openai/codex (`codex-rs/hooks/schema/generated`): Codex hooks are **enabled by default**,
+run for `PreToolUse`, `PostToolUse`, `PermissionRequest` (and session events), name tools `Bash`, `apply_patch`
+(`Edit`/`Write` are matcher aliases only), `mcp__<server>__<tool>`, and are enforceable through `requirements.toml`
+(`allow_managed_hooks_only = true`, `[features].hooks = true`). **Differences from Claude Code that the adapter
+handles:** `model`, `turn_id`, `permission_mode` are required; `transcript_path` may be null; `tool_input` is any JSON
+value; there is **no `PostToolUseFailure`** (a failed command still arrives as `PostToolUse`); and
+**`permissionDecision: "ask"` is unsupported: Codex "marks the hook run as failed, reports the error, and continues
+the tool call"**, so the adapter never emits it (§6). Codex MCP names reach a hook with both segments sanitised to
+`[A-Za-z0-9_]`, which is what keeps `builtin:codex` unreachable (§8). Codex also warns that "some specialized tool
+paths can opt out of the default hook path" and that hosted tools (`WebSearch`) never fire hooks: local mode under
+Codex is visibility over the hooked paths, not a complete boundary, exactly as for Claude Code (§7 residual limits).
 
 **MCP protocol version: 2026-07-28** (https://modelcontextprotocol.io/specification/2026-07-28/changelog).
 The transport is stateless: no `initialize` handshake, no `Mcp-Session-Id`; every POST carries
@@ -63,7 +70,7 @@ then server mode for design partners.
 | # | Folder | Job (exactly one) | Depends on |
 |---|---|---|---|
 | 1 | `src/front/` | MCP server (2026-07-28) the agent connects to (stdio + Streamable HTTP with `bindHost`, `allowedOrigins`); lists tools, hands each call to an injected `CallHandler` as an unauthenticated `IncomingCall` | types (the handler is injected) |
-| 1b | `src/hooks/` | Parse a Claude Code hook event into an `IncomingCall` (PreToolUse) or an `Outcome` (PostToolUse, PostToolUseFailure); format a `HookDecision` as the documented `hookSpecificOutput` JSON; run the PreToolUse handler under the fail-closed supervisor (§7) | types |
+| 1b | `src/hooks/` | Parse a Claude Code or Codex hook event into an `IncomingCall` (PreToolUse) or an `Outcome` (PostToolUse; Claude Code's PostToolUseFailure); format a `HookDecision` as the documented `hookSpecificOutput` JSON per agent; define the two-process watchdog the agent executes (§7) | types (the watchdog itself imports only node built-ins) |
 | 2 | `src/upstream/` | MCP clients to the real tool servers; combines their tool lists (with annotations) | types, secrets |
 | 3 | `src/identity/` | Authenticate the agent; create and track sessions | types |
 | 4 | `src/secrets/` | Hand upstream credentials to `upstream/` only. Backends: env/file (local), Secrets Manager (later). | types |
@@ -75,7 +82,8 @@ then server mode for design partners.
 | n/a | `src/pipeline/` | Wire 3 → 5 → 6 → 7 → 2 → 7 for one call (the only module that knows the order). `createPipeline(deps)` returns `{ handle, decide, recordOutcome }` | identity, policy, approvals, ledger, upstream, types |
 
 **Later, not scaffolded now:** 10, intent-vs-action drift detection (v2: `declare_plan` tool, rules, an
-LLM judge, baselines); 11, the Terraform module; 12, a Codex hook adapter (see §3).
+LLM judge, baselines); 11, the Terraform module; 12, a Codex `PermissionRequest` adapter (allow/deny Codex's own approval
+prompts; it carries no `tool_use_id`, so it cannot join the intent/outcome chain yet).
 
 ## 5. Shared contracts (`src/types/`)
 
@@ -127,11 +135,15 @@ interface HookDecision { decision: "allow" | "deny" | "ask"; reason: string; cal
 interface IdentityService { resolveAgent(cred: AgentCredential): Promise<AgentId>; startSession(agentId: AgentId, onBehalfOf?: string): Promise<SessionId>; }
 interface PipelineDeps { identity: IdentityService; registry: ToolRegistry; ledger: LedgerStore; upstream: Upstream; approvals: ApprovalChannel; }
 
-// Server identity (§8). MCP server names in Claude Code are [A-Za-z0-9_-] only; anything else becomes `_` in the
-// mcp__<server>__<tool> name, so no MCP call can ever carry a `:` in its server segment.
-const BUILTIN_NAMESPACE = "builtin:"; const BUILTIN_SERVER = "builtin:claude-code";
+// Server identity (§8). Neither agent lets a `:` through to the mcp__<server>__<tool> name a hook sees: Claude Code
+// allows [A-Za-z0-9_-] in MCP server names and rewrites the rest to `_`; Codex sanitises every hook-visible MCP name
+// to [A-Za-z0-9_]. So no MCP call can ever carry a `:` in its server segment.
+type HookAgent = "claude-code" | "codex";
+const BUILTIN_NAMESPACE = "builtin:";
+const BUILTIN_SERVERS = { "claude-code": "builtin:claude-code", codex: "builtin:codex" };   // BUILTIN_SERVER = the first
+const BUILTIN_SERVER_KEYS = ["builtin:claude-code", "builtin:codex"];
 const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]+$/;
-const RESERVED_SERVER_NAMES = ["claudecode", "builtinclaudecode"];   // after lowercase + strip non-[a-z0-9]
+const RESERVED_SERVER_NAMES = ["claudecode", "builtinclaudecode", "codex", "builtincodex"];   // after lowercase + strip non-[a-z0-9]
 const RESERVED_KEYS = ["__proto__", "constructor", "prototype"];      // plus anything `in Object.prototype`
 ```
 
@@ -193,37 +205,57 @@ the draft's names from this table:
 5. If allowed: `upstream.execute(call)` using credentials from `secrets`.
 6. `ledger.append(outcome record)` → the result is returned to the agent.
 
-**Decide-only mode** (`pipeline.decide`, run by the `hook` command under `hooks.runHookSupervised`, §7):
+**Decide-only mode** (`pipeline.decide`, run by the handler process that the watchdog spawns, §7; `agent` is fixed by the
+hook's own configuration, never read from the event):
 
-1. `hooks.parseHookInput(stdin)` → `PreToolUseEvent`; `hooks.toIncomingCall(ev, credential)` sets `callId = tool_use_id`,
-   `args = tool_input`, and names the server:
+1. `hooks.parseHookInput(stdin, agent)` → `PreToolUseEvent` (Claude Code) or `CodexPreToolUseEvent` (Codex; `model`,
+   `turn_id`, `permission_mode` required, `transcript_path` nullable, `tool_input` any JSON). `hooks.toIncomingCall(ev,
+   credential, agent)` sets `callId = tool_use_id`, `args = tool_input` (Codex: a `tool_input` that is not a plain object is
+   refused → deny), and names the server:
    - `mcp__<server>__<tool>` → `<server>/<tool>`, split at the first `__` after the prefix, server segment verbatim (plugin
      form `plugin_<plugin>_<server>` included). If the server segment, lowercased and stripped of everything outside
-     `[a-z0-9]`, is `claudecode` or `builtinclaudecode`, the collector **throws** (→ deny): an MCP server is impersonating
-     the built-in namespace. `mcp__claude-code__Read` therefore never resolves to the built-in `Read` row; if it somehow
-     reached the registry it would be server `claude-code`, an unreviewed MCP server, and `require_approval`.
-   - a name without the prefix but with an `mcp_server` provenance object (Claude Code ≥ 2.1.274) → throw (malformed).
-   - any other name → built-in tool on server **`builtin:claude-code`**. MCP cannot produce a `:` in a server segment
-     (Claude Code allows only `[A-Za-z0-9_-]` in MCP server names and rewrites anything else to `_`, verified 2026-09-29 at
-     https://code.claude.com/docs/en/mcp), so this key is unreachable from MCP by construction.
-2. Steps 1-4 above, then **stop**: nothing is executed, Claude Code runs the tool itself.
-3. `hooks.formatPreToolUseOutput(decision)` prints
+     `[a-z0-9]`, is `claudecode`, `builtinclaudecode`, `codex` or `builtincodex`, the collector **throws** (→ deny) under
+     either agent: an MCP server is impersonating a built-in namespace. `mcp__claude-code__Read` therefore never resolves to
+     the built-in `Read` row; if it somehow reached the registry it would be server `claude-code`, an unreviewed MCP server,
+     and `require_approval`. Same for `mcp__builtin_codex__Bash`, which is exactly what Codex makes of a server named `builtin:codex`.
+   - Claude Code only: a name without the prefix but with an `mcp_server` provenance object (≥ 2.1.274) → throw (malformed).
+   - any other name → built-in tool on server **`builtin:claude-code`** or **`builtin:codex`** (`BUILTIN_SERVERS[agent]`).
+     Neither agent can produce a `:` in a server segment (Claude Code: only `[A-Za-z0-9_-]` in MCP server names, the rest
+     rewritten to `_`, https://code.claude.com/docs/en/mcp; Codex: `sanitize_responses_api_tool_name` keeps only
+     `[A-Za-z0-9_]`, codex-rs/codex-mcp/src/mcp/mod.rs; both verified 2026-09-29), so these keys are unreachable from MCP by
+     construction. Codex built-in names as the hook sends them: `Bash` (shell and `exec_command`), `apply_patch` (all file
+     edits; the event never says `Edit`/`Write`), `update_plan`, `spawn_agent`.
+2. Steps 1-4 above, then **stop**: nothing is executed, the agent runs the tool itself.
+3. `hooks.formatPreToolUseOutput(decision, agent)` produces one line
    `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow|deny|ask","permissionDecisionReason":"..."}}`
-   with exit code 0. Mapping:
+   which the watchdog validates and prints (exit 0 for allow/ask, exit 2 for deny, §7). Mapping:
    - `allow` ↔ verdict allow; or verdict `require_approval` + Slack `approved`, **only after the intent record carrying that
      approval has persisted** (a failed append is a `deny`, never a silent allow);
    - `deny` ↔ verdict deny; approval `denied`, `timeout`, or `unavailable`; or any internal failure (§7);
    - `ask` ↔ verdict `require_approval` with `approvals: { kind: "hook-ask" }` (local mode, no channel). The intent record is
-     written first with `approval.decision = "delegated"`, then Claude Code prompts the human in the terminal. We do not
+     written first with `approval.decision = "delegated"`, then **Claude Code** prompts the human in the terminal. We do not
      see the human's answer directly: if they allow, the tool runs and `PostToolUse`/`PostToolUseFailure` produce the outcome
      record; if they deny, no outcome arrives (Claude Code fires `PermissionDenied`, an adapter for it is future work) and
      the intent record stands alone as "asked, not run". We never emit `defer`.
-4. On `PostToolUse`, `pipeline.recordOutcome(tool_use_id, { status: "ok" })`. On **`PostToolUseFailure`** (fires when a tool
-   that started executing fails; verified 2026-09-29, it does **not** fire for permission denials or validation rejections),
-   `pipeline.recordOutcome(tool_use_id, { status: "error", errorClass, durationMs: duration_ms })`, where `errorClass` is
-   `interrupt` when `is_interrupt` is true, else the `Exit code N` first line of `error` when present, else `tool-error`. The
-   `error` text itself is display text (may carry secrets, format unstable) and is not stored. Fixtures:
-   `test/fixtures/claude-code-{pretooluse,posttooluse,posttoolusefailure}.json`.
+     **Codex cannot ask.** Its docs (read 2026-09-29) list `permissionDecision: "ask"` as "parsed but not supported yet.
+     Codex marks the hook run as failed, reports the error, and continues the tool call": an `ask` sent to Codex is an
+     allow. So `formatPreToolUseOutput(d, "codex")` rewrites `ask` to **`deny`** with `CODEX_ASK_UNSUPPORTED_REASON`
+     (tells the user to approve out of band or have the tool reviewed). The intent record still carries `delegated`, so the
+     ledger reads "asked, denied by adapter". Under Codex, a `require_approval` becomes an allow only through a `slack`
+     channel; with `hook-ask` configured it is always a deny, and the setup guide must say so. (Codex's `PermissionRequest`
+     hook can allow/deny Codex's own approval prompts, but it fires only when Codex would prompt anyway and has no
+     `tool_use_id`; not adopted, §4.)
+4. On `PostToolUse`, `pipeline.recordOutcome(tool_use_id, { status: "ok" })`. On **`PostToolUseFailure`** (Claude Code; fires
+   when a tool that started executing fails; verified 2026-09-29, it does **not** fire for permission denials or validation
+   rejections), `pipeline.recordOutcome(tool_use_id, { status: "error", errorClass, durationMs: duration_ms })`, where
+   `errorClass` is `interrupt` when `is_interrupt` is true, else the `Exit code N` first line of `error` when present, else
+   `tool-error`. The `error` text itself is display text (may carry secrets, format unstable) and is not stored.
+   **Codex has no failure event**: `PostToolUse` "also runs after commands that exit with a non-zero status" and its
+   `tool_response` has no stable shape, so a Codex outcome is always `{ status: "ok" }`, meaning "the tool ran and returned",
+   not "succeeded". Reading an exit code out of `tool_response` is future work, stated as such in the report vocabulary.
+   Fixtures: `test/fixtures/claude-code-{pretooluse,posttooluse,posttoolusefailure}.json`,
+   `test/fixtures/codex-{pretooluse,posttooluse}.json` (composed from the Codex field tables and generated schemas; the Codex
+   page has no PreToolUse example block).
 
 A call that is denied (by policy, a human, a timeout, an unavailable channel, or an internal failure) gets one record with
 `phase: "outcome"` and `outcome.status: "blocked"`, and it never reaches `upstream`. Blocked attempts are evidence too.
@@ -248,48 +280,84 @@ Behavior depends on the call's risk class, which comes from the registry row or 
 |---|---|
 | Approvals `unavailable` (Slack configured but unreachable, non-2xx, auth failure) | `ApprovalResult.decision = "unavailable"` → **deny**; `risky` and `unreviewed` calls blocked (read and write calls never need approval). Distinct from "no channel", which is the explicit `hook-ask` kind, not an absence |
 | Approval `approved` but the intent record fails to persist | **deny**. An allow is emitted only after the append succeeded (§6) |
-| Registry file invalid (unknown field, bad class, missing reviewer, downgrading escalation, reserved or impersonating key, case-twin keys, §8) | Proxy and hook refuse to start, whatever the call |
-| Upstream error / `PostToolUseFailure` | Outcome recorded as `error` |
-| Hook handler throws, rejects, gets malformed stdin, or misses its internal deadline | The **fail-closed supervisor** emits a JSON `deny` **and** exit 2 (below) |
+| Registry file invalid (unknown field, bad class, missing reviewer, downgrading escalation, reserved or impersonating key, case-twin keys, §8) | Proxy refuses to start. Hook: the handler fails inside the watchdog, which emits a JSON `deny` **and** exit 2, never a plain exit 1 |
+| Upstream error / `PostToolUseFailure` (Claude Code) | Outcome recorded as `error` (Codex: `ok`, see §6) |
+| Hook handler crashes, exits non-zero, stalls, writes junk or too much, or the watchdog's own config is invalid | The **watchdog** emits a JSON `deny` **and** exit 2 (below) |
 
-**Fail-closed hook supervisor.** What Claude Code actually does with a PreToolUse hook, verified 2026-09-29 at
-https://code.claude.com/docs/en/hooks (#exit-code-output, #timeouts, #exit-code-2-behavior-per-event):
+**Two-process fail-closed watchdog.** What the agents actually do with a PreToolUse hook, verified 2026-09-29
+(Claude Code: https://code.claude.com/docs/en/hooks #exit-code-2, #other-exit-codes, #timeouts, #json-output; Codex:
+https://learn.chatgpt.com/docs/hooks #pretooluse, #common-output-fields):
 
-| Hook outcome | Claude Code's behavior |
-|---|---|
-| exit 2 (any stdout) | **Blocks** the tool call; JSON cannot override it |
-| exit 0 + JSON `permissionDecision: "deny"` | **Blocks** |
-| exit 0 + JSON `allow` / `ask` / `defer` | That decision |
-| exit 0 without a decision | **Continues** through the normal permission flow |
-| exit 1 or any other code, no valid JSON | **Continues** (non-blocking error notice) |
-| stdout that fails JSON parsing or schema validation (exit ≠ 2) | **Continues** |
-| hook reaches its `timeout` (default 600 s) | Output discarded, **continues**: "don't count on a stalled hook to act as a gate" |
-| hook binary missing or not executable (exit 127) | **Continues** |
+| Hook outcome | Claude Code | Codex |
+|---|---|---|
+| exit 2 (any stdout) | **Blocks**: "exit 2 blocks whether or not you print JSON: even a JSON permissionDecision of "allow" can't override it". Message = JSON deny reason if any, else stderr; Claude sees it [V] | **Blocks**: "You can also use exit code 2 and write the blocking reason to stderr" [V]. Whether JSON on exit 2 is read is undocumented [H], so we always send the deny JSON too |
+| exit 0 + JSON `permissionDecision: "deny"` | **Blocks** [V] | **Blocks** [V] (also legacy `{"decision":"block"}`) |
+| exit 0 + JSON `allow` | Allow [V] | Allow [V] |
+| exit 0 + JSON `ask` | Prompts the user [V] | **Not supported: hook marked failed, call CONTINUES** [V] |
+| exit 0 without a decision, or plain text | **Continues** [V] | **Continues** ("Exit 0 with no output is treated as success and Codex continues") [V] |
+| exit 1 or any other code | **Continues** (non-blocking error notice) [V] | Reported as a hook failure; **continues** [H, inferred from the failure wording] |
+| stdout fails JSON parsing or schema validation (exit ≠ 2); two JSON lines | **Continues** [V]; only `{...}` start/end is parsed as JSON | Unsupported fields → failed hook, **continues** [V] |
+| hook reaches its `timeout` (default 600 s in both) | Output discarded, **continues**: "don't count on a stalled hook to act as a gate" [V] | Hook terminated; no decision, **continues** [H] |
+| hook binary missing or not executable (exit 127) | **Continues** [V] | **Continues** [H] |
+| stdout size | plain stdout and context strings capped at 10,000 characters, spilled to a file above that [V] | model-visible output spilled above ~2,500 tokens [V]; effect on a decision payload undocumented [H] |
 
-So without help, every internal failure of our hook is an allow. The `hook` command therefore never runs the handler bare;
-it runs it through `hooks.runHookSupervised(handler, { deadlineMs })`:
+So without help, every internal failure of our hook is an allow, in both agents. Astra's re-review showed that an
+in-process supervisor cannot close this: a timer on the handler's own event loop never fires while a synchronous loop
+spins, and a deny written to a stdout the handler shares can be destroyed by an early `console.log`, an oversized payload,
+or truncation. The fix is a second process. The agent's hook entry runs the **watchdog** (`hooks.runWatchdog(opts)`), not
+the handler:
 
-- The supervised region covers reading and parsing stdin, `toIncomingCall`, `pipeline.decide`, and serialisation. A thrown
-  error, a rejected promise, malformed stdin, an `unhandledRejection`/`uncaughtException`, or an unserialisable decision all
-  become stdout `{"hookSpecificOutput":{...,"permissionDecision":"deny","permissionDecisionReason":"supervisor:<class>"}}`,
-  the same reason on stderr, and **exit 2**. Both channels, because exit 2 blocks even if stdout were lost, and the JSON gives
-  the human a readable reason.
-- An internal deadline (`DEFAULT_DEADLINE_MS` = 25 s) fires **before** the hook `timeout` we configure in settings
-  (`HOOK_TIMEOUT_S` = 30 s; Claude Code's own default is 600 s and must not be relied on). A deadline miss is a deny with
-  reason `supervisor:deadline`. `runHookSupervised` refuses a `deadlineMs` that is not below the configured timeout.
-- The supervisor never throws and never exits 0 without a decision. Runtime tests: `test/todo/hooks.todo.md`.
+- **Minimal by construction.** The watchdog imports only `node:child_process`, `node:fs`, `node:process`: no registry, no
+  YAML, no pipeline. Its own event loop does nothing but wait for the child and the timer, so nothing can block it.
+- **Spawns the handler as a child** with piped stdio and no shell, forwards the hook event (read from its own stdin, capped at
+  `MAX_STDIN_BYTES` = 4 MiB, over → deny), and **captures the handler's stdout and stderr into bounded buffers**: stdout up
+  to `maxOutputBytes` (+1 byte to detect overflow; default `DEFAULT_MAX_OUTPUT_BYTES` = 8,192, legal range 512–65,536, kept
+  under Claude Code's 10,000-character spill limit), stderr up to `MAX_HANDLER_STDERR_BYTES` = 16 KiB. **The watchdog
+  exclusively owns its stdout**; the handler never writes to the agent.
+- **Enforces `deadlineMs` with its own timer**, started before stdin is read or the child spawned. At the deadline it
+  **SIGKILLs** the handler (not SIGTERM, which a stalled process may ignore), writes the deny, and exits 2 at once. It never
+  awaits the child's exit or close events; unfinished handler work is abandoned. `DEFAULT_DEADLINE_MS` = 25 s sits at least
+  `WATCHDOG_MIN_MARGIN_MS` = 2 s below the `timeout` we configure in both agents (`HOOK_TIMEOUT_S` = 30 s; their own 600 s
+  default must not be relied on).
+- **Emits exit 2 for EVERY deny and EVERY failure path**, always with the reason on stderr (`watchdog:<class>`) AND a deny
+  JSON on stdout: handler crash or non-zero exit (`handler-exit:<code>`, `handler-signal:<sig>`), oversized or invalid output
+  (`output:too-large`, `output:not-json`, `output:not-object`, `output:multiple`, `output:extra-key:<key>`,
+  `output:missing-key:<key>`, `output:bad-value:<key>`, `output:empty`), deadline, spawn failure (`spawn:<code>`), stdin too
+  large, the handler's own init failure (`init`; the registry refusing to load happens INSIDE the handler and surfaces this
+  way), the watchdog's own uncaught error (`internal`), and a valid deny from the handler (`handler-deny`, re-emitted with
+  the handler's reason). This relies on the verified rule that exit 2 blocks regardless of JSON in Claude Code; for Codex the
+  deny JSON covers the undocumented case. **A plain exit 1 is never used**: both agents treat it as "continue".
+- **Config and init validation happen inside supervision and also deny with exit 2**: a `deadlineMs` that is non-finite,
+  non-integer, ≤ 0, or leaves less than `WATCHDOG_MIN_MARGIN_MS` before `timeoutS * 1000`; a `maxOutputBytes` outside its
+  range; an unknown `agent`; an empty `handlerCommand`. Reason `watchdog:config:<field>`. Misconfiguration is a block, not a
+  crash the agent ignores.
+- **Only a validated allow (or ask) is exit 0.** `hooks.validateHandlerOutput(raw, agent)` accepts the handler's stdout only
+  if it is within the size bound, exactly one JSON object, with exactly the top-level key `hookSpecificOutput` whose value has
+  exactly the keys `hookEventName: "PreToolUse"`, `permissionDecision` (allow | deny; `ask` for Claude Code only) and
+  `permissionDecisionReason` (string ≤ `MAX_REASON_CHARS` = 1,000). Anything else (`updatedInput`, `additionalContext`,
+  `systemMessage`, `continue`, a second object, whitespace tricks) is a deny. On success the watchdog **re-serialises** the
+  parsed payload as one line; the handler's raw bytes never reach the agent. All watchdog writes are synchronous
+  (`fs.writeSync` on fds 1 and 2) and followed by `process.exit`, so no verdict is lost to an unflushed stream. Its exit code
+  is only ever 0 or 2. Runtime tests: `test/todo/hooks.todo.md`.
 
-**Residual limits, stated honestly.** The supervisor runs inside the hook process; whatever prevents that process from
-writing output is outside its reach, and in every such case **Claude Code continues**: the hook binary is missing, not
-executable, or its interpreter is gone (exit 127); the process is killed by the OS (OOM, SIGKILL) before writing; the
-user removes or edits the hook entry in their own settings; `disableAllHooks` is set in non-managed settings (this one
-cannot disable *managed* hooks). Mitigations live in Claude Code's configuration, not in our code:
-- Deploy the hook through **managed settings** (`managed-settings.json`, MDM, or server-managed settings) with
-  **`allowManagedHooksOnly: true`**, so user, project, local, and plugin hooks are blocked and the user cannot remove ours
-  (https://code.claude.com/docs/en/settings-reference#allowmanagedhooksonly, verified 2026-09-29; managed settings
-  precedence: https://code.claude.com/docs/en/settings). Managed hooks merge with, and cannot be disabled by, lower levels.
-- A **health check**: a `SessionStart` hook that verifies the binary runs and writes a heartbeat record; the report flags a
-  session that has tool calls but no heartbeat, or a heartbeat but a gap in `PreToolUse` intent records.
+**Residual limits, stated honestly.** The watchdog is a process too; whatever prevents *it* from writing output is outside
+its reach, and in every such case **both agents continue**: the watchdog binary is missing, not executable, or its
+interpreter is gone (exit 127); the watchdog itself is killed by the OS (OOM, SIGKILL) before writing; the user removes or
+edits the hook entry in their own settings (Claude Code `settings.json`; Codex `hooks.json`/`config.toml`, where changing a
+non-managed hook also resets its trust hash and Codex skips it until re-trusted); `disableAllHooks` / `[features].hooks =
+false` in non-managed config (neither can disable *managed* hooks); and, Codex only, "some specialized tool paths can opt
+out of the default hook path" and hosted tools (`WebSearch`) never fire hooks. Mitigations live in the agents'
+configuration, not in our code:
+- **Claude Code:** deploy the hook through **managed settings** (`managed-settings.json`, MDM, or server-managed settings)
+  with **`allowManagedHooksOnly: true`**, so user, project, local, and plugin hooks are blocked and the user cannot remove
+  ours (https://code.claude.com/docs/en/settings-reference#allowmanagedhooksonly, verified 2026-09-29; precedence:
+  https://code.claude.com/docs/en/settings). Managed hooks merge with, and cannot be disabled by, lower levels.
+- **Codex:** deploy through **`requirements.toml`** (`/etc/codex/requirements.toml`, MDM, or cloud-managed) with
+  **`allow_managed_hooks_only = true`**, **`[features].hooks = true`** pinned, and the hook under `[[hooks.PreToolUse]]` with
+  `timeout = 30`, scripts installed under `[hooks].managed_dir` (https://learn.chatgpt.com/docs/hooks #managed-hooks-from-
+  requirementstoml, verified 2026-09-29). Managed hooks are "trusted by policy and can't be disabled from the user hook browser".
+- A **health check** in both: a `SessionStart` hook that verifies the watchdog runs and writes a heartbeat record; the report
+  flags a session that has tool calls but no heartbeat, or a heartbeat but a gap in `PreToolUse` intent records.
 - Server mode has none of this: the proxy holds the credentials, so a dead hook cannot let a call through.
 
 The read/write split is an assumption to test in Phase 1 calls (open question in `_state.md`).
@@ -322,18 +390,30 @@ servers:
 
 **Server identity.** Registry keys are matched **exactly, case-sensitively, by own property** (`Object.hasOwn`, or a
 `Map` the loader builds). A key is one of two things:
-- **`builtin:claude-code`**, the one legal key containing `:`. Built-in tools live here because MCP can never reach it:
-  Claude Code accepts only `[A-Za-z0-9_-]` in an MCP server name (`claude mcp add`), and in every `mcp__<server>__<tool>`
-  callable name any other character is replaced with `_` (https://code.claude.com/docs/en/mcp, verified 2026-09-29). A
-  plugin server registers as `plugin:<plugin>:<server>` internally, yet its tools appear as `mcp__plugin_<plugin>_<server>__`.
-  So `mcp__claude-code__Read`, `mcp__claude-code__Edit`, and `mcp__builtin_claude-code__Bash` split into servers
-  `claude-code` and `builtin_claude-code`: not this key, so they inherit nothing and are `unreviewed` → `require_approval`
-  (regression rows in `test/registry.test.ts`), and the collector refuses them outright (§6).
+- **`builtin:claude-code`** or **`builtin:codex`** (`BUILTIN_SERVER_KEYS`), the only legal keys containing `:`. Built-in
+  tools live here because MCP can never reach them:
+  - Claude Code accepts only `[A-Za-z0-9_-]` in an MCP server name (`claude mcp add`), and in every `mcp__<server>__<tool>`
+    callable name any other character is replaced with `_` (https://code.claude.com/docs/en/mcp, verified 2026-09-29). A
+    plugin server registers as `plugin:<plugin>:<server>` internally, yet its tools appear as `mcp__plugin_<plugin>_<server>__`.
+  - Codex's `codex mcp add` accepts `[A-Za-z0-9_:@/.-]`, so **`builtin:codex` is a legal raw server name there**, but the
+    hook sees the model-visible name: `sanitize_responses_api_tool_name` keeps only ASCII alphanumerics and `_`, replaces
+    everything else (`:`, `-`, `@`, `/`, `.`) with `_`, appends a hash suffix on collisions, and `mcp__` is prepended
+    (openai/codex `codex-rs/codex-mcp/src/mcp/mod.rs`, `codex-rs/codex-mcp/src/tools.rs`,
+    `codex-rs/core/src/tools/handlers/mcp.rs`, read 2026-09-29). So a Codex server named `builtin:codex` fires the hook as
+    `mcp__builtin_codex__<tool>`: server `builtin_codex`, refused below. Consequence for reviewers: a Codex MCP registry key
+    is written in sanitised form (`brave_search`, not `brave-search`), and a hash-suffixed name (`builtin_codex_a1b2c3`) is
+    its own unreviewed server, never a built-in.
+  So `mcp__claude-code__Read`, `mcp__builtin_claude-code__Bash`, `mcp__codex__Bash` and `mcp__builtin_codex__Bash` split into
+  servers `claude-code`, `builtin_claude-code`, `codex`, `builtin_codex`: not these keys, so they inherit nothing and are
+  `unreviewed` → `require_approval` (regression rows in `test/registry.test.ts`), and the collector refuses them outright (§6).
+  The two built-in keys are distinct servers: a Codex `Read` never sees the Claude Code row and a Claude Code `apply_patch`
+  never sees the Codex row.
 - an **MCP server name** matching `/^[A-Za-z0-9_-]+$/`.
 
-The loader **refuses** a registry with: any other key containing `:` (`builtin:codex` waits for a real Codex adapter); a
-non-builtin key that **normalises** (lowercase, strip everything outside `[a-z0-9]`) to `claudecode` or `builtinclaudecode`
-(`claude-code`, `Claude_Code`, `builtin_claude-code`, `builtin-claude-code`); two server keys, or two tool keys under one
+The loader **refuses** a registry with: any other key containing `:` (`builtin:cursor` waits for a cursor adapter); a
+non-builtin key that **normalises** (lowercase, strip everything outside `[a-z0-9]`) to `claudecode`, `builtinclaudecode`,
+`codex` or `builtincodex` (`claude-code`, `Claude_Code`, `builtin_claude-code`, `builtin-claude-code`, `Codex`,
+`builtin_codex`), whichever agent the registry serves; two server keys, or two tool keys under one
 server, that are equal case-insensitively (`github` + `GitHub`, `Read` + `read`), because a case twin must never be
 mistaken for a reviewed row while lookups stay case-sensitive; and any server or tool key in `RESERVED_KEYS`
 (`__proto__`, `constructor`, `prototype`) or otherwise `in Object.prototype` (`toString`, `hasOwnProperty`, ...). Verified
@@ -391,11 +471,19 @@ Vitest. Must-have tests:
 - Editing any one ledger record makes `verify()` fail at that record.
 - A registry table test: at least 20 calls with their expected verdicts, including the unreviewed regression rows
   `get_then_deploy`, `wipe_bucket`, `terminate_instance`, `push_to_main`, `deploy_production({environment:"dev"})`.
-- The hook fixtures in `test/fixtures/` keep the documented field names (format-drift guard), PostToolUseFailure included.
-- Identity regressions: `mcp__claude-code__Read`, `mcp__claude-code__Edit`, `mcp__builtin_claude-code__Bash` never
-  inherit `builtin:claude-code` rows; `github/constructor`, server `constructor`, `__proto__` are unreviewed; the loader
-  refuses reserved, impersonating, and case-twin keys.
-- Supervisor: a thrown error → deny + exit 2; a missed deadline → deny before the hook timeout; malformed stdin → deny.
+- The hook fixtures in `test/fixtures/` keep the documented field names (format-drift guard): Claude Code's three events and
+  Codex's two (`model`, `turn_id`, nullable `transcript_path`, no `PostToolUseFailure`).
+- Identity regressions: `mcp__claude-code__Read`, `mcp__claude-code__Edit`, `mcp__builtin_claude-code__Bash`,
+  `mcp__codex__Bash`, `mcp__builtin_codex__Bash` never inherit a `builtin:*` row under either agent; `github/constructor`,
+  server `constructor`, `__proto__` are unreviewed; the loader refuses reserved, impersonating, and case-twin keys and
+  accepts exactly the two built-in keys.
+- Watchdog (runtime, real processes; `test/todo/hooks.todo.md`): an infinite-loop handler → deny + exit 2 before the deadline
+  plus 500 ms; junk on stdout → deny; output over the cap → deny; a handler exiting 1 with a valid allow → deny; an allow
+  payload with an extra key → deny; an invalid `deadlineMs` (NaN, ∞, 0, ≥ timeout, margin too small) → deny + exit 2, never
+  exit 1; a valid allow → exit 0 with the re-serialised payload; a valid `ask` → exit 0 for Claude Code, deny for Codex; the
+  watchdog's exit code is only ever 0 or 2.
+- Codex adapter: `ask` → `deny` with `CODEX_ASK_UNSUPPORTED_REASON` and the output never contains `"ask"`; a non-object
+  `tool_input` → deny; the Codex PostToolUse fixture (exit code 1 in `tool_response`) → outcome `ok`.
 - An approval timeout blocks the call and records `timeout`; an unreachable channel records `unavailable` and blocks.
 - An approved risky call is allowed only after the intent record persisted; a failed append after approval is a deny.
 - A secret in args never appears in stored records.
@@ -412,4 +500,4 @@ Vitest. Must-have tests:
 1. Do customers accept fail-open for read-only calls?
 2. What do their agents run on? (That decides which framework and MCP setup to support first.)
 3. Will auditors accept a generated report, or do they insist on raw log access?
-4. Ryan: add a Codex hook adapter now that Codex hooks are stable and on by default (§3)?
+4. Codex design partners: is "risky = deny unless Slack is configured" acceptable, given Codex hooks cannot ask (§6)?
