@@ -1,8 +1,9 @@
 # Agent Ledger: Framework Spec (v2)
 
-**Date:** 2026-09-29 · **Status:** v2, awaiting Astra review · **Author:** Ryan + Fable
+**Date:** 2026-09-29 · **Status:** v2 fix round (Astra findings 1-6), awaiting Astra re-review · **Author:** Ryan + Fable
 **Brain:** `~/Desktop/AgentLedger/` (read `_state.md` first)
 **Changed in v2:** ADR-004 reviewed allowlist (§7, §8); MCP 2026-07-28 (§3, §4); hook collector for coding agents (§3, §4, §6); RFC 8785 hashing and IETF draft field alignment (§5). Every external format below was checked against its primary source on 2026-09-29; the URLs are inline and the findings are in the vault (`diligence-2026-09-28.md`, "Verified by Fable").
+**Changed in the v2 fix round (2026-09-29, after Astra's gate FAIL):** built-in tools moved to the reserved `builtin:claude-code` namespace and the loader refuses impersonating or case-twin keys (§6, §8); fail-closed hook supervisor and an honest list of what it cannot catch (§7); own-property registry lookups and refused prototype keys (§8); `ApprovalChannel` union with `hook-ask`, `unavailable` → deny, allow only after the intent record persists (§5, §6, §7); `PostToolUseFailure` event and `error` outcome mapping (§3, §6); the IETF draft alignment is now stated as conceptual, not byte-compatible (§5).
 
 ## 1. What this is
 
@@ -29,7 +30,7 @@ ADR-002 still holds, so this phase delivers **no business logic**. It delivers:
 
 | Mode | Collector | Runs where | Ledger backend | Evidence strength |
 |---|---|---|---|---|
-| **Local** | **Hook collector** (Claude Code `PreToolUse`/`PostToolUse`) **plus** MCP proxy over stdio | Developer laptop | Append-only JSONL file | Visibility. Per-user hooks can be edited; org-wide managed hooks cannot be disabled by the user. |
+| **Local** | **Hook collector** (Claude Code `PreToolUse`/`PostToolUse`/`PostToolUseFailure`) **plus** MCP proxy over stdio | Developer laptop | Append-only JSONL file | Visibility. Per-user hooks can be edited; org-wide managed hooks cannot be disabled by the user. |
 | **Server** | MCP proxy over Streamable HTTP | Docker container anywhere: laptop, homelab, VM, or the customer's cloud | Postgres | Audit-grade. The proxy holds the credentials, so the agent can't go around it. |
 
 **Why two collectors in local mode.** An MCP proxy never sees a coding agent's built-in tools (Claude Code's
@@ -62,12 +63,12 @@ then server mode for design partners.
 | # | Folder | Job (exactly one) | Depends on |
 |---|---|---|---|
 | 1 | `src/front/` | MCP server (2026-07-28) the agent connects to (stdio + Streamable HTTP with `bindHost`, `allowedOrigins`); lists tools, hands each call to an injected `CallHandler` as an unauthenticated `IncomingCall` | types (the handler is injected) |
-| 1b | `src/hooks/` | Parse a Claude Code hook event into an `IncomingCall`; format a `HookDecision` as the documented `hookSpecificOutput` JSON | types |
+| 1b | `src/hooks/` | Parse a Claude Code hook event into an `IncomingCall` (PreToolUse) or an `Outcome` (PostToolUse, PostToolUseFailure); format a `HookDecision` as the documented `hookSpecificOutput` JSON; run the PreToolUse handler under the fail-closed supervisor (§7) | types |
 | 2 | `src/upstream/` | MCP clients to the real tool servers; combines their tool lists (with annotations) | types, secrets |
 | 3 | `src/identity/` | Authenticate the agent; create and track sessions | types |
 | 4 | `src/secrets/` | Hand upstream credentials to `upstream/` only. Backends: env/file (local), Secrets Manager (later). | types |
 | 5 | `src/policy/` | Classify a ToolCall from the reviewed registry (`evaluate`); propose classes for review (`suggestClass`) | types |
-| 6 | `src/approvals/` | Ask a human (Slack) and return an ApprovalResult; deny on timeout | types |
+| 6 | `src/approvals/` | Ask a human (Slack) and return an ApprovalResult; `timeout` and `unavailable` both mean deny. The `hook-ask` channel never reaches this module (§6) | types |
 | 7 | `src/ledger/` | Redact, hash-chain (RFC 8785 + SHA-256), append, verify | types, `canonicalize` |
 | 8 | `src/anchor/` | Record the chain head daily somewhere hard to edit. Backends: local file (now), S3 Object Lock (later). | types (it receives the head hash) |
 | 9 | `src/report/` | Turn ledger records for a date range into PDF + CSV mapped to SOC 2 criteria | types, ledger |
@@ -100,7 +101,12 @@ type Verdict = "allow" | "deny" | "require_approval";
 type Risk = "read" | "write" | "risky" | "unreviewed";          // unreviewed = not in the registry (ADR-004)
 interface PolicyDecision { verdict: Verdict; ruleId: string; reason: string; risk: Risk; }
 
-interface ApprovalResult { callId: string; decision: "approved" | "denied" | "timeout"; approver?: string; decidedAt: string; channel: "slack"; }
+type ApprovalChannel = { kind: "slack"; channelId: string; timeoutMs: number } | { kind: "hook-ask" };   // required in PipelineDeps: "no channel" is said out loud
+interface ApprovalResult {
+  callId: string;
+  decision: "approved" | "denied" | "timeout" | "unavailable" | "delegated";   // only `approved` can become an allow; `delegated` only with hook-ask
+  approver?: string; decidedAt: string; channel: ApprovalChannel["kind"];
+}
 
 type Phase = "intent" | "outcome";
 interface LedgerRecord {
@@ -119,7 +125,14 @@ interface ToolInfo { server: string; name: string; description?: string; inputSc
 interface HookDecision { decision: "allow" | "deny" | "ask"; reason: string; callId: string; }
 
 interface IdentityService { resolveAgent(cred: AgentCredential): Promise<AgentId>; startSession(agentId: AgentId, onBehalfOf?: string): Promise<SessionId>; }
-interface PipelineDeps { identity: IdentityService; registry: ToolRegistry; ledger: LedgerStore; upstream: Upstream; approvals: ApprovalOptions; }
+interface PipelineDeps { identity: IdentityService; registry: ToolRegistry; ledger: LedgerStore; upstream: Upstream; approvals: ApprovalChannel; }
+
+// Server identity (§8). MCP server names in Claude Code are [A-Za-z0-9_-] only; anything else becomes `_` in the
+// mcp__<server>__<tool> name, so no MCP call can ever carry a `:` in its server segment.
+const BUILTIN_NAMESPACE = "builtin:"; const BUILTIN_SERVER = "builtin:claude-code";
+const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]+$/;
+const RESERVED_SERVER_NAMES = ["claudecode", "builtinclaudecode"];   // after lowercase + strip non-[a-z0-9]
+const RESERVED_KEYS = ["__proto__", "constructor", "prototype"];      // plus anything `in Object.prototype`
 ```
 
 `AgentCredential` appears only in `IncomingCall`. `ToolCall` and `LedgerRecord` have no field for it. The type
@@ -134,10 +147,19 @@ UTF-16 code units, ECMAScript number formatting, no whitespace. The ledger uses 
 (5.1.0, exact-pinned; README claims RFC 8785 conformance and ships types) and never hand-rolls canonical JSON.
 `test/jcs.test.ts` proves two key orders hash identically.
 
-**Alignment with draft-sharif-agent-audit-trail-06** (https://datatracker.ietf.org/doc/draft-sharif-agent-audit-trail/,
-dated 2026-09-29, individual Internet-Draft). It mandates JCS for its chain (`prev_hash(N) = hex(SHA-256(JCS(record(N-1))))`,
-§6.1), which our construction matches once `hash` is treated as the derived field it is. We keep camelCase and
-our vocabulary; the report module can emit the draft's names from this table:
+**Alignment with draft-sharif-agent-audit-trail-06 is conceptual, not byte-compatible**
+(https://datatracker.ietf.org/doc/draft-sharif-agent-audit-trail/, dated 2026-09-29, individual Internet-Draft, text
+re-read 2026-09-29). Both chains use JCS + SHA-256, but the draft's §6.1 defines
+`prev_hash(N) = hex(SHA-256(JCS(record(N-1))))` over the **complete previous record as stored, including all of its
+fields** (its own `prev_hash`, any signature; only a detached `batch` object is removed, §6.3). Ours is
+`prevHash(N) = hash(N-1)` where `hash = SHA-256(JCS(record without its own hash field))`, and our records carry a `hash`
+field the draft's do not, use camelCase names, and write `"0"` rather than `null` on genesis. A draft verifier fed our
+records byte-for-byte would fail at record 1, and renaming fields cannot fix that: the two hash inputs differ. So:
+our chain is verified by **our** `ledger.verify()`; the mapping table below is a vocabulary bridge for reports and
+conversations with auditors, nothing more. **Future work, not current behavior:** an export that re-emits records in the
+draft's schema and **re-hashes** them into a fresh draft-conformant chain, anchored separately from our own chain, so
+that either chain can be verified by its own rules. We keep camelCase and our vocabulary; the report module can emit
+the draft's names from this table:
 
 | Ours | Draft | Note |
 |---|---|---|
@@ -160,25 +182,51 @@ our vocabulary; the report module can emit the draft's names from this table:
 1. `front` receives an `IncomingCall` (credential attached). The pipeline calls `deps.identity.resolveAgent(credential)`
    and `startSession(...)`, then builds the authenticated `ToolCall` by explicit field projection (§5, never a spread).
    An unknown agent is denied before any other step.
-2. `policy.evaluate(registry, call)` returns `allow`, `deny`, or `require_approval` with a risk class (§8).
-3. If `require_approval`: `approvals.request(call, decision)`. A timeout counts as `denied`.
-4. `ledger.append(intent record)`. **This happens before execution**, so there's never an unlogged risky action.
+2. `policy.evaluate(registry, call)` returns `allow`, `deny`, or `require_approval` with a risk class (§8). Lookups are
+   exact, case-sensitive, own-property only.
+3. If `require_approval`: `approvals.requestApproval(call, decision, channel)` on a `slack` channel. `timeout` (nobody
+   answered in `timeoutMs`) and `unavailable` (channel configured but unreachable or erroring) both count as denied.
+   Proxy mode with `hook-ask` is a configuration error: there is no terminal to ask in, so `createPipeline` refuses it.
+4. `ledger.append(intent record)`, carrying the `ApprovalResult` when there is one. **This happens before execution**,
+   so there's never an unlogged risky action. **An approved risky call proceeds only after this append has succeeded**;
+   if the append fails, the call is blocked (§7), approval or not.
 5. If allowed: `upstream.execute(call)` using credentials from `secrets`.
 6. `ledger.append(outcome record)` → the result is returned to the agent.
 
-**Decide-only mode** (`pipeline.decide`, run by the `hook` command):
+**Decide-only mode** (`pipeline.decide`, run by the `hook` command under `hooks.runHookSupervised`, §7):
 
 1. `hooks.parseHookInput(stdin)` → `PreToolUseEvent`; `hooks.toIncomingCall(ev, credential)` sets `callId = tool_use_id`,
-   maps a built-in `tool_name` to server `claude-code` and `mcp__<server>__<tool>` to `<server>/<tool>`, `args = tool_input`.
+   `args = tool_input`, and names the server:
+   - `mcp__<server>__<tool>` → `<server>/<tool>`, split at the first `__` after the prefix, server segment verbatim (plugin
+     form `plugin_<plugin>_<server>` included). If the server segment, lowercased and stripped of everything outside
+     `[a-z0-9]`, is `claudecode` or `builtinclaudecode`, the collector **throws** (→ deny): an MCP server is impersonating
+     the built-in namespace. `mcp__claude-code__Read` therefore never resolves to the built-in `Read` row; if it somehow
+     reached the registry it would be server `claude-code`, an unreviewed MCP server, and `require_approval`.
+   - a name without the prefix but with an `mcp_server` provenance object (Claude Code ≥ 2.1.274) → throw (malformed).
+   - any other name → built-in tool on server **`builtin:claude-code`**. MCP cannot produce a `:` in a server segment
+     (Claude Code allows only `[A-Za-z0-9_-]` in MCP server names and rewrites anything else to `_`, verified 2026-09-29 at
+     https://code.claude.com/docs/en/mcp), so this key is unreachable from MCP by construction.
 2. Steps 1-4 above, then **stop**: nothing is executed, Claude Code runs the tool itself.
 3. `hooks.formatPreToolUseOutput(decision)` prints
    `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow|deny|ask","permissionDecisionReason":"..."}}`
-   with exit code 0. `allow` ↔ verdict allow; `deny` ↔ verdict deny, approval denied, or timeout; `ask` ↔ require_approval
-   when no approval channel is configured (Claude Code then asks the user). We never emit `defer`.
-4. On `PostToolUse`, `pipeline.recordOutcome(tool_use_id, outcome)` appends the outcome record.
+   with exit code 0. Mapping:
+   - `allow` ↔ verdict allow; or verdict `require_approval` + Slack `approved`, **only after the intent record carrying that
+     approval has persisted** (a failed append is a `deny`, never a silent allow);
+   - `deny` ↔ verdict deny; approval `denied`, `timeout`, or `unavailable`; or any internal failure (§7);
+   - `ask` ↔ verdict `require_approval` with `approvals: { kind: "hook-ask" }` (local mode, no channel). The intent record is
+     written first with `approval.decision = "delegated"`, then Claude Code prompts the human in the terminal. We do not
+     see the human's answer directly: if they allow, the tool runs and `PostToolUse`/`PostToolUseFailure` produce the outcome
+     record; if they deny, no outcome arrives (Claude Code fires `PermissionDenied`, an adapter for it is future work) and
+     the intent record stands alone as "asked, not run". We never emit `defer`.
+4. On `PostToolUse`, `pipeline.recordOutcome(tool_use_id, { status: "ok" })`. On **`PostToolUseFailure`** (fires when a tool
+   that started executing fails; verified 2026-09-29, it does **not** fire for permission denials or validation rejections),
+   `pipeline.recordOutcome(tool_use_id, { status: "error", errorClass, durationMs: duration_ms })`, where `errorClass` is
+   `interrupt` when `is_interrupt` is true, else the `Exit code N` first line of `error` when present, else `tool-error`. The
+   `error` text itself is display text (may carry secrets, format unstable) and is not stored. Fixtures:
+   `test/fixtures/claude-code-{pretooluse,posttooluse,posttoolusefailure}.json`.
 
-A call that is denied (by policy, a human, or a timeout) gets one record with `phase: "outcome"` and
-`outcome.status: "blocked"`, and it never reaches `upstream`. Blocked attempts are evidence too.
+A call that is denied (by policy, a human, a timeout, an unavailable channel, or an internal failure) gets one record with
+`phase: "outcome"` and `outcome.status: "blocked"`, and it never reaches `upstream`. Blocked attempts are evidence too.
 
 ## 7. Failure behavior
 
@@ -198,10 +246,51 @@ Behavior depends on the call's risk class, which comes from the registry row or 
 
 | Failure | Behavior |
 |---|---|
-| Approvals unavailable | `risky` and `unreviewed` calls blocked (read and write calls never need approval) |
-| Registry file invalid (unknown field, bad class, missing reviewer, downgrading escalation) | Proxy and hook refuse to start, whatever the call |
-| Upstream error | Outcome recorded as `error` |
-| Hook command crashes | Exit code 2 blocks the tool call in Claude Code; a crash is never an allow |
+| Approvals `unavailable` (Slack configured but unreachable, non-2xx, auth failure) | `ApprovalResult.decision = "unavailable"` → **deny**; `risky` and `unreviewed` calls blocked (read and write calls never need approval). Distinct from "no channel", which is the explicit `hook-ask` kind, not an absence |
+| Approval `approved` but the intent record fails to persist | **deny**. An allow is emitted only after the append succeeded (§6) |
+| Registry file invalid (unknown field, bad class, missing reviewer, downgrading escalation, reserved or impersonating key, case-twin keys, §8) | Proxy and hook refuse to start, whatever the call |
+| Upstream error / `PostToolUseFailure` | Outcome recorded as `error` |
+| Hook handler throws, rejects, gets malformed stdin, or misses its internal deadline | The **fail-closed supervisor** emits a JSON `deny` **and** exit 2 (below) |
+
+**Fail-closed hook supervisor.** What Claude Code actually does with a PreToolUse hook, verified 2026-09-29 at
+https://code.claude.com/docs/en/hooks (#exit-code-output, #timeouts, #exit-code-2-behavior-per-event):
+
+| Hook outcome | Claude Code's behavior |
+|---|---|
+| exit 2 (any stdout) | **Blocks** the tool call; JSON cannot override it |
+| exit 0 + JSON `permissionDecision: "deny"` | **Blocks** |
+| exit 0 + JSON `allow` / `ask` / `defer` | That decision |
+| exit 0 without a decision | **Continues** through the normal permission flow |
+| exit 1 or any other code, no valid JSON | **Continues** (non-blocking error notice) |
+| stdout that fails JSON parsing or schema validation (exit ≠ 2) | **Continues** |
+| hook reaches its `timeout` (default 600 s) | Output discarded, **continues**: "don't count on a stalled hook to act as a gate" |
+| hook binary missing or not executable (exit 127) | **Continues** |
+
+So without help, every internal failure of our hook is an allow. The `hook` command therefore never runs the handler bare;
+it runs it through `hooks.runHookSupervised(handler, { deadlineMs })`:
+
+- The supervised region covers reading and parsing stdin, `toIncomingCall`, `pipeline.decide`, and serialisation. A thrown
+  error, a rejected promise, malformed stdin, an `unhandledRejection`/`uncaughtException`, or an unserialisable decision all
+  become stdout `{"hookSpecificOutput":{...,"permissionDecision":"deny","permissionDecisionReason":"supervisor:<class>"}}`,
+  the same reason on stderr, and **exit 2**. Both channels, because exit 2 blocks even if stdout were lost, and the JSON gives
+  the human a readable reason.
+- An internal deadline (`DEFAULT_DEADLINE_MS` = 25 s) fires **before** the hook `timeout` we configure in settings
+  (`HOOK_TIMEOUT_S` = 30 s; Claude Code's own default is 600 s and must not be relied on). A deadline miss is a deny with
+  reason `supervisor:deadline`. `runHookSupervised` refuses a `deadlineMs` that is not below the configured timeout.
+- The supervisor never throws and never exits 0 without a decision. Runtime tests: `test/todo/hooks.todo.md`.
+
+**Residual limits, stated honestly.** The supervisor runs inside the hook process; whatever prevents that process from
+writing output is outside its reach, and in every such case **Claude Code continues**: the hook binary is missing, not
+executable, or its interpreter is gone (exit 127); the process is killed by the OS (OOM, SIGKILL) before writing; the
+user removes or edits the hook entry in their own settings; `disableAllHooks` is set in non-managed settings (this one
+cannot disable *managed* hooks). Mitigations live in Claude Code's configuration, not in our code:
+- Deploy the hook through **managed settings** (`managed-settings.json`, MDM, or server-managed settings) with
+  **`allowManagedHooksOnly: true`**, so user, project, local, and plugin hooks are blocked and the user cannot remove ours
+  (https://code.claude.com/docs/en/settings-reference#allowmanagedhooksonly, verified 2026-09-29; managed settings
+  precedence: https://code.claude.com/docs/en/settings). Managed hooks merge with, and cannot be disabled by, lower levels.
+- A **health check**: a `SessionStart` hook that verifies the binary runs and writes a heartbeat record; the report flags a
+  session that has tool calls but no heartbeat, or a heartbeat but a gap in `PreToolUse` intent records.
+- Server mode has none of this: the proxy holds the credentials, so a dead hook cannot let a call through.
 
 The read/write split is an assumption to test in Phase 1 calls (open question in `_state.md`).
 
@@ -226,17 +315,39 @@ servers:
         reviewedBy: ryan
         reviewedAt: 2026-09-29
         escalateWhen: [{ argPattern: { branch: "^(main|master|release/.*)$" }, to: risky }]
-  claude-code:                          # pseudo-server for Claude Code's built-in tools (hook collector)
+  "builtin:claude-code":                # Claude Code's built-in tools (hook collector); reserved namespace, see below
     trusted: true
     tools: { Read: {class: read, ...}, Edit: {class: write, ...}, Bash: {class: risky, note: "a shell can do anything", ...} }
 ```
+
+**Server identity.** Registry keys are matched **exactly, case-sensitively, by own property** (`Object.hasOwn`, or a
+`Map` the loader builds). A key is one of two things:
+- **`builtin:claude-code`**, the one legal key containing `:`. Built-in tools live here because MCP can never reach it:
+  Claude Code accepts only `[A-Za-z0-9_-]` in an MCP server name (`claude mcp add`), and in every `mcp__<server>__<tool>`
+  callable name any other character is replaced with `_` (https://code.claude.com/docs/en/mcp, verified 2026-09-29). A
+  plugin server registers as `plugin:<plugin>:<server>` internally, yet its tools appear as `mcp__plugin_<plugin>_<server>__`.
+  So `mcp__claude-code__Read`, `mcp__claude-code__Edit`, and `mcp__builtin_claude-code__Bash` split into servers
+  `claude-code` and `builtin_claude-code`: not this key, so they inherit nothing and are `unreviewed` → `require_approval`
+  (regression rows in `test/registry.test.ts`), and the collector refuses them outright (§6).
+- an **MCP server name** matching `/^[A-Za-z0-9_-]+$/`.
+
+The loader **refuses** a registry with: any other key containing `:` (`builtin:codex` waits for a real Codex adapter); a
+non-builtin key that **normalises** (lowercase, strip everything outside `[a-z0-9]`) to `claudecode` or `builtinclaudecode`
+(`claude-code`, `Claude_Code`, `builtin_claude-code`, `builtin-claude-code`); two server keys, or two tool keys under one
+server, that are equal case-insensitively (`github` + `GitHub`, `Read` + `read`), because a case twin must never be
+mistaken for a reviewed row while lookups stay case-sensitive; and any server or tool key in `RESERVED_KEYS`
+(`__proto__`, `constructor`, `prototype`) or otherwise `in Object.prototype` (`toString`, `hasOwnProperty`, ...). Verified
+2026-09-29 with `yaml` 2.9.1: a YAML `__proto__` key parses as an own property (no prototype pollution) and duplicate keys
+are a parse error, but `"constructor" in servers.github` is `true` and `servers.github.tools["constructor"]` returns
+`Object.prototype.constructor`, so a naive `if (!row)` check would skip the unreviewed branch. Hence own-property lookups
+everywhere (`evaluate`, `argPattern` matching, the test evaluator) and the refusals above.
 
 **Evaluation** (`policy.evaluate(registry, call)`):
 
 | Situation | Verdict | Risk | ruleId |
 |---|---|---|---|
-| Server not in registry | `require_approval` | `unreviewed` | `unreviewed:<server>/<tool>` |
-| Server known, tool not listed | `require_approval` | `unreviewed` | `unreviewed:<server>/<tool>` |
+| Server not in registry (own-property, case-sensitive: `GitHub`, `constructor`, `__proto__`, `claude-code` are all "not in") | `require_approval` | `unreviewed` | `unreviewed:<server>/<tool>` |
+| Server known, tool not listed (same rule: `github/constructor`, `github/toString` are "not listed") | `require_approval` | `unreviewed` | `unreviewed:<server>/<tool>` |
 | Row class `read` | `allow` | `read` | `registry:<server>/<tool>` |
 | Row class `write` | `allow` | `write` | `registry:<server>/<tool>` |
 | Row class `risky` | `require_approval` | `risky` | `registry:<server>/<tool>` |
@@ -280,8 +391,13 @@ Vitest. Must-have tests:
 - Editing any one ledger record makes `verify()` fail at that record.
 - A registry table test: at least 20 calls with their expected verdicts, including the unreviewed regression rows
   `get_then_deploy`, `wipe_bucket`, `terminate_instance`, `push_to_main`, `deploy_production({environment:"dev"})`.
-- The hook fixtures in `test/fixtures/` keep the documented field names (format-drift guard).
-- An approval timeout blocks the call and records `timeout`.
+- The hook fixtures in `test/fixtures/` keep the documented field names (format-drift guard), PostToolUseFailure included.
+- Identity regressions: `mcp__claude-code__Read`, `mcp__claude-code__Edit`, `mcp__builtin_claude-code__Bash` never
+  inherit `builtin:claude-code` rows; `github/constructor`, server `constructor`, `__proto__` are unreviewed; the loader
+  refuses reserved, impersonating, and case-twin keys.
+- Supervisor: a thrown error → deny + exit 2; a missed deadline → deny before the hook timeout; malformed stdin → deny.
+- An approval timeout blocks the call and records `timeout`; an unreachable channel records `unavailable` and blocks.
+- An approved risky call is allowed only after the intent record persisted; a failed append after approval is a deny.
 - A secret in args never appears in stored records.
 - Ledger down + risky or unreviewed call means the call is blocked.
 - A local-mode JSONL chain verifies after restart.
