@@ -12,5 +12,8 @@
     "typescript": "7.0.2",
     "vitest": "4.1.11",
     "yaml": "2.9.1"
+  },
+  "dependencies": {
+    "canonicalize": "5.1.0"
   }
 }
