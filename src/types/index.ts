@@ -1,6 +1,19 @@
 export type AgentId = string;
 export type SessionId = string;
 
+/** What an agent presents to prove who it is. Never stored: it appears only in IncomingCall. */
+export interface AgentCredential { kind: "api_key" | "local"; value: string; }
+
+/** A call as the front receives it: unauthenticated. The pipeline turns it into a ToolCall. */
+export interface IncomingCall {
+  callId: string; credential: AgentCredential;
+  server: string; tool: string;
+  args: Record<string, unknown>;
+  receivedAt: string;
+  onBehalfOf?: string; declaredPlan?: string;
+}
+
+/** An authenticated call. No credential here, so none can reach the ledger. */
 export interface ToolCall {
   callId: string; sessionId: SessionId; agentId: AgentId;
   onBehalfOf?: string; declaredPlan?: string;
@@ -15,6 +28,7 @@ export type Risk = "read" | "write" | "risky";
 export interface PolicyDecision { verdict: Verdict; ruleId: string; reason: string; risk: Risk; }
 
 export interface ApprovalResult {
+  callId: string;               // ties the approval to one call, so replay on another call is detectable
   decision: "approved" | "denied" | "timeout";
   approver?: string; decidedAt: string; channel: "slack";
 }
@@ -33,4 +47,4 @@ export interface VerifyResult { ok: boolean; checked: number; brokenAt?: string;
 export interface ToolInfo { server: string; name: string; description?: string; inputSchema?: unknown; }
 export interface ToolResult { content: unknown; isError: boolean; }
 export interface DateRange { from: string; to: string; }
-export type CallHandler = (call: ToolCall) => Promise<ToolResult>;
+export type CallHandler = (incoming: IncomingCall) => Promise<ToolResult>;
