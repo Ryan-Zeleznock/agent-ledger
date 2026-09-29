@@ -1,51 +1,65 @@
 version: 1
 # Rules are evaluated top to bottom; the first match wins. Unmatched calls get defaultDecision.
+# Patterns are case-insensitive regexes over the tool name; argPattern and unless test String(args[key]).
+#
+# ORDER MATTERS. The five risky rules come first, so a read-looking prefix can never shield a risky verb
+# later in the name (get_and_delete_record, list_and_remove_users). read-only and default-write follow.
+# Because reads are classified last, each risky pattern is written so plain read tools do not match it:
+# list_roles, get_policy, describe_iam_policy, get_deploy_status, list_payments all reach read-only.
 defaultDecision:
   verdict: allow
   risk: write
   ruleId: default
   reason: Unclassified action, logged
 rules:
-  # Read tools first, so a name like list_roles or get_deploy_status is never escalated by the risky rules.
-  - id: read-only
-    match: { tool: "^(get|list|read|search|describe|fetch|query)_" }
-    verdict: allow
-    risk: read
-    reason: Read-only action, logged
-  # Nonprod exception before risky-prod-deploy: only a known nonprod environment is allowed through.
-  - id: nonprod-deploy
-    match: { tool: "(deploy|release|merge)", argPattern: { environment: "^(dev|development|test|staging|sandbox)$" } }
-    verdict: allow
-    risk: write
-    reason: Deploy to a nonprod environment, logged
+  # Destructive verbs are risky wherever they appear in the name, so this pattern is unanchored.
+  # Conservative by design: remove_label and list_deleted_files also land here.
   - id: risky-delete
     match: { tool: "(delete|remove|destroy|drop|purge)" }
     verdict: require_approval
     risk: risky
     reason: Destructive action
+  # Money words are also nouns (list_payments, get_refund), so they count only at the start of the name
+  # or after a mutating verb or "and": pay_invoice, charge_card, create_refund, get_and_transfer_funds.
   - id: risky-payment
-    match: { tool: "(pay|charge|refund|transfer|payout|invoice_send)" }
+    match: { tool: "(^|(create|make|send|submit|issue|initiate|execute|process|capture|schedule|retry|and)_)(pay|charge|refund|transfer|payout|invoice)|invoice_send" }
     verdict: require_approval
     risk: risky
     reason: Money movement
+  # send/post forms are verb+noun already. "tweet" is also a noun (get_tweet, list_tweets), so it counts
+  # only at the start of the name or after a posting verb or "and".
   - id: risky-external-message
-    match: { tool: "(send_email|send_message|post_message|tweet)" }
+    match: { tool: "send_email|send_message|post_message|(^|(post|send|create|publish|reply_to|and)_)(tweet|retweet)" }
     verdict: require_approval
     risk: risky
     reason: Message to recipients outside the company
+  # A permission noun alone is not a change (list_roles, get_policy, describe_iam_policy).
+  # Risky only with a mutating verb before it: grant_deploy_permission, attach_role_policy, invite_user.
   - id: risky-iam-change
-    match: { tool: "(iam|role|policy|permission|grant|invite_user)" }
+    match: { tool: "(grant|revoke|attach|detach|assign|put|create|update|delete|add|remove|set|invite)[a-z0-9_]*(role|policy|permission|iam|user|group|member|access)" }
     verdict: require_approval
     risk: risky
     reason: Permission change
-  # No argPattern: a deploy with an unknown, missing, or prod environment requires approval.
+  # Deploy words are also nouns (get_deploy_status, list_releases), so they count only at the start of
+  # the name or after a mutating verb or "and": deploy_app, merge_pull_request, trigger_release.
+  # unless: a call whose environment is a KNOWN nonprod name does not match here and falls through to
+  # default-write. A missing, unknown, or prod environment still requires approval.
   - id: risky-prod-deploy
-    match: { tool: "(deploy|release|merge)" }
+    match:
+      tool: "(^|(create|start|trigger|run|execute|approve|apply|push|and)_)(deploy|release|merge|rollout|promote)"
+      unless: { argPattern: { environment: "^(dev|development|test|staging|sandbox)$" } }
     verdict: require_approval
     risk: risky
     reason: Production or unknown-environment change
+  # Read tools come AFTER the risky rules: a read prefix no longer hides a risky verb later in the name.
+  - id: read-only
+    match: { tool: "^(get|list|read|search|describe|fetch|query)_" }
+    verdict: allow
+    risk: read
+    reason: Read-only action, logged
+  # Includes the deploy words so a nonprod deploy released by the unless above lands here, not on defaultDecision.
   - id: default-write
-    match: { tool: "(create|update|write|edit|put|set)" }
+    match: { tool: "(create|update|write|edit|put|set|deploy|release|merge|rollout|promote)" }
     verdict: allow
     risk: write
     reason: Non-destructive write, logged
