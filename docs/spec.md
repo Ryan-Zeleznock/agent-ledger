@@ -93,21 +93,30 @@ interface LedgerRecord {
   writtenAt: string;
 }
 
-interface PolicyRule { id: string; match: { server?: string; tool?: string; argPattern?: Record<string, string> }; verdict: Verdict; risk: Risk; reason: string; }
+interface PolicyRule {
+  id: string;
+  match: { server?: string; tool?: string; argPattern?: Record<string, string>;
+           unless?: { argPattern: Record<string, string> } };   // rule does NOT match when every unless pattern matches
+  verdict: Verdict; risk: Risk; reason: string;
+}
 interface Policy { version: 1; rules: PolicyRule[]; defaultDecision: PolicyDecision; }   // first match wins
 
 interface IdentityService { resolveAgent(cred: AgentCredential): Promise<AgentId>; startSession(agentId: AgentId, onBehalfOf?: string): Promise<SessionId>; }
 interface PipelineDeps { identity: IdentityService; policy: Policy; ledger: LedgerStore; upstream: Upstream; approvals: ApprovalOptions; }
 ```
 
-`AgentCredential` appears only in `IncomingCall`. `ToolCall` and `LedgerRecord` have no field for it, so a
-credential can never reach the ledger.
+`AgentCredential` appears only in `IncomingCall`. `ToolCall` and `LedgerRecord` have no field for it. The type
+alone does not enforce this at runtime (a spread `{ ...incoming, agentId, sessionId }` would keep `credential`
+on the object), so the pipeline builds `ToolCall` by **explicit field projection** and never spreads
+`IncomingCall`: `{ callId, sessionId, agentId, onBehalfOf, declaredPlan, server, tool, args, receivedAt }`, each
+copied by name. A runtime test pins this (`test/todo/pipeline.todo.md`).
 
 ## 6. Flow of one tool call
 
 1. `front` receives an `IncomingCall` (credential attached) and passes it to the `CallHandler` that
    `pipeline.createPipeline(deps)` returned. The pipeline calls `deps.identity.resolveAgent(credential)` and
-   `startSession(...)`, then builds the authenticated `ToolCall`. An unknown agent is denied before any other step.
+   `startSession(...)`, then builds the authenticated `ToolCall` by explicit field projection (§5, never a spread).
+   An unknown agent is denied before any other step.
 2. `policy.evaluate(call)` returns `allow`, `deny`, or `require_approval`.
 3. If `require_approval`: `approvals.request(call, decision)`. A timeout counts as `denied`.
 4. `ledger.append(intent record)`. **This happens before execution**, so there's never an unlogged risky action.
@@ -143,24 +152,44 @@ The read/write split is an assumption to test in Phase 1 calls (open question in
 
 ## 8. Default policy (`policies/default.yaml`)
 
-Rules match on server, tool name, and argument patterns. They are evaluated **top to bottom and the first
-match wins**, so order is part of the policy:
+Rules match on server, tool name, and argument patterns; all patterns are case-insensitive regexes. They are
+evaluated **top to bottom and the first match wins**, so order is part of the policy:
 
-1. **Read rules** come first: tools named `^(get|list|read|search|describe|fetch|query)_` are `allow` / `read`.
-   This stops the broad risky patterns below from escalating `list_roles` or `get_deploy_status`.
-2. **Nonprod exception**: `deploy|release|merge` with `environment` matching
-   `^(dev|development|test|staging|sandbox)$` is `allow` / `write`.
-3. **Five risky action types** require approval: deletes, payments or money movement, email or messages to
-   external recipients, IAM or permission changes, and deploys. The deploy rule has **no** argument pattern, so a
-   deploy with a prod, unknown, or missing `environment` requires approval; only the exception above lets it pass.
-4. **Writes** (`create|update|write|edit|put|set`) are `allow` / `write`.
-5. Anything unmatched gets `defaultDecision`: `allow`, risk `write`, ruleId `default`, "Unclassified action, logged".
+1. **Five risky rules first**, all `require_approval` / `risky`:
+   - `risky-delete`: `delete|remove|destroy|drop|purge`, **unanchored**, so the verb is caught anywhere in the
+     name (`get_and_delete_record`). Conservative on purpose: `remove_label` needs approval too.
+   - `risky-payment`: `pay|charge|refund|transfer|payout|invoice` at the start of the name or after a mutating
+     verb or `and` (`pay_invoice`, `create_refund`, `get_and_transfer_funds`).
+   - `risky-external-message`: `send_email|send_message|post_message`, plus `tweet|retweet` at the start or after
+     a posting verb. Recipient-based matching (internal vs external) is a deferred P2.
+   - `risky-iam-change`: a **mutating verb** (`grant|revoke|attach|detach|assign|put|create|update|delete|add|
+     remove|set|invite`) followed by a permission noun (`role|policy|permission|iam|user|group|member|access`).
+     The noun alone is not a change, so `list_roles` and `describe_iam_policy` fall through to read-only.
+   - `risky-prod-deploy`: `deploy|release|merge|rollout|promote` at the start or after a mutating verb or `and`,
+     **unless** `environment` matches `^(dev|development|test|staging|sandbox)$`. A missing, unknown, or prod
+     environment requires approval; a known nonprod one does not match this rule and falls through to
+     `default-write`. The exception lives on this rule only, so `delete_deployment` or
+     `grant_deploy_permission` in staging still hit `risky-delete` / `risky-iam-change` above.
+2. **`read-only`**: `^(get|list|read|search|describe|fetch|query)_` is `allow` / `read`.
+3. **`default-write`**: `create|update|write|edit|put|set|deploy|release|merge|rollout|promote` is `allow` / `write`.
+4. Anything unmatched gets `defaultDecision`: `allow`, risk `write`, ruleId `default`, "Unclassified action, logged".
+
+**Why risky rules come first.** With read rules first, any name with a read prefix skipped approval:
+`get_and_delete_record` and `list_and_remove_users` were classified `read`, so they ran without approval and
+even during a ledger outage (§7). Putting the risky rules first closes that; the cost is that each risky
+pattern must be written so plain read tools (`list_roles`, `get_deploy_status`, `list_payments`) do not match
+it, which is why the noun-like patterns require a leading position or a mutating verb, while the destructive
+verbs stay unanchored. A false positive here means an unneeded approval; a false negative means an unlogged-
+approval risky action. The default errs toward the former.
 
 Everything is logged, whatever the verdict.
 
 ## 9. Security of the proxy itself
 
 - The proxy is the credential boundary. Agents never receive upstream secrets.
+- The agent's own credential stops at identity: `ToolCall` is built from `IncomingCall` by explicit field
+  projection (§5), never by spreading it, so no `credential` property exists on anything the ledger stores.
+  Runtime tests assert both the projected object and the stored record JSON (`test/todo/pipeline.todo.md`).
 - Redaction (secrets and PII patterns) runs **before** hashing and storage. Raw args are never persisted.
 - The ledger can only be appended to. Edits and deletes are impossible through the API, and any tampering
   is caught by chain verification plus the daily anchor.
