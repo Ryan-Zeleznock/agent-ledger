@@ -21,7 +21,7 @@ ADR-002 still holds, so this phase delivers **no business logic**. It delivers:
 - A contract file per module (`contract.ts`): exported types and function signatures whose bodies
   `throw new Error("not implemented")`.
 - Shared types in `src/types/`. This is the one place where the data shapes are final.
-- A test list per module (`test/<module>.todo.md`) so development after Gate 2 starts test-first.
+- A test list per module (`test/todo/<module>.todo.md`) so development after Gate 2 starts test-first.
 - A default policy file and the Docker Compose skeleton, marked not runnable yet.
 
 ## 3. Deployment modes (one codebase)
@@ -39,16 +39,16 @@ then server mode for design partners.
 
 | # | Folder | Job (exactly one) | Depends on |
 |---|---|---|---|
-| 1 | `src/front/` | MCP server the agent connects to (stdio + HTTP); lists tools, accepts calls | types, pipeline |
+| 1 | `src/front/` | MCP server the agent connects to (stdio + HTTP); lists tools, hands each call to an injected `CallHandler` as an unauthenticated `IncomingCall` | types (the handler is injected) |
 | 2 | `src/upstream/` | MCP clients to the real tool servers; combines their tool lists | types, secrets |
 | 3 | `src/identity/` | Authenticate the agent; create and track sessions | types |
 | 4 | `src/secrets/` | Hand upstream credentials to `upstream/` only. Backends: env/file (local), Secrets Manager (later). | types |
 | 5 | `src/policy/` | Evaluate a ToolCall against YAML rules and return a PolicyDecision | types |
 | 6 | `src/approvals/` | Ask a human (Slack) and return an ApprovalResult; deny on timeout | types |
 | 7 | `src/ledger/` | Redact, hash-chain, and append records; verify the chain | types |
-| 8 | `src/anchor/` | Record the chain head daily somewhere hard to edit. Backends: local file (now), S3 Object Lock (later). | types, ledger |
+| 8 | `src/anchor/` | Record the chain head daily somewhere hard to edit. Backends: local file (now), S3 Object Lock (later). | types (it receives the head hash) |
 | 9 | `src/report/` | Turn ledger records for a date range into PDF + CSV mapped to SOC 2 criteria | types, ledger |
-| n/a | `src/pipeline/` | Wire 3 → 5 → 6 → 7 → 2 → 7 for one call (the only module that knows the order) | all of the above |
+| n/a | `src/pipeline/` | Wire 3 → 5 → 6 → 7 → 2 → 7 for one call (the only module that knows the order). Receives 3, 5, 6, 7, 2 through `PipelineDeps` and returns the `CallHandler` that `front` runs | identity, policy, approvals, ledger, upstream, types |
 
 **Later, not scaffolded now:** 10, intent-vs-action drift detection (v2: `declare_plan` tool, rules, an
 LLM judge, baselines); 11, the Terraform module.
@@ -58,7 +58,16 @@ LLM judge, baselines); 11, the Terraform module.
 ```ts
 type AgentId = string; type SessionId = string;
 
-interface ToolCall {
+interface AgentCredential { kind: "api_key" | "local"; value: string; }   // never stored
+
+interface IncomingCall {          // what `front` receives: unauthenticated
+  callId: string; credential: AgentCredential;
+  server: string; tool: string; args: Record<string, unknown>; receivedAt: string;
+  onBehalfOf?: string; declaredPlan?: string;
+}
+type CallHandler = (incoming: IncomingCall) => Promise<ToolResult>;   // built by pipeline, run by front
+
+interface ToolCall {              // authenticated by the pipeline; carries no credential
   callId: string; sessionId: SessionId; agentId: AgentId;
   onBehalfOf?: string;          // the human the agent acts for
   declaredPlan?: string;        // v2 intent capture; optional now
@@ -70,7 +79,10 @@ interface ToolCall {
 type Verdict = "allow" | "deny" | "require_approval";
 interface PolicyDecision { verdict: Verdict; ruleId: string; reason: string; risk: "read" | "write" | "risky"; }
 
-interface ApprovalResult { decision: "approved" | "denied" | "timeout"; approver?: string; decidedAt: string; channel: "slack"; }
+interface ApprovalResult {
+  callId: string;                 // bound to one call, so a replayed approval is detectable
+  decision: "approved" | "denied" | "timeout"; approver?: string; decidedAt: string; channel: "slack";
+}
 
 type Phase = "intent" | "outcome";
 interface LedgerRecord {
@@ -80,11 +92,22 @@ interface LedgerRecord {
   prevHash: string; hash: string;             // hash = SHA-256(canonical JSON of the record without its hash field)
   writtenAt: string;
 }
+
+interface PolicyRule { id: string; match: { server?: string; tool?: string; argPattern?: Record<string, string> }; verdict: Verdict; risk: Risk; reason: string; }
+interface Policy { version: 1; rules: PolicyRule[]; defaultDecision: PolicyDecision; }   // first match wins
+
+interface IdentityService { resolveAgent(cred: AgentCredential): Promise<AgentId>; startSession(agentId: AgentId, onBehalfOf?: string): Promise<SessionId>; }
+interface PipelineDeps { identity: IdentityService; policy: Policy; ledger: LedgerStore; upstream: Upstream; approvals: ApprovalOptions; }
 ```
+
+`AgentCredential` appears only in `IncomingCall`. `ToolCall` and `LedgerRecord` have no field for it, so a
+credential can never reach the ledger.
 
 ## 6. Flow of one tool call
 
-1. `front` receives the call → `identity` resolves the agent and session. An unknown agent is denied.
+1. `front` receives an `IncomingCall` (credential attached) and passes it to the `CallHandler` that
+   `pipeline.createPipeline(deps)` returned. The pipeline calls `deps.identity.resolveAgent(credential)` and
+   `startSession(...)`, then builds the authenticated `ToolCall`. An unknown agent is denied before any other step.
 2. `policy.evaluate(call)` returns `allow`, `deny`, or `require_approval`.
 3. If `require_approval`: `approvals.request(call, decision)`. A timeout counts as `denied`.
 4. `ledger.append(intent record)`. **This happens before execution**, so there's never an unlogged risky action.
@@ -96,20 +119,44 @@ A call that is denied (by policy, a human, or a timeout) gets one record with `p
 
 ## 7. Failure behavior
 
-| Failure | Risky call | Read-only call |
-|---|---|---|
-| Ledger unavailable | **Blocked** (fail-closed) | Allowed; record buffered locally and replayed |
-| Approvals unavailable | Blocked | n/a |
-| Policy file invalid | Proxy refuses to start | Proxy refuses to start |
-| Upstream error | Outcome recorded as `error` | Same |
+Behavior depends on the call's risk class, which comes from the matching rule or from `defaultDecision`
+(so every call has one).
 
-This split is an assumption to test in Phase 1 calls (open question in `_state.md`).
+**Ledger unavailable**, by risk class:
+
+| Risk | Behavior |
+|---|---|
+| `read` | Allowed; record buffered locally and replayed when the ledger returns |
+| `write` | **Blocked** (fail-closed) |
+| `risky` | **Blocked** (fail-closed) |
+
+**Other failures:**
+
+| Failure | Behavior |
+|---|---|
+| Approvals unavailable | Risky call blocked (read and write calls never need approval) |
+| Policy file invalid | Proxy refuses to start, whatever the call |
+| Upstream error | Outcome recorded as `error` |
+
+Unmatched calls default to `write`, so anything the policy doesn't recognize fails closed.
+The read/write split is an assumption to test in Phase 1 calls (open question in `_state.md`).
 
 ## 8. Default policy (`policies/default.yaml`)
 
-Five risky action types require approval by default: deletes, payments or money movement, email or
-messages to external recipients, IAM or permission changes, and production deploys. Everything else is
-classified `read` or `write` and allowed, but still logged. Rules match on server, tool name, and argument patterns.
+Rules match on server, tool name, and argument patterns. They are evaluated **top to bottom and the first
+match wins**, so order is part of the policy:
+
+1. **Read rules** come first: tools named `^(get|list|read|search|describe|fetch|query)_` are `allow` / `read`.
+   This stops the broad risky patterns below from escalating `list_roles` or `get_deploy_status`.
+2. **Nonprod exception**: `deploy|release|merge` with `environment` matching
+   `^(dev|development|test|staging|sandbox)$` is `allow` / `write`.
+3. **Five risky action types** require approval: deletes, payments or money movement, email or messages to
+   external recipients, IAM or permission changes, and deploys. The deploy rule has **no** argument pattern, so a
+   deploy with a prod, unknown, or missing `environment` requires approval; only the exception above lets it pass.
+4. **Writes** (`create|update|write|edit|put|set`) are `allow` / `write`.
+5. Anything unmatched gets `defaultDecision`: `allow`, risk `write`, ruleId `default`, "Unclassified action, logged".
+
+Everything is logged, whatever the verdict.
 
 ## 9. Security of the proxy itself
 
