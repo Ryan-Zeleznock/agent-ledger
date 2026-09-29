@@ -1,0 +1,33 @@
+version: 1
+defaultVerdict: allow
+rules:
+  - id: risky-delete
+    match: { tool: "(delete|remove|destroy|drop|purge)" }
+    verdict: require_approval
+    risk: risky
+    reason: Destructive action
+  - id: risky-payment
+    match: { tool: "(pay|charge|refund|transfer|payout|invoice_send)" }
+    verdict: require_approval
+    risk: risky
+    reason: Money movement
+  - id: risky-external-message
+    match: { tool: "(send_email|send_message|post_message|tweet)" }
+    verdict: require_approval
+    risk: risky
+    reason: Message to recipients outside the company
+  - id: risky-iam-change
+    match: { tool: "(iam|role|policy|permission|grant|invite_user)" }
+    verdict: require_approval
+    risk: risky
+    reason: Permission change
+  - id: risky-prod-deploy
+    match: { tool: "(deploy|release|merge)", argPattern: { environment: "^prod" } }
+    verdict: require_approval
+    risk: risky
+    reason: Production change
+  - id: default-write
+    match: { tool: "(create|update|write|edit|put|set)" }
+    verdict: allow
+    risk: write
+    reason: Non-destructive write, logged

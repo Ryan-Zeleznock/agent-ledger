@@ -1,0 +1,18 @@
+# NOT RUNNABLE YET (ADR-002): the proxy image is built after Gate 2.
+# Server mode = proxy (HTTP) + Postgres ledger. Local mode needs no compose at all.
+services:
+  proxy:
+    build: .
+    command: ["node", "dist/main.js", "--mode", "http", "--port", "8787"]
+    ports: ["8787:8787"]
+    environment:
+      LEDGER_KIND: postgres
+      LEDGER_TARGET: postgres://ledger:ledger@db:5432/ledger
+      POLICY_PATH: /app/policies/default.yaml
+    depends_on: [db]
+  db:
+    image: postgres:17
+    environment: { POSTGRES_USER: ledger, POSTGRES_PASSWORD: ledger, POSTGRES_DB: ledger }
+    volumes: ["ledger-data:/var/lib/postgresql/data"]
+volumes:
+  ledger-data: {}
