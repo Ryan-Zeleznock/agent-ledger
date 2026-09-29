@@ -1,0 +1,46 @@
+# SUGGESTIONS ONLY, NEVER AUTHORITY (ADR-004).
+#
+# These name patterns are read by exactly one function, policy.suggestClass, which proposes a class for a tool
+# while a human builds policies/tools.yaml from `tools/list`. They never decide a call. Three Astra review rounds
+# showed that regexes over tool names do not converge as an authorization boundary (get_then_deploy, wipe_bucket,
+# deploy_production({environment:"dev"})), which is why the reviewed registry replaced them.
+#
+# Rules are tried top to bottom over the tool name; patterns are case-insensitive regexes; the first match wins.
+# `default` applies when nothing matches and is deliberately `risky`, so an unfamiliar name draws the reviewer's eye.
+version: 1
+default:
+  class: risky
+  reason: No pattern matched; classify by hand
+rules:
+  # Destructive verbs are risky wherever they appear in the name, so this pattern is unanchored.
+  - id: risky-delete
+    tool: "(delete|remove|destroy|drop|purge|wipe|truncate|kill|terminate|undeploy)"
+    class: risky
+    reason: Destructive verb in the name
+  # Money words are also nouns (list_payments, get_refund): they count at the start or after a mutating verb or a joiner.
+  - id: risky-payment
+    tool: "(^|(create|make|send|submit|issue|initiate|execute|process|capture|schedule|retry|and|then)_)(pay|charge|refund|transfer|payout|invoice)|invoice_send"
+    class: risky
+    reason: Money movement
+  - id: risky-external-message
+    tool: "send_email|send_message|post_message|reply_to_email|forward_email|(^|(post|send|create|publish|reply_to|and|then)_)(tweet|retweet)"
+    class: risky
+    reason: Message to recipients outside the company
+  # A permission noun alone is not a change (list_roles, get_policy); risky only with a mutating verb before it.
+  - id: risky-iam-change
+    tool: "(grant|revoke|attach|detach|assign|put|create|update|delete|add|remove|set|invite|rotate)[a-z0-9_]*(role|policy|permission|iam|user|group|member|access|token|key)"
+    class: risky
+    reason: Permission or credential change
+  # Deploy words are also nouns (get_deploy_status, list_releases). No environment exception: arguments never lower a class.
+  - id: risky-deploy
+    tool: "(^|(create|start|trigger|run|execute|approve|apply|push|and|then)_)(deploy|release|merge|rollout|promote|publish|push)"
+    class: risky
+    reason: Deployment or publication
+  - id: read-only
+    tool: "^(get|list|read|search|describe|fetch|query)_"
+    class: read
+    reason: Read-only prefix
+  - id: write
+    tool: "(create|update|write|edit|put|set|add|append)"
+    class: write
+    reason: Non-destructive mutating verb

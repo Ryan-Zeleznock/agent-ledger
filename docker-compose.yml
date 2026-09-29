@@ -8,7 +8,8 @@ services:
     environment:
       LEDGER_KIND: postgres
       LEDGER_TARGET: postgres://ledger:ledger@db:5432/ledger
-      POLICY_PATH: /app/policies/default.yaml
+      REGISTRY_PATH: /app/policies/tools.yaml
+      SUGGESTIONS_PATH: /app/policies/suggestions.yaml
     depends_on: [db]
   db:
     image: postgres:17

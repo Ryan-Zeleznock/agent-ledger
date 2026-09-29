@@ -1,0 +1,77 @@
+# Reviewed tool registry: the ONLY authority for classifying a tool call (ADR-004).
+#
+# A tool is read, write, or risky because a named human reviewed it and said so. Anything not listed here,
+# on a listed server or not, is `unreviewed` and requires approval. Nothing in this file can lower a class:
+# `escalateWhen` may only raise it (write -> risky, read -> write|risky); the loader refuses anything else.
+# `trusted` says whether the server's MCP annotations (readOnlyHint etc.) may be used as a SUGGESTION at review
+# time. It changes nothing at call time. Name patterns live in policies/suggestions.yaml and only suggest too.
+#
+# Build this file at setup from `tools/list` with `suggestClass`, then have a human confirm each row.
+version: 1
+servers:
+  github:
+    trusted: true
+    tools:
+      list_repos:
+        class: read
+        reviewedBy: ryan
+        reviewedAt: 2026-09-29
+      create_issue:
+        class: write
+        reviewedBy: ryan
+        reviewedAt: 2026-09-29
+        note: Creates content; nothing is destroyed. Approval-free but always logged.
+      merge_pull_request:
+        class: risky
+        reviewedBy: ryan
+        reviewedAt: 2026-09-29
+        note: A merge to a protected branch is a production change (CC8.1).
+      delete_repo:
+        class: risky
+        reviewedBy: ryan
+        reviewedAt: 2026-09-29
+      update_branch_protection:
+        class: write
+        reviewedBy: ryan
+        reviewedAt: 2026-09-29
+        note: Write on ordinary branches; risky on main. Escalation can only raise the class, never lower it.
+        escalateWhen:
+          - argPattern: { branch: "^(main|master|release/.*)$" }
+            to: risky
+  # Pseudo-server for Claude Code's built-in tools, which never touch MCP. The hook collector (src/hooks/) maps
+  # a built-in tool_name to server "claude-code" and a tool_name of the form mcp__<server>__<tool> to <server>/<tool>.
+  claude-code:
+    trusted: true
+    tools:
+      Read:
+        class: read
+        reviewedBy: ryan
+        reviewedAt: 2026-09-29
+      Grep:
+        class: read
+        reviewedBy: ryan
+        reviewedAt: 2026-09-29
+      Glob:
+        class: read
+        reviewedBy: ryan
+        reviewedAt: 2026-09-29
+      WebFetch:
+        class: read
+        reviewedBy: ryan
+        reviewedAt: 2026-09-29
+        note: Read-only for us, but it reaches the open world; the ledger keeps the URL.
+      Edit:
+        class: write
+        reviewedBy: ryan
+        reviewedAt: 2026-09-29
+      Write:
+        class: write
+        reviewedBy: ryan
+        reviewedAt: 2026-09-29
+      Bash:
+        class: risky
+        reviewedBy: ryan
+        reviewedAt: 2026-09-29
+        note: >
+          A shell can do anything (rm -rf, git push --force, curl | sh), and its intent is not visible from the
+          tool name, so the whole tool is risky. Per-command carve-outs are a later, reviewed feature, not a regex.
