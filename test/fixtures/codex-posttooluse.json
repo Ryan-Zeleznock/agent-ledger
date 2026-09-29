@@ -1,0 +1,15 @@
+{
+  "session_id": "thr_123",
+  "transcript_path": "/workspace/.codex/rollout.jsonl",
+  "cwd": "/workspace",
+  "hook_event_name": "PostToolUse",
+  "model": "gpt-5.3-codex",
+  "permission_mode": "default",
+  "turn_id": "turn_456",
+  "tool_name": "Bash",
+  "tool_use_id": "call_01ABC123",
+  "tool_input": {
+    "command": "npm test"
+  },
+  "tool_response": "Exit code 1\nError: Cannot find module 'express'"
+}

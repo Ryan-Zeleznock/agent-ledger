@@ -1,14 +1,20 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
+import * as hooks from "../src/hooks/contract.js";
 import {
-  BUILTIN_SERVER, CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_S, DEFAULT_DEADLINE_MS, HOOK_EVENT_NAMES, HOOK_TIMEOUT_S, MCP_TOOL_PREFIX,
-  type PostToolUseEvent, type PostToolUseFailureEvent, type PreToolUseEvent, type PreToolUseOutput, type SupervisedOutput,
+  BUILTIN_CODEX_SERVER, BUILTIN_SERVER, CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_S, CODEX_ASK_UNSUPPORTED_REASON, CODEX_DEFAULT_HOOK_TIMEOUT_S,
+  CODEX_HOOK_EVENT_NAMES, DEFAULT_DEADLINE_MS, DEFAULT_MAX_OUTPUT_BYTES, HOOK_EVENT_NAMES, HOOK_TIMEOUT_S, MAX_MAX_OUTPUT_BYTES,
+  MAX_REASON_CHARS, MCP_TOOL_PREFIX, MIN_MAX_OUTPUT_BYTES, WATCHDOG_MIN_MARGIN_MS, WATCHDOG_REASONS, WATCHDOG_REASON_PREFIX,
+  type CodexPostToolUseEvent, type CodexPreToolUseEvent, type PostToolUseEvent, type PostToolUseFailureEvent, type PreToolUseEvent,
+  type PreToolUseOutput, type ValidatedHandlerOutput, type WatchdogOptions, type WatchdogResult,
 } from "../src/hooks/contract.js";
 import type { HookDecision, Outcome } from "../src/types/index.js";
 
-// Format-drift guard. The fixtures are the example blocks from https://code.claude.com/docs/en/hooks (read
-// 2026-09-29). If Claude Code renames a field, re-fetch the docs, update the fixture, and this test tells you
-// what else must change. Shape only: no parsing logic lives here (ADR-002).
+// Format-drift guard. The Claude Code fixtures are the example blocks from https://code.claude.com/docs/en/hooks (read
+// 2026-09-29). The Codex fixtures are composed from the field tables at https://learn.chatgpt.com/docs/hooks and the
+// generated schemas (codex-rs/hooks/schema/generated/*.command.input.schema.json, read 2026-09-29), because the Codex
+// page has no PreToolUse example block; the schema's `required` list is asserted below. If either agent renames a
+// field, re-fetch, update the fixture, and this test tells you what else must change. Shape only (ADR-002).
 const load = (name: string) => JSON.parse(readFileSync(`test/fixtures/${name}.json`, "utf8")) as Record<string, unknown>;
 const COMMON: Record<string, string> = { session_id: "string", transcript_path: "string", cwd: "string", hook_event_name: "string" };
 
@@ -88,24 +94,132 @@ describe("Claude Code hook fixtures", () => {
   });
 });
 
-describe("fail-closed supervisor constants (spec §7)", () => {
-  it("our internal deadline sits below the hook timeout we configure, which sits far below Claude Code's default", () => {
-    expect(CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_S).toBe(600); // verified 2026-09-29, hooks reference "Common fields"
-    expect(HOOK_TIMEOUT_S).toBeLessThan(CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_S);
-    expect(DEFAULT_DEADLINE_MS).toBeLessThan(HOOK_TIMEOUT_S * 1000);
-    expect(HOOK_TIMEOUT_S * 1000 - DEFAULT_DEADLINE_MS).toBeGreaterThanOrEqual(1000); // at least a second of margin
+describe("Codex hook fixtures (ADR-005)", () => {
+  const pre = load("codex-pretooluse");
+  const post = load("codex-posttooluse");
+  const both = { pre, post };
+  // `required` from pre-tool-use.command.input.schema.json (read 2026-09-29); post adds tool_response
+  const SCHEMA_REQUIRED = ["cwd", "hook_event_name", "model", "permission_mode", "session_id", "tool_input", "tool_name", "tool_use_id", "transcript_path", "turn_id"];
+
+  it("carries every field the generated schema marks required, and nothing Claude Code-specific", () => {
+    for (const [n, ev] of Object.entries(both)) {
+      for (const f of SCHEMA_REQUIRED) expect(f in ev, `${n}.${f}`).toBe(true);
+      // additionalProperties: false in the schema, and these names exist only in Claude Code's events
+      for (const absent of ["prompt_id", "scratchpad_dir", "mcp_server", "is_interrupt", "duration_ms", "error"]) expect(absent in ev, `${n}.${absent}`).toBe(false);
+    }
+    expect("tool_response" in pre).toBe(false);
+    expect("tool_response" in post).toBe(true);
   });
-  it("the failure-path output is a deny AND exit 2, since exit 2 blocks even if stdout were lost", () => {
-    const denied: SupervisedOutput = {
-      stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "supervisor:deadline" } }),
-      stderr: "supervisor:deadline",
+  it("model and turn_id are Codex-specific extensions and are strings; transcript_path may be null there", () => {
+    for (const ev of Object.values(both)) {
+      expect(typeof ev["model"]).toBe("string");
+      expect(typeof ev["turn_id"]).toBe("string");
+      expect(["string", "object"]).toContain(typeof ev["transcript_path"]); // string | null
+    }
+    const nullable: CodexPreToolUseEvent = { ...(pre as unknown as CodexPreToolUseEvent), transcript_path: null };
+    expect(nullable.transcript_path).toBeNull();
+    // @ts-expect-error Claude Code's transcript_path is never null
+    const cc: PreToolUseEvent = { ...(load("claude-code-pretooluse") as unknown as PreToolUseEvent), transcript_path: null };
+    expect(cc.hook_event_name).toBe("PreToolUse");
+  });
+  it("permission_mode is required and uses Codex's five values (no `auto`)", () => {
+    const modes = ["default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"];
+    for (const ev of Object.values(both)) expect(modes).toContain(ev["permission_mode"]);
+    const typed = pre as unknown as CodexPreToolUseEvent;
+    // @ts-expect-error `auto` is a Claude Code mode only
+    const bad: CodexPreToolUseEvent = { ...typed, permission_mode: "auto" };
+    expect(bad.permission_mode).toBe("auto");
+  });
+  it("Codex has only two tool events the collector consumes: there is no PostToolUseFailure", () => {
+    expect(CODEX_HOOK_EVENT_NAMES).toEqual(["PreToolUse", "PostToolUse"]);
+    expect(CODEX_HOOK_EVENT_NAMES).not.toContain("PostToolUseFailure");
+    expect([pre, post].map((e) => e["hook_event_name"])).toEqual([...CODEX_HOOK_EVENT_NAMES]);
+    // a failed Bash command still arrives as PostToolUse; the outcome is `ok` = "ran and returned" (spec §6)
+    const typed = post as unknown as CodexPostToolUseEvent;
+    expect(String(typed.tool_response).startsWith("Exit code 1")).toBe(true);
+    const outcome: Outcome = { status: "ok" };
+    expect(outcome).toEqual({ status: "ok" });
+  });
+  it("tool names are Codex's canonical hook names: Bash, apply_patch (never Edit/Write), mcp__<server>__<tool>", () => {
+    expect(pre["tool_name"]).toBe("Bash");
+    expect((pre["tool_input"] as Record<string, unknown>)["command"]).toBe("npm test"); // Bash and apply_patch use tool_input.command
+    const patch: CodexPreToolUseEvent = { ...(pre as unknown as CodexPreToolUseEvent), tool_name: "apply_patch", tool_input: { command: "*** Begin Patch\n*** End Patch" } };
+    expect(patch.tool_name).toBe("apply_patch");
+    const mcp: CodexPreToolUseEvent = { ...(pre as unknown as CodexPreToolUseEvent), tool_name: "mcp__filesystem__read_file", tool_input: { path: "a" } };
+    expect(mcp.tool_name.startsWith(MCP_TOOL_PREFIX)).toBe(true);
+    expect(BUILTIN_CODEX_SERVER).toBe("builtin:codex");
+  });
+  it("tool_input is `any JSON value` in the schema, so the type is unknown and the collector must check it", () => {
+    const typed = pre as unknown as CodexPreToolUseEvent;
+    const input: unknown = typed.tool_input;
+    // @ts-expect-error Codex tool_input is not a Record: toIncomingCall narrows it and denies anything that is not a plain object
+    const direct: string = typed.tool_input["command"];
+    expect(typeof input).toBe("object");
+    expect(direct).toBe("npm test");
+  });
+  it("shares the PreToolUse output shape with Claude Code, but ask is rewritten to deny for Codex", () => {
+    const ask: HookDecision = { decision: "ask", reason: "unreviewed tool", callId: "call_01ABC123" };
+    const codexOut: PreToolUseOutput = { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: CODEX_ASK_UNSUPPORTED_REASON } };
+    expect(ask.decision).toBe("ask");
+    expect(codexOut.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(CODEX_ASK_UNSUPPORTED_REASON).toMatch(/Codex hooks cannot prompt/);
+    expect(CODEX_ASK_UNSUPPORTED_REASON.length).toBeLessThanOrEqual(MAX_REASON_CHARS);
+  });
+  it("uses the documented names for camelCase-free wire fields", () => {
+    for (const bad of ["sessionId", "toolName", "toolInput", "toolUseId", "hookEventName", "turnId", "transcriptPath", "permissionMode"]) {
+      for (const [n, ev] of Object.entries(both)) expect(bad in ev, `${n}.${bad}`).toBe(false);
+    }
+  });
+});
+
+describe("two-process watchdog contract (spec §7)", () => {
+  it("replaces the in-process supervisor: runWatchdog and validateHandlerOutput exist, runHookSupervised does not", () => {
+    expect(typeof hooks.runWatchdog).toBe("function");
+    expect(typeof hooks.validateHandlerOutput).toBe("function");
+    expect("runHookSupervised" in hooks).toBe(false);
+  });
+  it("the deadline sits below the hook timeout we configure by at least the margin, and that sits far below both agents' defaults", () => {
+    expect(CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_S).toBe(600); // verified 2026-09-29, Claude Code hooks reference "Common fields"
+    expect(CODEX_DEFAULT_HOOK_TIMEOUT_S).toBe(600);       // verified 2026-09-29, Codex hooks "Config shape" notes
+    expect(HOOK_TIMEOUT_S).toBeLessThan(CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_S);
+    expect(HOOK_TIMEOUT_S * 1000 - DEFAULT_DEADLINE_MS).toBeGreaterThanOrEqual(WATCHDOG_MIN_MARGIN_MS);
+    expect(Number.isInteger(DEFAULT_DEADLINE_MS) && DEFAULT_DEADLINE_MS > 0).toBe(true);
+  });
+  it("the output cap is bounded on both sides and stays under Claude Code's 10,000-character spill limit", () => {
+    expect(MIN_MAX_OUTPUT_BYTES).toBeLessThanOrEqual(DEFAULT_MAX_OUTPUT_BYTES);
+    expect(DEFAULT_MAX_OUTPUT_BYTES).toBeLessThanOrEqual(MAX_MAX_OUTPUT_BYTES);
+    expect(DEFAULT_MAX_OUTPUT_BYTES).toBeLessThan(10_000);
+    // a maximal valid payload fits under the default cap with room for the reason
+    const maximal: PreToolUseOutput = { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "x".repeat(MAX_REASON_CHARS) } };
+    expect(Buffer.byteLength(JSON.stringify(maximal))).toBeLessThan(DEFAULT_MAX_OUTPUT_BYTES);
+  });
+  it("options carry the handler argv, the deadline, the cap and the agent; deny reasons are namespaced", () => {
+    const opts: WatchdogOptions = { handlerCommand: ["node", "/opt/agent-ledger/hook-handler.js"], deadlineMs: DEFAULT_DEADLINE_MS, maxOutputBytes: DEFAULT_MAX_OUTPUT_BYTES, agent: "codex" };
+    expect(opts.handlerCommand.length).toBeGreaterThan(0);
+    expect(WATCHDOG_REASON_PREFIX).toBe("watchdog:");
+    for (const r of ["config", "deadline", "handler-exit", "output:too-large", "output:extra-key", "handler-deny", "internal"]) expect(WATCHDOG_REASONS).toContain(r);
+  });
+  it("the failure-path result is a deny JSON AND exit 2; exit 1 is not a legal result; allow is exit 0 with a re-serialised payload", () => {
+    const denied: WatchdogResult = {
+      stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "watchdog:deadline" } }),
+      stderr: "watchdog:deadline",
       exitCode: 2,
     };
     expect(denied.exitCode).toBe(2);
     expect(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision).toBe("deny");
-    const decided: SupervisedOutput = { stdout: "{}", stderr: "", exitCode: 0 };
-    // @ts-expect-error the supervisor never exits 1: that code lets the tool call continue
-    const never: SupervisedOutput = { stdout: "", stderr: "", exitCode: 1 };
-    expect([decided.exitCode, never.exitCode]).toEqual([0, 1]);
+    expect(denied.stdout.split("\n").length).toBe(1); // one JSON value: two lines would be a parse failure for Claude Code
+    const allowed: WatchdogResult = { stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", permissionDecisionReason: "reviewed read" } }), stderr: "", exitCode: 0 };
+    // @ts-expect-error the watchdog never exits 1: both agents treat it as "continue"
+    const never: WatchdogResult = { stdout: "", stderr: "", exitCode: 1 };
+    expect([allowed.exitCode, never.exitCode]).toEqual([0, 1]);
+  });
+  it("a validated handler payload is either an exact PreToolUseOutput or a namespaced output:* reason", () => {
+    const ok: ValidatedHandlerOutput = { ok: true, payload: { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", permissionDecisionReason: "r" } } };
+    const bad: ValidatedHandlerOutput = { ok: false, reason: "watchdog:output:extra-key:updatedInput" };
+    // @ts-expect-error a non-output reason is not a validation result
+    const wrong: ValidatedHandlerOutput = { ok: false, reason: "watchdog:deadline" };
+    expect(ok.ok && Object.keys(ok.payload)).toEqual(["hookSpecificOutput"]);
+    expect(!bad.ok && bad.reason.startsWith("watchdog:output:")).toBe(true);
+    expect(wrong.ok).toBe(false);
   });
 });
