@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
-  HOOK_DECISIONS, RISKS, VERDICTS,
-  type ApprovalResult, type HookDecision, type IncomingCall, type LedgerRecord, type ToolCall, type ToolInfo, type UnsealedRecord,
+  APPROVAL_DECISIONS, BUILTIN_NAMESPACE, BUILTIN_SERVER, HOOK_DECISIONS, RESERVED_KEYS, RESERVED_SERVER_NAMES, RISKS, VERDICTS,
+  type ApprovalChannel, type ApprovalResult, type HookDecision, type IncomingCall, type LedgerRecord, type ToolCall, type ToolInfo, type UnsealedRecord,
 } from "../src/types/index.js";
 import { notImplemented } from "../src/types/not-implemented.js";
 
@@ -41,6 +41,23 @@ describe("types", () => {
   it("ApprovalResult is bound to a callId", () => {
     const a: ApprovalResult = { callId: "c1", decision: "approved", approver: "ryan", decidedAt: "2026-09-28T00:00:00Z", channel: "slack" };
     expect(a.callId).toBe("c1");
+  });
+  it("ApprovalChannel is a union: slack with its options, or hook-ask with none (Astra spec v2 finding 4)", () => {
+    const slack: ApprovalChannel = { kind: "slack", channelId: "C0123", timeoutMs: 300_000 };
+    const ask: ApprovalChannel = { kind: "hook-ask" };
+    // @ts-expect-error hook-ask carries no timeout: there is nothing to wait for, Claude Code asks the human
+    const bad: ApprovalChannel = { kind: "hook-ask", timeoutMs: 1 };
+    expect([slack.kind, ask.kind, bad.kind]).toEqual(["slack", "hook-ask", "hook-ask"]);
+    expect(APPROVAL_DECISIONS).toEqual(["approved", "denied", "timeout", "unavailable", "delegated"]);
+    const down: ApprovalResult = { callId: "c1", decision: "unavailable", decidedAt: "2026-09-29T00:00:00Z", channel: "slack" };
+    const delegated: ApprovalResult = { callId: "c1", decision: "delegated", decidedAt: "2026-09-29T00:00:00Z", channel: "hook-ask" };
+    expect([down.decision, delegated.channel]).toEqual(["unavailable", "hook-ask"]);
+  });
+  it("exports the reserved identity constants (Astra spec v2 findings 1 and 3)", () => {
+    expect(BUILTIN_SERVER).toBe("builtin:claude-code");
+    expect(BUILTIN_SERVER.startsWith(BUILTIN_NAMESPACE)).toBe(true);
+    expect(RESERVED_KEYS).toEqual(["__proto__", "constructor", "prototype"]);
+    expect(RESERVED_SERVER_NAMES).toEqual(["claudecode", "builtinclaudecode"]);
   });
   it("LedgerRecord shape compiles, with the chain fields the ledger seals", () => {
     const unsealed: UnsealedRecord = {
