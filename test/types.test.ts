@@ -1,10 +1,22 @@
 import { describe, it, expect } from "vitest";
-import { VERDICTS, type ApprovalResult, type IncomingCall, type LedgerRecord, type ToolCall } from "../src/types/index.js";
+import {
+  HOOK_DECISIONS, RISKS, VERDICTS,
+  type ApprovalResult, type HookDecision, type IncomingCall, type LedgerRecord, type ToolCall, type ToolInfo, type UnsealedRecord,
+} from "../src/types/index.js";
 import { notImplemented } from "../src/types/not-implemented.js";
 
 describe("types", () => {
   it("exposes the three verdicts", () => {
     expect(VERDICTS).toEqual(["allow", "deny", "require_approval"]);
+  });
+  it("exposes the three reviewed classes plus unreviewed (ADR-004)", () => {
+    expect(RISKS).toEqual(["read", "write", "risky", "unreviewed"]);
+  });
+  it("hook decisions are allow | deny | ask, never defer", () => {
+    expect(HOOK_DECISIONS).toEqual(["allow", "deny", "ask"]);
+    expect(HOOK_DECISIONS).not.toContain("defer");
+    const d: HookDecision = { decision: "ask", reason: "unreviewed tool", callId: "toolu_01" };
+    expect(d.callId).toBe("toolu_01");
   });
   it("notImplemented names the function", () => {
     expect(notImplemented("ledger.append").message).toBe("not implemented: ledger.append");
@@ -30,13 +42,22 @@ describe("types", () => {
     const a: ApprovalResult = { callId: "c1", decision: "approved", approver: "ryan", decidedAt: "2026-09-28T00:00:00Z", channel: "slack" };
     expect(a.callId).toBe("c1");
   });
-  it("LedgerRecord shape compiles", () => {
-    const r: LedgerRecord = {
+  it("LedgerRecord shape compiles, with the chain fields the ledger seals", () => {
+    const unsealed: UnsealedRecord = {
       id: "r1", phase: "intent",
       call: { callId: "c1", sessionId: "s1", agentId: "a1", server: "github", tool: "list_repos", args: {}, receivedAt: "2026-09-28T00:00:00Z" },
-      policy: { verdict: "allow", ruleId: "read-only", reason: "read-only", risk: "read" },
-      prevHash: "0", hash: "h", writtenAt: "2026-09-28T00:00:00Z",
+      policy: { verdict: "allow", ruleId: "registry:github/list_repos", reason: "reviewed read", risk: "read" },
     };
-    expect(r.phase).toBe("intent");
+    const genesis: LedgerRecord = { ...unsealed, parentRecordId: null, prevHash: "0", hash: "h1", writtenAt: "2026-09-28T00:00:00Z" };
+    const next: LedgerRecord = { ...unsealed, id: "r2", parentRecordId: genesis.id, prevHash: genesis.hash, hash: "h2", writtenAt: "2026-09-28T00:00:01Z" };
+    expect(genesis.parentRecordId).toBeNull();
+    expect(next.parentRecordId).toBe("r1");
+    expect("parentRecordId" in unsealed).toBe(false);
+  });
+  it("ToolInfo carries the four MCP annotation hints, all optional", () => {
+    const t: ToolInfo = { server: "github", name: "list_repos", annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true } };
+    expect(Object.keys(t.annotations!).sort()).toEqual(["destructiveHint", "idempotentHint", "openWorldHint", "readOnlyHint"]);
+    const bare: ToolInfo = { server: "github", name: "x" };
+    expect(bare.annotations).toBeUndefined();
   });
 });
