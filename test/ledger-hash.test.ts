@@ -38,6 +38,17 @@ describe("ledger.hashRecord (spec §5: SHA-256 over JCS of the record without `h
     expect(hashRecord({ ...sealedWithoutHash(1), writtenAt: "2026-09-30T12:00:02.000Z" })).not.toBe(base);
   });
 
+  it("sorts keys by UTF-16 code unit (RFC 8785 §3.2.3) and never normalises Unicode: NFC and NFD inputs hash differently", () => {
+    // U+00E9 (é, one code unit) sorts before U+FF10 but after "z"; a supplementary char (surrogate pair) sorts by its high surrogate.
+    const rec = sealedWithoutHash(1);
+    rec.call.args = { "z": 1, "é": 2, "０": 3, "😀": 4, "a": 5 };
+    expect(canonicalize(rec.call.args)).toBe('{"a":5,"z":1,"é":2,"😀":4,"０":3}');
+    const nfc = { ...sealedWithoutHash(1), call: { ...sealedWithoutHash(1).call, args: { name: "café" } } };
+    const nfd = { ...sealedWithoutHash(1), call: { ...sealedWithoutHash(1).call, args: { name: "café" } } };
+    expect("café".normalize("NFC")).toBe("café".normalize("NFC"));
+    expect(hashRecord(nfc)).not.toBe(hashRecord(nfd));
+  });
+
   it("refuses NaN and Infinity (RFC 8785 §3.2.2.3: a JCS implementation MUST error)", () => {
     const rec = sealedWithoutHash(1);
     rec.call.args = { n: Number.NaN };

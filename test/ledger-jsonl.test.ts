@@ -287,6 +287,33 @@ describe("createLedger('jsonl'): strict evidence validation (Astra #9, #10)", ()
   });
 });
 
+describe("createLedger('jsonl'): residual limit (Astra #13)", () => {
+  it("a FULL re-chain by whoever can write the file passes verify(); only a comparison with an independently kept anchor catches it", async () => {
+    const { createAnchor } = await import("../src/anchor/contract.js");
+    const anchorPath = join(dir, "elsewhere", "anchor.jsonl"); // stands in for an off-machine copy
+    const anchor = createAnchor("file", anchorPath);
+    const { ledger } = await appendN(3);
+    await anchor.write({ hash: await ledger.head(), at: "2026-09-30T00:00:00Z" });
+
+    // Attacker with write access edits record 1 and recomputes every later link and hash.
+    const recs = parsed();
+    recs[0]!.call.args = { path: "/etc/shadow" };
+    rewrite(rechain(recs, 0));
+    expect(await createLedger("jsonl", path).verify()).toEqual({ ok: true, checked: 3 }); // internal consistency cannot see it
+
+    // The caller's duty (README "What verify() cannot see"): the anchored head must appear in the verified chain.
+    const anchored = (await anchor.latest())!.hash;
+    const hashes = new Set(parsed().map((r) => r.hash));
+    expect(hashes.has(anchored)).toBe(false); // tamper detected by the trusted anchor, not by verify()
+
+    // Control: the untouched chain does contain its anchored head.
+    rmSync(path);
+    const { out } = await appendN(3);
+    await anchor.write({ hash: out[2]!.hash, at: "2026-10-01T00:00:00Z" });
+    expect(new Set(parsed().map((r) => r.hash)).has((await anchor.latest())!.hash)).toBe(true);
+  });
+});
+
 describe("createLedger('jsonl'): read(range)", () => {
   it("yields records whose writtenAt falls inside the range (inclusive), in file order", async () => {
     const { out } = await appendN(4);
