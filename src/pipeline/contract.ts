@@ -132,7 +132,12 @@ const intentRecord = (call: ToolCall, policy: PolicyDecision, approval?: Approva
 };
 const outcomeRecord = (call: ToolCall, policy: PolicyDecision, outcome: Outcome): UnsealedRecord => ({ id: randomUUID(), phase: "outcome", call, policy, outcome });
 
-interface Decided { decision: HookDecision; call?: ToolCall; policy?: PolicyDecision }
+/**
+ * `exec` is the authenticated call with the RAW argument snapshot (what upstream executes and policy evaluated);
+ * `stored` is the same call with the ADR-009 projection (what every record and every Slack preview carries). They are
+ * never the same object (Astra P1 #1, 2026-09-30).
+ */
+interface Decided { decision: HookDecision; exec?: ToolCall; stored?: ToolCall; policy?: PolicyDecision }
 
 export function createPipeline(deps: PipelineDeps): Pipeline {
   const { identity, registry, ledger, upstream, approvals, hookAgent } = deps;
@@ -195,55 +200,58 @@ export function createPipeline(deps: PipelineDeps): Pipeline {
     try { sessionId = await identity.startSession(agentId, incoming.onBehalfOf); }
     catch (e) { return { decision: deny(callId, `agent-ledger: denied: session refused (${message(e)})`) }; }
 
-    // Policy sees the raw args; the ledger sees the projection (ADR-009).
-    const rawCall = toolCall(incoming, sessionId, agentId, incoming.args);
+    // Policy and upstream see the RAW args; the ledger sees the projection (ADR-009). Under Codex an mcp__ server segment
+    // is not an identity (ADR-006), so a registry row's allowlist is never consulted for it: the routing decision comes
+    // first and every Codex MCP hook argument is hashed, handoffs and denials alike (Astra P1 #2, 2026-09-30).
+    const codexMcp = hookAgent === "codex" && !isBuiltinKey(incoming.server);
+    const rawCall = toolCall(incoming, sessionId, agentId, JSON.parse(JSON.stringify(incoming.args)) as Record<string, unknown>);
     let call: ToolCall;
-    try { call = toolCall(incoming, sessionId, agentId, projectArgs(incoming.args, clearArgFields(registry, incoming.server, incoming.tool), hmacKey)); }
+    try { call = toolCall(incoming, sessionId, agentId, projectArgs(incoming.args, codexMcp ? [] : clearArgFields(registry, incoming.server, incoming.tool), hmacKey)); }
     catch (e) { return { decision: deny(callId, `agent-ledger: denied: arguments cannot be recorded (${message(e)})`) }; }
+    const done = (decision: HookDecision, policy: PolicyDecision): Decided => ({ decision, exec: rawCall, stored: call, policy });
 
-    // ADR-006: under Codex an mcp__ server segment is not an identity.
-    if (hookAgent === "codex" && !isBuiltinKey(call.server)) {
+    if (codexMcp) {
       const proxyName = registry.proxy?.codex?.serverName;
       if (proxyName !== undefined && call.server === proxyName) {
         const policy: PolicyDecision = { verdict: "allow", risk: "unreviewed", ruleId: `${HANDOFF_TO_PROXY_RULE_PREFIX}${proxyName}`, reason: HANDOFF_TO_PROXY_REASON };
         const record: UnsealedRecord = { ...intentRecord(call, policy), handoff: { kind: "to-proxy", proxyServerName: proxyName } };
         const r = await appendIntent(record);
-        if (!r.ok) return { decision: ledgerDenied(callId, r.error), call, policy };
-        return { decision: { decision: "allow", reason: HANDOFF_TO_PROXY_REASON, callId, kind: "governed-by-proxy" }, call, policy };
+        if (!r.ok) return done(ledgerDenied(callId, r.error), policy);
+        return done({ decision: "allow", reason: HANDOFF_TO_PROXY_REASON, callId, kind: "governed-by-proxy" }, policy);
       }
       const policy: PolicyDecision = { verdict: "deny", risk: "unreviewed", ruleId: `codex-mcp-not-proxied:${call.server}/${call.tool}`, reason: CODEX_MCP_NOT_PROXIED_REASON };
       const r = await appendIntent(intentRecord(call, policy));
-      if (!r.ok) return { decision: ledgerDenied(callId, r.error), call, policy };
+      if (!r.ok) return done(ledgerDenied(callId, r.error), policy);
       await appendBlocked(call, policy);
-      return { decision: deny(callId, `agent-ledger: denied (${policy.ruleId}): ${CODEX_MCP_NOT_PROXIED_REASON}`), call, policy };
+      return done(deny(callId, `agent-ledger: denied (${policy.ruleId}): ${CODEX_MCP_NOT_PROXIED_REASON}`), policy);
     }
 
     const policy = evaluate(registry, rawCall);
     const tag = `${policy.risk}; ${policy.ruleId}`;
     if (policy.verdict === "allow") {
       const r = await appendIntent(intentRecord(call, policy));
-      if (!r.ok) return { decision: ledgerDenied(callId, r.error), call, policy };
-      return { decision: { decision: "allow", reason: clip(`agent-ledger: allowed (${tag}): ${policy.reason}`), callId, kind: "decided" }, call, policy };
+      if (!r.ok) return done(ledgerDenied(callId, r.error), policy);
+      return done({ decision: "allow", reason: clip(`agent-ledger: allowed (${tag}): ${policy.reason}`), callId, kind: "decided" }, policy);
     }
     if (policy.verdict === "deny") {
       const r = await appendIntent(intentRecord(call, policy));
-      if (!r.ok) return { decision: ledgerDenied(callId, r.error), call, policy };
+      if (!r.ok) return done(ledgerDenied(callId, r.error), policy);
       await appendBlocked(call, policy);
-      return { decision: deny(callId, `agent-ledger: denied (${tag}): ${policy.reason}`), call, policy };
+      return done(deny(callId, `agent-ledger: denied (${tag}): ${policy.reason}`), policy);
     }
     // require_approval: the channel is resolved BEFORE the intent record is persisted.
     if (approvals.kind === "hook-ask") {
       if (hookAgent === "claude-code") {
         const approval: ApprovalResult = { callId, decision: "delegated", reason: DELEGATED_REASON, decidedAt: now(), channel: "hook-ask" };
         const r = await appendIntent(intentRecord(call, policy, approval));
-        if (!r.ok) return { decision: ledgerDenied(callId, r.error), call, policy };
-        return { decision: { decision: "ask", reason: clip(`agent-ledger: approval required (${tag}): ${policy.reason}`), callId, kind: "decided" }, call, policy };
+        if (!r.ok) return done(ledgerDenied(callId, r.error), policy);
+        return done({ decision: "ask", reason: clip(`agent-ledger: approval required (${tag}): ${policy.reason}`), callId, kind: "decided" }, policy);
       }
       const approval: ApprovalResult = { callId, decision: "no-channel", reason: CODEX_NO_CHANNEL_REASON, decidedAt: now(), channel: "hook-ask" };
       const r = await appendIntent(intentRecord(call, policy, approval));
-      if (!r.ok) return { decision: ledgerDenied(callId, r.error), call, policy };
+      if (!r.ok) return done(ledgerDenied(callId, r.error), policy);
       await appendBlocked(call, policy);
-      return { decision: deny(callId, `agent-ledger: denied (${tag}): ${CODEX_NO_CHANNEL_REASON}`), call, policy };
+      return done(deny(callId, `agent-ledger: denied (${tag}): ${CODEX_NO_CHANNEL_REASON}`), policy);
     }
     let approval: ApprovalResult;
     try {
@@ -253,22 +261,30 @@ export function createPipeline(deps: PipelineDeps): Pipeline {
       approval = { callId, decision: "unavailable", reason: `Slack unreachable: ${message(e)}`, decidedAt: now(), channel: "slack" };
     }
     const r = await appendIntent(intentRecord(call, policy, approval));
-    if (!r.ok) return { decision: ledgerDenied(callId, r.error), call, policy };
+    if (!r.ok) return done(ledgerDenied(callId, r.error), policy);
     if (approval.decision === "approved") {
-      return { decision: { decision: "allow", reason: clip(`agent-ledger: approved by ${approval.approver ?? "?"} (${tag}): ${approval.reason ?? ""}`), callId, kind: "decided" }, call, policy };
+      return done({ decision: "allow", reason: clip(`agent-ledger: approved by ${approval.approver ?? "?"} (${tag}): ${approval.reason ?? ""}`), callId, kind: "decided" }, policy);
     }
     await appendBlocked(call, policy);
-    return { decision: deny(callId, `agent-ledger: denied (approval ${approval.decision}; ${tag}): ${approval.reason ?? ""}`), call, policy };
+    return done(deny(callId, `agent-ledger: denied (approval ${approval.decision}; ${tag}): ${approval.reason ?? ""}`), policy);
   }
 
-  /** The intent this outcome belongs to: same process first, then the ledger (last intent record with that callId). */
+  /**
+   * The intent this outcome belongs to: same process first, then the ledger. One callId can carry TWO intents in a
+   * combined ledger (the Codex hook's `handoff-to-proxy` record and the proxy's own record), so the hook (hookAgent
+   * set) prefers the handoff intent and the proxy (no hookAgent) prefers a non-handoff intent; the last matching record
+   * wins within each preference (Astra P2 #5, 2026-09-30).
+   */
   async function findIntent(callId: string): Promise<{ call: ToolCall; policy: PolicyDecision } | undefined> {
     const cached = intents.get(callId);
     if (cached) return cached;
-    let found: LedgerRecord | undefined;
+    let handoff: LedgerRecord | undefined;
+    let plain: LedgerRecord | undefined;
     for await (const rec of ledger.read({ from: "1970-01-01T00:00:00.000Z", to: new Date(Date.now() + 86_400_000).toISOString() })) {
-      if (rec.phase === "intent" && rec.call.callId === callId) found = rec;
+      if (rec.phase !== "intent" || rec.call.callId !== callId) continue;
+      if (rec.handoff !== undefined) handoff = rec; else plain = rec;
     }
+    const found = decideOnly ? (handoff ?? plain) : (plain ?? handoff);
     return found ? { call: found.call, policy: found.policy } : undefined;
   }
 
@@ -292,19 +308,19 @@ export function createPipeline(deps: PipelineDeps): Pipeline {
     async handle(incoming): Promise<ToolResult> {
       if (decideOnly) throw new Error("pipeline.handle: not available in decide-only mode (hookAgent set, hook-ask or hook clocks configured)");
       const d = await decideInternal(incoming);
-      if (d.decision.decision !== "allow" || d.call === undefined || d.policy === undefined) {
+      if (d.decision.decision !== "allow" || d.exec === undefined || d.stored === undefined || d.policy === undefined) {
         return { content: [{ type: "text", text: d.decision.reason }], isError: true };
       }
       const started = Date.now();
       let result: ToolResult;
-      try { result = await upstream.execute(d.call); }
+      try { result = await upstream.execute(d.exec); } // the RAW authenticated call, never the storage projection
       catch (e) {
-        try { await ledger.append(outcomeRecord(d.call, d.policy, { status: "error", errorClass: e instanceof Error ? e.name : "upstream-error", durationMs: Date.now() - started })); } catch { /* the error result is returned regardless */ }
+        try { await ledger.append(outcomeRecord(d.stored, d.policy, { status: "error", errorClass: e instanceof Error ? e.name : "upstream-error", durationMs: Date.now() - started })); } catch { /* the error result is returned regardless */ }
         return { content: [{ type: "text", text: `agent-ledger: upstream failed: ${message(e)}` }], isError: true };
       }
       const outcome: Outcome = { status: result?.isError ? "error" : "ok", durationMs: Date.now() - started };
       if (outcome.status === "error") outcome.errorClass = "tool-error";
-      try { await ledger.append(outcomeRecord(d.call, d.policy, outcome)); } catch { /* the tool already ran; the outcome could not be recorded */ }
+      try { await ledger.append(outcomeRecord(d.stored, d.policy, outcome)); } catch { /* the tool already ran; the outcome could not be recorded */ }
       return result;
     },
   };

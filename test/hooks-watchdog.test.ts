@@ -150,6 +150,12 @@ describe("watchdog: handler misbehaviour (Astra P1 #1, #2, P2 #3)", () => {
     expectDeny(await watchdog(["extra-top", "continue"]), /^watchdog:output:extra-key:continue$/);
     expectDeny(await watchdog(["bad-event-name"]), /^watchdog:output:bad-value:hookEventName$/);
   });
+  it("Astra P2 #7: a payload with duplicate permissionDecision members (deny then allow) is a deny, exit 2, never an allow", async () => {
+    const dup = '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecision":"allow","permissionDecisionReason":"r"}}';
+    expectDeny(await watchdog(["junk", dup]), /^watchdog:output:extra-key:permissionDecision$/);
+    const dupTop = '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"r"},"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"r"}}';
+    expectDeny(await watchdog(["junk", dupTop]), /^watchdog:output:extra-key:hookSpecificOutput$/);
+  });
   it("empty stdout with exit 0 → output:empty", async () => {
     expectDeny(await watchdog(["empty"]), /^watchdog:output:empty$/);
   });
@@ -255,13 +261,36 @@ describe("watchdog: exit vs close, group kill, PGID (Astra re-review 2026-09-29/
       expect(kills.length).toBe(1);
       expect(kills[0]).toContain(` kill -${list[0]} SIGKILL`);
     }, 10_000);
-  it("the allow path never signals the group (no negative-pid kill in the trace)", async () => {
-    const trace = join(dir, "trace");
-    const r = await watchdog(["group", "allow"], { harness: true, env: { HOOKS_TEST_TRACE_FILE: trace } });
-    expect(r.code).toBe(0);
-    expect(readFileSync(trace, "utf8")).not.toMatch(/ kill -\d+ /);
-    for (const pid of pids(r.stderr).slice(1)) { if (alive(pid)) process.kill(pid, "SIGKILL"); } // our own sleepers, cleaned up
+  it("the allow path never signals the group (no negative-pid kill in the trace); the test's own sleepers are cleaned via the pid file (P3)", async () => {
+    const trace = join(dir, "trace"); const pidFile = join(dir, "pids");
+    try {
+      const r = await watchdog(["group", "allow"], { harness: true, env: { HOOKS_TEST_TRACE_FILE: trace, HOOKS_TEST_PID_FILE: pidFile } });
+      expect(r.code).toBe(0);
+      expect(readFileSync(trace, "utf8")).not.toMatch(/ kill -\d+ /);
+      expect(readFileSync(pidFile, "utf8").trim().split("\n").length).toBe(3);
+    } finally {
+      const owned = existsSync(pidFile) ? readFileSync(pidFile, "utf8").trim().split("\n").map(Number) : [];
+      for (const pid of owned) { if (alive(pid)) process.kill(pid, "SIGKILL"); }
+      await eventuallyGone(owned);
+    }
   });
+  it("Astra P2 #3: a write failure AFTER a validated allow still group-kills: children gone, exactly one kill, exit 2", async () => {
+    const trace = join(dir, "trace"); const pidFile = join(dir, "pids");
+    try {
+      const r = await watchdog(["group", "allow"], { harness: true, env: { HOOKS_TEST_FAULT: "epipe-stdout", HOOKS_TEST_TRACE_FILE: trace, HOOKS_TEST_PID_FILE: pidFile } });
+      expect(r.code).toBe(2);
+      expect(r.stderr).toMatch(/^watchdog:write:EPIPE/);
+      const owned = readFileSync(pidFile, "utf8").trim().split("\n").map(Number);
+      expect(owned.length).toBe(3);
+      await eventuallyGone(owned);
+      const kills = readFileSync(trace, "utf8").split("\n").filter((l) => / kill -\d+ /.test(l));
+      expect(kills.length).toBe(1);
+      expect(kills[0]).toContain(` kill -${owned[0]} SIGKILL`);
+    } finally {
+      const owned = existsSync(pidFile) ? readFileSync(pidFile, "utf8").trim().split("\n").map(Number) : [];
+      for (const pid of owned) { if (alive(pid)) process.kill(pid, "SIGKILL"); }
+    }
+  }, 10_000);
   it("the handler is its own process group leader (spawned detached: getpgid(child) === child.pid)", async () => {
     const pidFile = join(dir, "pids");
     const done = watchdog(["pgid"], { env: { HOOKS_TEST_PID_FILE: pidFile } });
@@ -335,6 +364,11 @@ describe("watchdog: deadline env, internal errors, write failures (Astra P1/P2 2
     expect(r.stdout).toBe("");
     expect(r.ms).toBeLessThan(WATCHDOG_WRITE_BUDGET_MS + 1_500); // handler start (~100 ms) + one budget window
   }, 10_000);
+  it("Astra P2 #4: writes that make progress but too slowly (1 byte / 300 ms) are cut off by the budget → exit 2 within about one budget", async () => {
+    const r = await watchdog(["allow"], { harness: true, env: { HOOKS_TEST_FAULT: "slow-short-write" } });
+    expect(r.code).toBe(2);
+    expect(r.ms).toBeLessThan(WATCHDOG_WRITE_BUDGET_MS * 2 + 1_500);
+  }, 15_000);
   it("setNonBlocking failure (no handle to switch) → treated as a write failure → exit 2, best-effort deny on whichever fd works", async () => {
     const r = await watchdog(["allow"], { harness: true, env: { HOOKS_TEST_FAULT: "no-setblocking" } });
     expectDeny(r, /^watchdog:write:setNonBlocking/);

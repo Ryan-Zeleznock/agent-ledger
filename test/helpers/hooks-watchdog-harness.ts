@@ -2,8 +2,8 @@
 // (`fs.writeSync`, `process.kill`, the stdio handle's `setBlocking`) BEFORE importing watchdog-main.js, so the product
 // code stays free of test seams. Every fault can only make the watchdog fail; none can produce an allow.
 //   HOOKS_TEST_TRACE_FILE: append one line per `process.kill`, `setBlocking` and first `writeSync` call
-//   HOOKS_TEST_FAULT: short-write | epipe-stdout | fail-both | eagain-always | zero-progress | no-setblocking
-//                     | throw-async | fill-stdout
+//   HOOKS_TEST_FAULT: short-write | slow-short-write | epipe-stdout | fail-both | eagain-always | zero-progress
+//                     | no-setblocking | throw-async | fill-stdout
 import fs from "node:fs";
 import process from "node:process";
 
@@ -37,8 +37,9 @@ let eagainCount = 0;
 fs.writeSync = ((fd: number, data: Uint8Array | string, ...rest: unknown[]) => {
   if (firstWrite && (fd === 1 || fd === 2)) { firstWrite = false; log(`writeSync-first ${fd}`); }
   if (fd === 1 || fd === 2) {
-    if (fault === "short-write" && typeof data !== "string") {
+    if ((fault === "short-write" || fault === "slow-short-write") && typeof data !== "string") {
       const [off = 0] = rest as [number?];
+      if (fault === "slow-short-write") Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300); // 1 byte per 300 ms: progress, but far too slow
       return realWriteSync(fd, data, off, 1);
     }
     if (fault === "epipe-stdout" && fd === 1) throw errno("EPIPE");
