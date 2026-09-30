@@ -226,7 +226,8 @@ export interface SuggestOptions {
 }
 /**
  * Proposes a class for a tool during registry review. Combines the first matching name pattern with, for trusted
- * servers only, the annotation hints (readOnlyHint true -> read; destructiveHint true -> risky; otherwise write).
+ * servers only, annotation hints (explicit destructive -> risky; readOnly -> read; explicit nondestructive -> write;
+ * otherwise risky per MCP's destructiveHint default).
  * When the sources disagree, the higher class wins and both sources are listed. Output is advice for a reviewer;
  * it is never written to the registry without a human's reviewedBy/reviewedAt.
  */
@@ -239,10 +240,10 @@ export function suggestClass(tool: ToolInfo, opts: SuggestOptions): ClassSuggest
   if (pattern) { cls = pattern.class; sources.push("name-pattern"); reasons.push(pattern.reason); }
   if (hints) {
     // Conflicting hints take the higher risk, just as conflicting name/annotation sources do.
-    const annotation: ToolClass = hints.destructiveHint === true ? "risky" : hints.readOnlyHint === true ? "read" : "write";
+    const annotation: ToolClass = hints.destructiveHint === true ? "risky" : hints.readOnlyHint === true ? "read" : hints.destructiveHint === false ? "write" : "risky";
     if (cls === undefined || CLASS_RANK[annotation] > CLASS_RANK[cls]) cls = annotation;
     sources.push("annotation");
-    reasons.push(`Annotation: ${annotation === "risky" ? "destructiveHint" : annotation === "read" ? "readOnlyHint" : "no read-only or destructive hint"}`);
+    reasons.push(`Annotation: ${annotation === "risky" ? "destructiveHint" : annotation === "read" ? "readOnlyHint" : "destructiveHint false"}`);
   }
   if (cls === undefined) return { ...opts.rules.default, sources: [] };
   return { class: cls, sources, reason: reasons.join("; ") };

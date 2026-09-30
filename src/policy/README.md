@@ -31,7 +31,12 @@ The shared reader checks and reads the same open descriptor, then closes it even
 Owner/mode checks are skipped on Windows, where these POSIX semantics do not apply.
 
 Suggestions use the first name match and any present trusted annotations. Conflicting hints
-select risky over read; absent annotations contribute nothing. The default applies only when
+select risky over read; absent annotations contribute nothing. Within present annotations,
+`readOnlyHint: true` suggests read unless `destructiveHint: true` explicitly conflicts;
+otherwise only `destructiveHint: false` suggests write, and omitted destructiveHint suggests risky.
+This follows the [MCP annotation defaults](https://modelcontextprotocol.io/specification/2025-06-18/schema#toolannotations)
+(verified 2026-09-30). Advice never changes runtime authority. Frozen spec §8's “else write” wording
+should follow at the next ADR; `docs/spec.md` remains unchanged. The default applies only when
 neither source contributes. No function writes registry files or supplies reviewer metadata.
 The existing registry decision table exercises the real loader/evaluator and compares every row
 with the retained test helper (also still needed by unfinished hook tests). Generated cases cover

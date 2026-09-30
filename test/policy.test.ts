@@ -139,7 +139,9 @@ describe("suggestions are advice", () => {
     [true, "delete_items", { readOnlyHint: true }, "risky", ["name-pattern", "annotation"]],
     [true, "list_items", { readOnlyHint: true }, "read", ["name-pattern", "annotation"]],
     [true, "frobnicate", { readOnlyHint: true }, "read", ["annotation"]],
-    [true, "frobnicate", {}, "write", ["annotation"]],
+    [true, "frobnicate", {}, "risky", ["annotation"]],
+    [true, "frobnicate", { destructiveHint: false }, "write", ["annotation"]],
+    [true, "frobnicate", { readOnlyHint: false }, "risky", ["annotation"]],
     [true, "frobnicate", undefined, "risky", []],
     [true, "frobnicate", { readOnlyHint: true, destructiveHint: true }, "risky", ["annotation"]],
   ] as const)("combines hints %#", async (serverTrusted, name, annotations, cls, sources) => {
