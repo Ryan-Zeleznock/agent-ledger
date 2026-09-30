@@ -9,11 +9,13 @@ Depends on types, the ledger's read contract, and Node built-ins. No new depende
 
 ## Evidence and criteria
 
-Checked **2026-09-30** against AICPA's **2017 Trust Services Criteria (with Revised Points of Focus — 2022)**:
+Read by **Astra on 2026-09-30** against AICPA's **2017 Trust Services Criteria (with Revised Points of Focus — 2022)**:
 [AICPA publication page](https://www.aicpa-cima.com/resources/download/2017-trust-services-criteria-with-revised-points-of-focus-2022).
 The publisher's download requires an account. The primary document itself was read via this
 [mirror of the AICPA PDF](https://gccertification.com/wp-content/uploads/2024/06/AICPA-TSP-Section-100-Trust-Services-Criteria-2022.pdf),
-printed pages 33, 39 and 44 (PDF pages 34, 40 and 45). These are paraphrases, not quotations:
+printed pages 33, 39 and 44 (PDF pages 34, 40 and 45). Fable could not retrieve the mirror during
+independent review (403), so page-level confirmation remains Astra-only pending Ryan's spot-check
+(review residual #10). These are paraphrases, not quotations:
 
 | Criterion | Verified scope [V] | Our candidate evidence mapping [H] |
 | --- | --- | --- |
@@ -34,7 +36,9 @@ CC7.2: their placeholder allow/unreviewed policy is not a second access/approval
 - `ledger.verify()` covers the **whole ledger**, not just the selected range. Its result, checked
   count, broken record (if supplied), and observed head appear in HTML/PDF and the CSV rows.
   A readable hash-broken ledger produces a prominently failed pack; structurally unreadable data
-  fails export. No records are silently skipped. Empty CSV has only its header.
+  fails export. CLI stdout includes the verification result used in this pack; a failed chain
+  returns exit 1 even when the diagnostic pack was written. No records are silently skipped.
+  Empty CSV has only its header.
 - Reads are bracketed by head checks; a changed head fails export before writing. Pause writers
   for a consistent export. The frozen API provides no transactional snapshot and cannot exclude
   malicious edits that preserve the observed head or happen after verification.
@@ -72,6 +76,7 @@ shown as reversible `\uXXXX` UTF-16 escapes; HTML/CSV retain Unicode. It wraps l
 truncating records. No PDF/A, embedded fonts or signatures are claimed. Output files use exclusive
 creation with mode 0600; use a fresh output directory for each pack. HTML is written last. I/O errors
 can leave an incomplete pack; a failed invocation must not be distributed as a completed export.
-All history/outputs are held in memory; large-ledger streaming is future work.
+All history/outputs are held in memory; handoff and finding lookups can be quadratic. Indexed
+joins and large-ledger streaming remain future work (review residual #8).
 
 Tests: `test/report.test.ts`, plus the real-ledger/process export in `test/cli-process.test.ts`.

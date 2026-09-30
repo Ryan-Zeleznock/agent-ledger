@@ -5,7 +5,9 @@ Status: implemented
 Local process composition root for Slice 1b. Build with `npm run build`; run
 `node /absolute/repo/dist/cli/main.js ...`. The package bin is `agent-ledger` → `dist/cli/main.js`.
 `main(argv, overrides)` returns an exit code and accepts injected I/O, hooks and module factories;
-importing it never launches a command. No runtime dependency was added.
+importing it never launches a command. The entry guard resolves argv[1] through realpath, so npm-bin
+symlinks and macOS /tmp aliases execute normally. Coordinator-authorized dependency correction
+(review #2): `yaml` moved to runtime dependencies, still pinned at 2.9.1, with no version drift.
 
 ## Commands and layout
 
@@ -48,7 +50,10 @@ failures go to stderr and still exit 0. The frozen pipeline constructor requires
 for decide-only instances even when only `recordOutcome` will be used. The direct post handler supplies
 a construction-only deadline of now + DEFAULT_DEADLINE_MS, then restores the environment immediately.
 It does not make a decision or claim watchdog supervision. Pre never manufactures a deadline.
-This integration detail needs cross-review against Fable's constructor when both halves land.
+Coordinator decision (2026-09-30, review #3): retain this shim instead of changing the contract.
+The recordOutcome-only construction question remains open for Ryan. A conditional process test
+activates when both hooks and pipeline READMEs say `Status: implemented`; it requires a real
+outcome append with both watchdog environment variables absent. It is skipped on this stub branch.
 
 `install-hooks --print` prints only a JSON `hooks` snippet for **Claude Code**. It uses absolute Node,
 CLI, watchdog and ledger-directory paths, POSIX shell quoting, all-tools matcher, PreToolUse via the
@@ -65,21 +70,22 @@ protection before that file exists. See [the demo](../../docs/DEMO.md).
 
 | Code | Meaning |
 | --- | --- |
-| 0 | Command completed; hook pre successfully formatted a decision (including deny); valid post command is always non-blocking. Verify: chain passed and latest anchor matches head or a retained ancestor. |
-| 1 | Operational/configuration failure, chain failure, or latest anchor absent from the retained chain. Pre failures are converted to deny by the watchdog. |
+| 0 | Command completed; hook pre successfully formatted a decision (including deny); valid post command is always non-blocking. Verify: chain passed and a non-genesis latest anchor matches head or a retained ancestor. Report: export completed with chain verification passing. |
+| 1 | Operational/configuration failure, chain failure (including a completed report whose chain failed), or latest anchor absent from the retained chain. Pre failures are converted to deny by the watchdog. |
 | 2 | CLI usage error. The watchdog separately uses exit 2 for a blocked pre call. |
-| 3 | Verify: chain passed, but no anchor is available. Distinct from fully checked verification. |
+| 3 | Verify: chain passed, but no non-genesis anchor is available. Distinct from fully checked verification. |
 
 Verify prints JSON containing the full `ledger.verify()` result, observed head, `anchor.latest()` and
 status `head`, `ancestor`, `missing`, `mismatch` or `untrusted` (chain failed). An ancestor anchors only
-a prefix; its existence does not anchor subsequent records. Genesis `0` anchors no records. Verify
+a prefix; its existence does not anchor subsequent records. Genesis `0` anchors no records and is reported as `missing`/exit 3, even for an empty ledger. Verify
 never creates an anchor or changes the ledger. A fresh init normally returns **3**: this slice does
 not schedule anchor writes. A valid chain alone cannot detect removal of its tail. Pause writers for
 verify/report; changed heads fail. Local anchors offer no independent tamper resistance.
 
 Report writes `report.html`, `report.pdf`, `records.csv` to a fresh output directory and prints paths
-as JSON. Explicit-offset timestamps are inclusive. Exit 0 means export completed, even if a readable
-ledger's verification result is FAIL; inspect the cover. No mode, collector or external-anchor
+and the report's own `chain` verification result as JSON. Explicit-offset timestamps are inclusive;
+invalid calendar dates or times return usage/exit 2. A readable ledger with a failed chain still
+produces a diagnostic pack, prints `chain.ok: false`, and returns exit 1. Exit 0 requires a passing chain. No mode, collector or external-anchor
 attestation is added. See [report semantics](../report/README.md).
 
 Errors deliberately omit raw parser/registry exception text that might contain secrets. Hook private
@@ -88,3 +94,15 @@ within the local-mode visibility/best-effort-gating trust boundary on a user-con
 
 Tests: injected contracts in `test/cli.test.ts`; built real-process commands and a directly written
 JSONL ledger in `test/cli-process.test.ts`. Full gate: `npm run typecheck && npm test`.
+
+
+## Review residuals (Fable, 2026-09-30)
+
+- **#8:** Handoff matching and record finding lookups still use quadratic scans in the worst case.
+  Large ledgers can be slow; indexed joins and streaming need a later change. No 50k-record runtime
+  bound is claimed.
+- **#10:** The AICPA primary PDF and printed pages were read by Astra. Fable could not independently
+  retrieve the mirror (403) or account-gated publisher download. Ryan should spot-check the cited
+  pages; candidate evidence mappings and auditor acceptance remain [H].
+- **#11:** Printed hooks still use the valid, tested shell command form. Moving to the documented
+  exec/args form is deferred; existing POSIX quoting and hostile-path tests remain applicable.

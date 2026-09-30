@@ -140,3 +140,11 @@ it("refuses to replace an existing export", async () => {
   await expect(generateReport(store([record(2)]), range, dir)).rejects.toThrow();
   expect(await readFile(files.csvPath)).toEqual(before);
 });
+
+it.each(["+SUM(1)", "-1+2", "@SUM(1)", "\t+cmd", "\r=cmd"])("prefixes formula-like CSV values %j", async value => {
+  const r = record(1); r.call.onBehalfOf = value;
+  const files = await generateReport(store([r]), range, await output());
+  const csv = await readFile(files.csvPath, "utf8");
+  expect(csv).toContain(`,"'${value}",`);
+  expect(csv).not.toContain(`,"${value}",`);
+});

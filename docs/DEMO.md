@@ -24,6 +24,7 @@ cd "$LEDGER_DEMO_DIR"
 "$LEDGER_DEMO_NODE" "$LEDGER_DEMO_REPO/dist/cli/main.js" init
 ```
 
+The CLI resolves its entry path, including symlinked checkouts and macOS `/tmp` → `/private/tmp` aliases.
 This creates `.agent-ledger/` in the sandbox only. The registry starts from the reviewed examples;
 both agents' **Bash is risky**, so even harmless shell commands request approval. Bash command text
 is withheld as an HMAC digest, not stored in cleartext. `init` refuses to replace an existing setup.
@@ -102,7 +103,7 @@ printf 'verify exit code: %s\n' "$LEDGER_DEMO_VERIFY_CODE"
 ```
 
 Expect `chain.ok: true` and a nonzero checked count after the live steps. **Exit 3 is expected when
-no local anchor exists**: it means the chain passed, but no saved anchor was available to check tail
+no non-genesis local anchor exists**: it means the chain passed, but no saved anchor was available to check tail
 truncation. Exit 1 is a verification/configuration failure; investigate before continuing. Exit 0
 means an existing anchor also matched the head or a retained ancestor. The CLI never writes an
 anchor just to make verification pass; periodic/independent anchoring is not wired in this slice.
@@ -115,6 +116,9 @@ Choose UTC boundaries covering the session. For a demo on the task date:
   --out "$LEDGER_DEMO_DIR/evidence-pack"
 open "$LEDGER_DEMO_DIR/evidence-pack/report.html"
 ```
+
+Report stdout includes `chain`; exit 1 with `chain.ok: false` means a failed-chain diagnostic pack
+was written. Investigate it before presenting the evidence as verified.
 
 Use the actual dates if running later. `open` is the macOS opener; elsewhere use the browser's Open
 File action. For another export, choose a new output directory: existing pack files are never

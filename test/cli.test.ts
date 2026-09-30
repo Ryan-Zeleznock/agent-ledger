@@ -102,7 +102,7 @@ describe("verify", () => {
 
 it("passes the selected range and output directory to the report contract", async () => {
   const dir = await initialized(); const out = join(await sandbox(), "pack");
-  const generateReport = vi.fn<CliDeps["generateReport"]>(async () => ({ pdfPath: join(out, "report.pdf"), csvPath: join(out, "records.csv") }));
+  const generateReport = vi.fn<CliDeps["generateReport"]>(async ledger => { await ledger.verify(); return { pdfPath: join(out, "report.pdf"), csvPath: join(out, "records.csv") }; });
   const r = run(["report", "--from", "2026-09-30T00:00:00Z", "--to", "2026-09-30T23:59:59Z", "--out", out, "--dir", dir], { generateReport });
   expect(await r.result).toBe(0); expect(generateReport.mock.calls[0]!.slice(1)).toEqual([{ from: "2026-09-30T00:00:00Z", to: "2026-09-30T23:59:59Z" }, out]);
   expect(JSON.parse(r.output()).htmlPath).toBe(join(out, "report.html"));
@@ -124,4 +124,44 @@ it("reports a broken chain even when its tail cannot be read", async () => {
   const ledger: LedgerStore = { append: vi.fn(), verify: vi.fn(async () => ({ ok: false, checked: 0, brokenAt: "line:1" })), head: async () => { throw new Error("bad tail"); }, async *read() {} };
   const r = run(["verify", "--dir", dir], { createLedger: () => ledger, createAnchor: () => ({ latest: async () => null, write: vi.fn() }) });
   expect(await r.result).toBe(1); expect(ledger.verify).toHaveBeenCalledOnce(); expect(JSON.parse(r.output()).chain.brokenAt).toBe("line:1");
+});
+
+it.each(["pre", "post"])("rejects a mismatched event for --event %s before pipeline construction", async event => {
+  const dir = await initialized(); const f = hookFakes();
+  const hooks = { ...f.hooks, parseHookInput: (() => event === "post" ? f.event : { ...f.event, hook_event_name: "PostToolUse", tool_response: {} }) as CliDeps["hooks"]["parseHookInput"] };
+  const r = run(["hook", "--agent", "claude-code", "--event", event, "--dir", dir], { ...f, hooks, stdin: async () => "raw" });
+  expect(await r.result).toBe(event === "post" ? 0 : 1);
+  expect(r.output()).toBe(""); expect(r.error()).not.toBe("");
+  expect(f.createPipeline).not.toHaveBeenCalled(); expect(f.recordOutcome).not.toHaveBeenCalled();
+});
+it.each(["0", "a".repeat(64)])("treats a genesis anchor as missing with head %s", async head => {
+  const dir = await initialized();
+  const ledger: LedgerStore = { append: vi.fn(), verify: async () => ({ ok: true, checked: head === "0" ? 0 : 1 }), head: async () => head, async *read() {} };
+  const r = run(["verify", "--dir", dir], { createLedger: () => ledger, createAnchor: () => ({ latest: async () => ({ hash: "0", at: "2026-09-30T12:00:00Z" }), write: vi.fn() }) });
+  expect(await r.result).toBe(3); expect(JSON.parse(r.output()).anchor.status).toBe("missing");
+});
+it.each(["2026-09-30T24:00:00Z", "2026-02-30T00:00:00Z"])("returns usage for invalid calendar timestamp %s before ledger access", async from => {
+  const createLedger = vi.fn<CliDeps["createLedger"]>();
+  const r = run(["report", "--from", from, "--to", "2026-10-01T00:00:00Z", "--out", "unused"], { createLedger });
+  expect(await r.result).toBe(2); expect(r.error()).toContain("Usage:"); expect(createLedger).not.toHaveBeenCalled();
+});
+it.each([true, false])("reports the export's actual chain result (ok=%s)", async ok => {
+  const dir = await initialized(); const chain = { ok, checked: 7, ...(ok ? {} : { brokenAt: "rec-2" }) };
+  const verify = vi.fn(async () => chain);
+  const ledger: LedgerStore = { append: vi.fn(), head: async () => "0", verify, async *read() {} };
+  const generateReport = vi.fn<CliDeps["generateReport"]>(async store => {
+    await store.verify(); return { pdfPath: "pack/report.pdf", csvPath: "pack/records.csv" };
+  });
+  const r = run(["report", "--dir", dir, "--from", "2026-09-30T00:00:00Z", "--to", "2026-10-01T00:00:00Z", "--out", "pack"], { createLedger: () => ledger, generateReport });
+  expect(await r.result).toBe(ok ? 0 : 1); expect(JSON.parse(r.output()).chain).toEqual(chain);
+  expect(verify).toHaveBeenCalledOnce();
+});
+it("places pinned yaml in runtime dependencies and the production lock graph", async () => {
+  const pkg = JSON.parse(await readFile("package.json", "utf8"));
+  const lock = JSON.parse(await readFile("package-lock.json", "utf8"));
+  expect(pkg.dependencies.yaml).toBe("2.9.1"); expect(pkg.devDependencies.yaml).toBeUndefined();
+  expect(lock.packages[""].dependencies).toEqual(pkg.dependencies);
+  expect(lock.packages[""].devDependencies).toEqual(pkg.devDependencies);
+  expect(lock.packages["node_modules/yaml"].dev).toBeUndefined();
+  expect(lock.packages["node_modules/yaml"].version).toBe("2.9.1");
 });

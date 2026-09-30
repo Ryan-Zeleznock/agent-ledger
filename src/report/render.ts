@@ -5,6 +5,7 @@ import type { LedgerStore } from "../ledger/contract.js";
 import type { ReportFiles, UnreconciledHandoff } from "./contract.js";
 import { textPdf } from "./pdf.js";
 
+export const HANDOFF_RECONCILE_GRACE_MS = 60_000;
 export const HISTORY_START = "0100-01-01T00:00:00.000Z";
 export function checkedRange(range: DateRange, graceMs = 0): { from: number; to: number; extended: string } {
   const instant = (s: string) => {
@@ -42,7 +43,7 @@ const vocabulary = [
   "delegated = asked in the terminal; not a recorded human approval. An intent with no outcome means execution was not observed; denial, cancellation or lost telemetry cannot be distinguished.",
   "Codex hook outcome ok means the tool ran and returned; it does not prove success.",
   "HMAC-SHA256 digest = argument withheld, not the clear argument. Keyed comparison requires the separately held per-ledger key; the pack never includes that key.",
-  "Handoff matching uses callId and a non-handoff MCP intent; collector provenance is absent from the schema, so this is correlation, not proof of proxy identity. Grace: 60000 ms after range end.",
+  `Handoff matching uses callId and a non-handoff MCP intent; collector provenance is absent from the schema, so this is correlation, not proof of proxy identity. Grace: ${HANDOFF_RECONCILE_GRACE_MS} ms after range end.`,
   "Orphan outcomes have no preceding intent for their callId in available ledger history. A standalone blocked outcome can be a legitimate denial; investigate rather than infer execution.",
   "No outcome findings are relative to the range end plus grace. Missing records and activity outside governed paths cannot be ruled out by a valid chain. No external anchor was supplied to this report API; use CLI verify for the local anchor status.",
 ];
@@ -52,7 +53,7 @@ const esc = (s: string) => s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt
 const csvCell = (s: string) => `"${(/^[\s]*[=+@-]|^[\t\r\n]/.test(s) ? "'" + s : s).replace(/"/g, '""')}"`;
 
 export async function renderReport(ledger: LedgerStore, range: DateRange, outDir: string): Promise<ReportFiles> {
-  const { from, to, extended } = checkedRange(range, 60_000);
+  const { from, to, extended } = checkedRange(range, HANDOFF_RECONCILE_GRACE_MS);
   const head = await ledger.head();
   const verify = await ledger.verify();
   const history: LedgerRecord[] = [];

@@ -1,6 +1,6 @@
 import type { DateRange } from "../types/index.js";
 import type { LedgerStore } from "../ledger/contract.js";
-import { checkedRange, findHandoffs, renderReport } from "./render.js";
+import { checkedRange, findHandoffs, renderReport, HANDOFF_RECONCILE_GRACE_MS } from "./render.js";
 export interface ReportFiles { pdfPath: string; csvPath: string; }
 export function generateReport(ledger: LedgerStore, range: DateRange, outDir: string): Promise<ReportFiles> { return renderReport(ledger, range, outDir); }
 
@@ -13,7 +13,7 @@ export function generateReport(ledger: LedgerStore, range: DateRange, outDir: st
  * its end, so a handoff at the boundary is not flagged for a proxy record written a moment later.
  */
 export interface UnreconciledHandoff { callId: string; proxyServerName: string; hookRecordId: string; handedOffAt: string; }
-export const HANDOFF_RECONCILE_GRACE_MS = 60_000;
+export { HANDOFF_RECONCILE_GRACE_MS } from "./render.js";
 export async function reconcileHandoffs(ledger: LedgerStore, range: DateRange, graceMs = HANDOFF_RECONCILE_GRACE_MS): Promise<UnreconciledHandoff[]> {
   const { extended } = checkedRange(range, graceMs);
   const records = [];

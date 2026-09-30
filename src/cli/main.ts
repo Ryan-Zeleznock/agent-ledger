@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import { randomBytes, createHash } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, realpathSync } from "node:fs";
 import { mkdir, open, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import * as hooks from "../hooks/contract.js";
 import { createPipeline, type PipelineDeps } from "../pipeline/contract.js";
@@ -11,8 +11,9 @@ import { createLedger } from "../ledger/contract.js";
 import { createIdentity } from "../identity/contract.js";
 import { loadRegistry } from "../policy/contract.js";
 import { createAnchor } from "../anchor/contract.js";
-import { generateReport } from "../report/contract.js";
-import type { HookAgent } from "../types/index.js";
+import { generateReport, HANDOFF_RECONCILE_GRACE_MS } from "../report/contract.js";
+import { checkedRange } from "../report/render.js";
+import type { HookAgent, VerifyResult } from "../types/index.js";
 
 /** The CLI is the process composition root; ordering inside a call belongs to the pipeline. */
 export interface CliDeps {
@@ -129,14 +130,21 @@ export async function main(argv: string[] = process.argv.slice(2), overrides: Pa
     const range = name === "report" ? { from: string("from"), to: string("to") } : undefined;
     const outDir = name === "report" ? resolve(string("out")) : undefined;
     if (range) {
-      const instant = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/i;
-      if (![range.from, range.to].every(s => instant.test(s) && Number.isFinite(Date.parse(s))) || Date.parse(range.from) > Date.parse(range.to)) throw new UsageError(usage);
+      try { checkedRange(range, HANDOFF_RECONCILE_GRACE_MS); } catch { throw new UsageError(usage); }
     }
     if (!(await stat(join(dir, "ledger"))).isDirectory()) throw new Error("Initialize first");
     const ledger = deps.createLedger("jsonl", join(dir, "ledger", "records.jsonl"));
     if (name === "report") {
-      const files = await deps.generateReport(ledger, range!, outDir!);
-      deps.stdout(JSON.stringify({ ...files, htmlPath: join(outDir!, "report.html") }) + "\n"); return 0;
+      // Capture the report's own verification result without changing ReportFiles or
+      // independently verifying a potentially different ledger state for stdout.
+      let chain: VerifyResult | undefined;
+      const files = await deps.generateReport({
+        append: record => ledger.append(record), head: () => ledger.head(), read: range => ledger.read(range),
+        verify: async () => { chain = await ledger.verify(); return chain; },
+      }, range!, outDir!);
+      if (!chain) throw new Error("Report did not verify the ledger");
+      deps.stdout(JSON.stringify({ ...files, htmlPath: join(outDir!, "report.html"), chain }) + "\n");
+      return chain.ok ? 0 : 1;
     }
     if (name === "verify") {
       let before: string | null = null;
@@ -147,7 +155,7 @@ export async function main(argv: string[] = process.argv.slice(2), overrides: Pa
       let status = "missing";
       if (!chain.ok) status = "untrusted";
       else if (latest) {
-        status = latest.hash === before ? "head" : latest.hash === "0" ? "ancestor" : "mismatch";
+        status = latest.hash === "0" ? "missing" : latest.hash === before ? "head" : "mismatch";
         if (status === "mismatch") for await (const record of ledger.read({ from: "0100-01-01T00:00:00.000Z", to: "9999-12-31T23:59:59.999Z" })) {
           if (record.hash === latest.hash) { status = "ancestor"; break; }
         }
@@ -169,6 +177,8 @@ export async function main(argv: string[] = process.argv.slice(2), overrides: Pa
       identity, registry, ledger, argsHmacKey: key, approvals: { kind: "hook-ask" as const }, hookAgent: agent,
       upstream: { async execute() { throw new Error("Decide-only CLI cannot execute tools"); }, async listTools() { throw new Error("Decide-only CLI cannot list tools"); }, async close() {} },
     } as PipelineDeps & { argsHmacKey: Uint8Array }; // PIN-1: remove cast once Fable's required field lands.
+    // Coordinator decision (2026-09-30, review #3): retain this shim instead of changing
+    // the pipeline contract; the recordOutcome-only construction question stays open for Ryan.
     // Post hooks run directly. Supply construction-only timing for the frozen pipeline init check;
     // no pre decision is made here, and no watchdog enforcement is claimed for a post event.
     const priorDeadline = process.env[hooks.WATCHDOG_DEADLINE_AT_ENV];
@@ -194,6 +204,8 @@ export async function main(argv: string[] = process.argv.slice(2), overrides: Pa
   }
 }
 
-if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
-  process.exitCode = await main();
-}
+let invokedDirectly = false;
+try {
+  invokedDirectly = !!process.argv[1] && realpathSync.native(resolve(process.argv[1])) === fileURLToPath(import.meta.url);
+} catch { /* An absent/unresolvable argv entry must not run the CLI during an import. */ }
+if (invokedDirectly) process.exitCode = await main();
