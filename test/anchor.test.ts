@@ -71,6 +71,46 @@ describe("createAnchor('file')", () => {
     for (const l of lines()) expect(() => JSON.parse(l)).not.toThrow();
   });
 
+  it("Astra #11: a torn tail makes the next write reject WITHOUT changing a byte; latest() reports it; recovery is manual", async () => {
+    const anchor = createAnchor("file", path);
+    await anchor.write({ hash: h("a"), at: "2026-09-30T00:00:00.000Z" });
+    appendFileSync(path, '{"hash":"');
+    const before = readFileSync(path);
+    await expect(anchor.write({ hash: h("b"), at: "2026-10-01T00:00:00.000Z" })).rejects.toThrow(/incomplete line/);
+    await expect(anchor.write({ hash: h("c"), at: "2026-10-02T00:00:00.000Z" })).rejects.toThrow(/incomplete line/);
+    expect(readFileSync(path).equals(before)).toBe(true);
+    await expect(anchor.latest()).rejects.toThrow(/incomplete line/);
+    expect(existsSync(`${path}.lock`)).toBe(false);
+  });
+
+  it("Astra #12: `at` must carry an explicit offset and name a real day; '0', timezone-free and February 30 are refused", async () => {
+    const anchor = createAnchor("file", path);
+    for (const at of ["0", "2026-09-30T00:00:00", "2026-09-30", "2026-02-30T00:00:00Z", "2026-09-30T00:00:00+25:00", 1727654400000]) {
+      await expect(anchor.write({ hash: h("a"), at: at as string })).rejects.toThrow(/at must be/);
+    }
+    await anchor.write({ hash: h("a"), at: "2026-09-30T02:00:00+02:00" });
+    expect(await anchor.latest()).toEqual({ hash: h("a"), at: "2026-09-30T02:00:00+02:00" });
+    expect(existsSync(path)).toBe(true);
+  });
+
+  it("takes the shared lock file and fails closed, in bounded time, when someone else holds it", async () => {
+    const anchor = createAnchor("file", path);
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(join(dir, "anchors"), { recursive: true });
+    writeFileSync(`${path}.lock`, "4242 2026-09-30T00:00:00.000Z\n");
+    const prev = process.env.AGENT_LEDGER_LOCK_TIMEOUT_MS;
+    process.env.AGENT_LEDGER_LOCK_TIMEOUT_MS = "100";
+    try {
+      const t0 = performance.now();
+      await expect(anchor.write({ hash: h("a"), at: "2026-09-30T00:00:00.000Z" })).rejects.toThrow(/lock .*is held by "4242/);
+      expect(performance.now() - t0).toBeLessThan(2000);
+      expect(existsSync(path)).toBe(false);
+      expect(existsSync(`${path}.lock`)).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.AGENT_LEDGER_LOCK_TIMEOUT_MS; else process.env.AGENT_LEDGER_LOCK_TIMEOUT_MS = prev;
+    }
+  });
+
   it("createAnchor('s3') stays not implemented (later: S3 Object Lock)", () => {
     expect(() => createAnchor("s3", "s3://bucket/key")).toThrow(/^not implemented: /);
   });

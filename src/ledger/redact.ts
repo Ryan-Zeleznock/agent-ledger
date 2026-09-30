@@ -21,7 +21,7 @@ const PLACEHOLDER = (kind: string) => `[REDACTED:${kind}]`;
 const PLACEHOLDER_FULL = /^\[REDACTED:[a-z0-9][a-z0-9:#_-]*\]$/;
 const PLACEHOLDER_AT = /\[REDACTED:[a-z0-9][a-z0-9:#_-]*\]/y;
 
-const WORD_REGEX_MAX = 4096;    // longer words skip the per-word regexes (still get assignment/decoding checks)
+const WORD_REGEX_MAX = 1024;    // longer words get only anchored single-attempt checks (still assignment/decoding checks)
 const JSON_IN_STRING_MAX = 64 * 1024;
 const DECODE_MAX = 64 * 1024;
 const MAX_SCAN_DEPTH = 3;       // string → JSON-in-string → decoded → stop
@@ -91,9 +91,38 @@ const WORD_PATTERNS: readonly { kind: string; re: RegExp }[] = [
   { kind: "sk-token", re: /\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}/g },
   { kind: "slack-token", re: /\bxox[abprs]-[A-Za-z0-9-]{10,}|\bxapp-[A-Za-z0-9-]{10,}/g },
   { kind: "google-api-key", re: /\bAIza[0-9A-Za-z_-]{35}/g },
-  { kind: "email", re: /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/g },
+];
+/** Words longer than WORD_REGEX_MAX get only anchored, single-attempt checks. */
+const LONG_WORD_PATTERNS: readonly { kind: string; re: RegExp }[] = [
+  { kind: "jwt", re: /^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/ },
 ];
 const URL_CRED_RE = /^([a-z][a-z0-9+.-]*:\/\/)([^/@]+)@/i;
+
+const isLocalChar = (c: number) => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 46 || c === 95 || c === 37 || c === 43 || c === 45; // [A-Za-z0-9._%+-]
+const isDomainChar = (c: number) => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 46 || c === 45;          // [A-Za-z0-9.-]
+const isAlpha = (c: number) => (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+/** Linear e-mail finder: expand around each `@` (a regex with `[...]+@` backtracks quadratically on long runs). */
+function redactEmails(w: string): string {
+  if (!w.includes("@")) return w;
+  let out = ""; let i = 0; let from = 0;
+  while (i < w.length) {
+    const at = w.indexOf("@", i);
+    if (at === -1) break;
+    let l = at; while (l > from && isLocalChar(w.charCodeAt(l - 1))) l--;
+    let r = at + 1; while (r < w.length && isDomainChar(w.charCodeAt(r))) r++;
+    const domain = w.slice(at + 1, r).replace(/\.+$/, "");
+    const dot = domain.lastIndexOf(".");
+    const tld = dot === -1 ? "" : domain.slice(dot + 1);
+    const okTld = tld.length >= 2 && [...tld].every((ch) => isAlpha(ch.charCodeAt(0)));
+    if (l < at && domain.length > dot + 1 && dot > 0 && okTld) {
+      out += w.slice(from, l) + PLACEHOLDER("email");
+      from = at + 1 + domain.length; i = from;
+    } else {
+      i = at + 1;
+    }
+  }
+  return out + w.slice(from);
+}
 
 // ---------- tokeniser ----------
 
@@ -271,6 +300,9 @@ function redactWord(word: string, depth: number): string {
   }
   if (w.length <= WORD_REGEX_MAX) {
     for (const p of WORD_PATTERNS) { p.re.lastIndex = 0; w = w.replace(p.re, PLACEHOLDER(p.kind)); }
+    w = redactEmails(w);
+  } else {
+    for (const p of LONG_WORD_PATTERNS) if (p.re.test(w)) return PLACEHOLDER(p.kind);
   }
   if (w === word && decodedHasSecret(word, depth)) return PLACEHOLDER("encoded");
   return w;
