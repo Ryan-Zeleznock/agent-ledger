@@ -11,14 +11,14 @@ import {
 const isBuiltinKey = (server: string) => (BUILTIN_SERVER_KEYS as readonly string[]).includes(server);
 
 export type Args = Record<string, unknown>;
-const re = (p: string) => new RegExp(p, "i");
+const re = (p: string) => compileRegex(p, "oracle argPattern");
 const argsMatch = (patterns: Record<string, string>, args: Args) =>
-  Object.entries(patterns).every(([k, p]) => {
+  Object.entries(patterns).map(([k, p]): [string, RegExp] => [k, re(p)]).every(([k, pattern]) => {
     if (typeof args !== "object" || args === null || !Object.hasOwn(args, k)) return false;
     const value = args[k];
     if ((typeof value === "object" && value !== null) || typeof value === "function") return true;
     const text = String(value);
-    return text.length > 1024 || re(p).test(text);
+    return text.length > 1024 || pattern.test(text);
   });
 const isClass = (c: unknown): c is ToolClass => (TOOL_CLASSES as readonly unknown[]).includes(c);
 

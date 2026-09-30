@@ -1,4 +1,4 @@
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -9,7 +9,7 @@ import { decide } from "./helpers/registry-eval.js";
 import type { ToolCall } from "../src/types/index.js";
 
 const dirs: string[] = [];
-afterEach(() => dirs.splice(0).forEach(d => rmSync(d, { recursive: true, force: true })));
+afterEach(() => { vi.restoreAllMocks(); dirs.splice(0).forEach(d => rmSync(d, { recursive: true, force: true })); });
 const config = (pattern: string) => ({ version: 1, servers: { s: { trusted: true, tools: { t: {
   class: "write", reviewedBy: "ryan", reviewedAt: "2026-09-30",
   escalateWhen: [{ to: "risky", argPattern: { env: pattern } }],
@@ -91,4 +91,32 @@ it("generated escalation combinations preserve oracle parity, max rank, AND and 
       }
     }
   }
+});
+
+it("compiles once per entry and recompiles when that entry's patterns change", async () => {
+  const NativeRegExp = RegExp;
+  const constructor = vi.spyOn(globalThis, "RegExp").mockImplementation(function (pattern: string | RegExp, flags?: string) {
+    return new NativeRegExp(pattern, flags);
+  });
+  const registry = await loadRegistry(file(config("^main$")));
+  const compiledMain = () => constructor.mock.calls.filter(([source]) => source === "^main$").length;
+  expect(compiledMain()).toBe(1);
+  for (let i = 0; i < 20; i++) expect(evaluate(registry, call({ env: "main" })).risk).toBe("risky");
+  expect(compiledMain()).toBe(1);
+  registry.servers.s!.tools.t!.escalateWhen![0]!.argPattern.env = "^dev$";
+  expect(evaluate(registry, call({ env: "main" })).risk).toBe("write");
+  expect(evaluate(registry, call({ env: "dev" })).risk).toBe("risky");
+  expect(constructor.mock.calls.filter(([source]) => source === "^dev$")).toHaveLength(1);
+});
+it("both evaluators refuse unsafe hand-built patterns under a hard child deadline", () => {
+  const child = spawnSync(process.execPath, ["--import", "./test/helpers/source-loader.mjs", "--input-type=module", "-e", `
+    import assert from 'node:assert/strict';
+    import { evaluate } from './src/policy/contract.ts';
+    import { decide } from './test/helpers/registry-eval.ts';
+    const registry = JSON.parse(process.argv[1]);
+    const args = { env: 'a'.repeat(40) + '!' };
+    assert.throws(() => evaluate(registry, { server: 's', tool: 't', args }), /unsafe regex/);
+    assert.throws(() => decide(registry, 's', 't', args), /unsafe regex/);
+  `, JSON.stringify(config("^(a+)+$"))], { timeout: 2000, killSignal: "SIGKILL", encoding: "utf8" });
+  expect(child.error, child.stderr).toBeUndefined(); expect(child.status, child.stderr).toBe(0);
 });
