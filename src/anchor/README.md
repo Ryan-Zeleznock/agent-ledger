@@ -6,8 +6,9 @@
 
 Status: implemented
 
-Implemented 2026-09-30 (Fable, branch `slice-1a-ledger`) for LOCAL MODE and hardened after Astra's review the same day
-(findings #11, #12). `createAnchor("s3", …)` still throws `not implemented` (later: S3 Object Lock, server mode).
+Implemented 2026-09-30 (Fable, branch `slice-1a-ledger`) for LOCAL MODE and hardened after Astra's reviews the same day
+(round 1 #11, #12; round 3: timestamp parity with the ledger). `createAnchor("s3", …)` still throws `not implemented`
+(later: S3 Object Lock, server mode).
 Files: `file.ts`, `contract.ts`. Tests: `test/anchor.test.ts`.
 
 ## Behaviour

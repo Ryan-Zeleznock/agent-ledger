@@ -8,8 +8,8 @@
 Status: implemented
 
 Implemented 2026-09-30 (Fable, branch `slice-1a-ledger`) for LOCAL MODE, then hardened after Astra's cross-review
-(`docs/reviews/2026-09-30-astra-ledger-review.md`, 13 findings) and re-review (`…-astra-ledger-rereview.md`, 9 findings);
-see "Review resolutions" for both rounds.
+(`docs/reviews/2026-09-30-astra-ledger-review.md`, 13 findings), re-review (`…-astra-ledger-rereview.md`, 9 findings) and
+round 3 (`…-astra-ledger-round3.md`, 4 defects); see "Review resolutions" for all rounds.
 
 **Design note: redaction is best-effort defence in depth, never the only secret control.** Pattern matching cannot
 prove the absence of a secret. The ledger's actual controls are: credentials never enter a `ToolCall` (explicit
@@ -33,14 +33,19 @@ Spec §9's "raw args are never persisted" holds for the args AFTER redaction; wh
   a record the store could not read back is never written). Duplicate `id`s are refused under the lock (an amortised id
   index reads only the bytes appended since its last refresh). Sealing adds `parentRecordId`, `prevHash`, `writtenAt`
   (ledger clock, ISO 8601 UTC, milliseconds) and `hash`, and writes one line: the record's JCS form plus `\n`.
-  Rejections leave the file untouched. Getters are never invoked: `snapshotJsonData` reads every value once through its
-  property descriptor and rejects accessors, holes, Proxies and class instances.
+  Rejections leave the file untouched. Getters are never invoked anywhere: `snapshotJsonData` (args) and the contract
+  object snapshot (record, call, policy, approval, outcome, handoff) read every value once through its property
+  descriptor and reject accessors, holes, Proxies and class instances, so the values validated are the values sealed.
+  Right before writing, the sealed record is serialised, pushed through the SAME strict read path (`parseStored`) and
+  re-hashed; only a line that `verify()` will accept is written.
 - **`head()`** is the hash of the last stored record (re-read and self-hash-checked every call), or `"0"` for an empty
   or missing file: the value the next record's `prevHash` takes and the value to hand to `anchor`.
 - **`verify()`** streams the file and stops at the first line that fails any of: parses as JSON; passes
   `projectStored` (STRICT: an unknown field at any level of record/call/policy/approval/outcome/handoff is a broken
   record, so an injected field can never be dropped before re-hashing; RFC 3339 `writtenAt`, 64-hex `hash`,
-  genesis-consistent `prevHash`/`parentRecordId`);
+  genesis-consistent `prevHash`/`parentRecordId`); **is byte-for-byte the RFC 8785 serialisation of that record**
+  (round 3: one rule that rejects duplicate member names, which `JSON.parse` would silently collapse, as well as
+  whitespace, reordering and escape variants, so the bytes on disk are exactly the bytes the hash covers);
   unique `id`; `prevHash` = previous hash; `parentRecordId` = previous id; recomputed hash = stored hash (a
   canonicalisation failure such as `1e400` is a broken record, not an exception). Blank lines and a final line without
   `\n` are broken too. `brokenAt` is the record's `id`, or `line:<n>`; `checked` counts records up to and including it.
@@ -74,29 +79,42 @@ still a secret). Layers, at every nesting level:
 
 1. **Key layer.** The field name is NFKC-normalised (fullwidth `ｐａｓｓｗｏｒｄ` → `password`), lowercased,
    separators removed. If it ends with `password`, `passwd`, `passphrase`, `secret`, `token`, `apikey`, `privatekey`,
-   `accesskey`, `secretkey`, `clientsecret`, `authorization`, `credential(s)`, `cookie`, `setcookie`, or equals `pwd`,
-   `pass`, `auth`, `bearer`, `key`, `ssn`, `otp`, `pin`, the WHOLE value becomes `[REDACTED:key:<keyword>]`, where
-   `<keyword>` is the matched word from **our** list: the caller's key is never copied into a placeholder. A key that
-   itself carries a secret or PII shape (a token, an e-mail) is renamed `[REDACTED:key#n]`, collision-safe within the object.
-2. **Structure layer.** argv pairs `["--password", "x"]` → `[REDACTED:argv]`; `["Authorization", "Bearer", "x"]` and
-   `["X-Api-Key", "x"]` → `[REDACTED:pair]` (scheme word kept); header objects `{name|key|header|field: "Authorization",
-   value: "x"}` → `value` redacted.
+   `accesskey`, `secretkey`, `clientsecret`, `authorization`, `credential(s)`, `cookie`, `setcookie`, equals `pwd`,
+   `pass`, `auth`, `bearer`, `key`, `ssn`, `otp`, `pin`, or **contains** `password|passwd|passphrase|secret|token|
+   apikey|privatekey|accesskey|authorization|credential|cookie` anywhere (`db_password_value`, `api_key_value`,
+   `tokens_list`), the WHOLE value becomes `[REDACTED:key:<keyword>]`, where `<keyword>` is the matched word from
+   **our** list: the caller's key is never copied into a placeholder. A key that itself carries a secret or PII shape
+   (a token, an e-mail) is renamed `[REDACTED:key#n]`, collision-safe within the object.
+2. **Structure layer.** argv: a flag whose bare name is sensitive (`--password`, `--token`, `--secret`, `--auth`, `-p`,
+   `-u`, `--key`, `--db-token`, …) makes the NEXT element `[REDACTED:pair]`, even if it starts with `-`; a `--flag=value`
+   carries its own value and is redacted as an assignment. `["Authorization", "Bearer", "x"]` and `["X-Api-Key", "x"]`
+   → `[REDACTED:pair]` (scheme word kept); header objects `{name|key|header|field: "Cookie", value: "x"}` → `value` redacted.
 3. **Value layer.** A string that parses as a JSON object/array (≤ 64 KiB, and only within the remaining depth budget,
    measured iteratively) is redacted **structurally** and re-serialised. Every other string goes through a
-   **linear, recursion-free tokeniser** (whitespace, words, placeholders, punctuation including quotes) and token
-   rules: assignments `name=value`, `name:value`, `name: value`, `name = value`, `"name": "value"`, `--flag value`
-   whose name contains `password|passwd|passphrase|secret|token|apikey|privatekey|accesskey|authorization|credential|
-   cookie` (the value may be quoted with backslash escapes, multi-word, comma-separated, unterminated → consumed to
-   the end, or start with an auth scheme as in `authorization:bearer X` → `[REDACTED:assignment]`/`[REDACTED:bearer]`,
-   quotes kept so JSON stays JSON); auth schemes `bearer|basic|digest|negotiate` (case-insensitive) → the following
-   credential; URL userinfo (`scheme://user:pass@` → `[REDACTED:url-credentials]`) and secret query parameters; vendor
-   shapes (JWT, AWS access key ids, GitHub, Stripe, `sk-`/`sk-ant-`, Slack, Google; glued suffixes still match); e-mail
-   (hand-rolled, linear); words that are percent-, base64/base64url- (≥ 8 chars) or hex-encoded (≥ 8 chars) text whose
-   **decoded** form carries a secret → `[REDACTED:encoded]`, with EXACTLY one level of decoding (the decoded text is
-   scanned with decoding off). **Words longer than 1 KiB are replaced whole** (`[REDACTED:long-word]`), wherever they
-   appear (values, keys, URLs): fail safe rather than leave a long word unscanned. On the whole string only linear
-   scans run: PEM private-key blocks (indexOf-based, every search starts where the last stopped, a missing footer is
-   remembered) and bounded-quantifier regexes for US SSNs and Luhn-valid 13–19-digit card numbers.
+   **linear, recursion-free tokeniser** (whitespace, words, placeholders, punctuation including quotes; `,` and `&`
+   are word characters) and **format-aware rules** (round 3):
+   - **Sensitive assignments** `NAME=VALUE`, `NAME:VALUE`, `NAME: VALUE`, `NAME = VALUE`, `"NAME": "VALUE"` (NAME
+     sensitive by the key-layer rule): a quoted value is redacted to its closing quote (backslash escapes honoured,
+     unterminated = to the end, quotes kept so JSON stays JSON); an **unquoted value is redacted to the end of the
+     line**, or to the closing quote of the enclosing quoted context (`-H "Authorization: Bearer x" https://…` keeps
+     the URL). That single boundary covers `Authorization: <any scheme> <credential>` (the scheme goes too),
+     `Cookie: a=b; c=d` and `Set-Cookie` (every cookie), `PASSWORD=alpha,beta`, `PASS=x`, `?pwd=x`, and
+     `export TOKEN=x && echo done` (the tail is lost: accepted over-redaction).
+   - **CLI flags** in text: `--password a,b`, `--password -x`, `--auth x`, `-p x`, `--token=x`: the next argument
+     (one word or one quoted span), even if it starts with `-`.
+   - **URLs** anywhere in a word, also after `DATABASE_URL=`: userinfo replaced entirely (`user:alpha,beta@` →
+     `[REDACTED:url-credentials]@`); each sensitive query parameter (`api_key`, `pwd`, `token`, …) redacted up to the
+     next `&` or `#`, other parameters kept.
+   - **Prose** auth schemes `bearer|basic|digest|negotiate` (case-insensitive) → the following value; vendor shapes
+     (JWT, AWS access key ids, GitHub, Stripe, `sk-`/`sk-ant-`, Slack, Google; glued suffixes still match); e-mail
+     (hand-rolled, linear); words that are percent-, base64/base64url- (≥ 8 chars) or hex-encoded (≥ 8 chars) text whose
+     **decoded** form carries a secret → `[REDACTED:encoded]`, with EXACTLY one level of decoding.
+   - **Words longer than 1 KiB are replaced whole** (`[REDACTED:long-word]`), wherever they appear: fail safe rather
+     than leave a long word unscanned.
+   - On the whole string only linear scans run: PEM private-key blocks (indexOf-based, every search starts where the
+     last stopped, a missing footer is remembered) and bounded-quantifier regexes for US SSNs and Luhn-valid card numbers.
+   `test/ledger-redact.test.ts` holds one parameterised table with all of Astra's round-3 shapes (headers, cookies, env
+   lines, JSON keys, URLs, CLI flags), each checked in a string, an array and a nested object, and for idempotency.
 
 Performance (Astra #6, re-review P1): no unanchored keyword regex over the whole string, no `Array#includes` per
 renamed key, no PEM rescans, no recursion on quotes. Measured on the compiled build, 2026-09-30, Apple silicon:
@@ -111,8 +129,10 @@ from 40 KB to 160 KB.
 messages, secrets in binary blobs, and secret-bearing text that matches none of the shapes above cannot be defeated by
 pattern matching. Redaction reduces exposure; it is not a guarantee of secrecy (see the design note at the top). Also
 not redacted on purpose: phone numbers, street addresses, person names, generic high-entropy strings shorter than 1 KiB.
-Over-redaction (`tokens: 42` in prose, `authorization_url`, any word over 1 KiB such as a long path or data URI) is the
-accepted failure direction. Strings over 256 KiB, or records whose redacted args exceed the limits, are rejected before
+Over-redaction is the accepted failure direction, and round 3 widened it on purpose: a key or name that merely
+CONTAINS a sensitive word (`tokens_list`, `authorization_url`, `secretary`), the rest of a line after an unquoted
+sensitive assignment (`TOKEN=x && echo done` loses `&& echo done`), the argument after `-p`/`-u`/`--key`, and any word
+over 1 KiB (a long path, a data URI). Strings over 256 KiB, or records whose redacted args exceed the limits, are rejected before
 anything is written.
 
 ## Concurrency design (JSONL)
@@ -180,6 +200,15 @@ Re-review (Astra, 2026-09-30, round 2: `docs/reviews/2026-09-30-astra-ledger-rer
 | P2 `:60` accepted and shifted; sub-ms ordering; leap seconds | `:60` refused (documented); > 3 fractional digits refused; ms kept exact |
 | P2 duplicate ids at append | refused under the lock via the id index; also across instances and after reopen |
 | P2 4-process test did not prove contention | hold/blocked/release tests for ledger and anchor |
+
+Round 3 (Astra, 2026-09-30: `docs/reviews/2026-09-30-astra-ledger-round3.md`):
+
+| Defect | Resolution |
+|---|---|
+| duplicate JSON members in a stored line bypass verify (`JSON.parse` keeps the last) | a stored line must equal `canonicalize(record)` exactly (tail/verify/read); sealed line proven through the same path before writing |
+| common formats leak (`Authorization: ApiKey x`, full Cookie, `PASSWORD=a,b`, `PASS=`, `DATABASE_URL=…u:p@`, `*_password_value`, URL userinfo/params with commas, `?pwd=`, `--password a,b`, `--password -x`, `--auth x`) | format-aware boundaries above; parameterised table |
+| `outcome.durationMs` accessor: append succeeds, verify rejects | every contract object is a descriptor snapshot (accessors/Proxies rejected at any level); sealed record validated and re-hashed right before writing |
+| anchor accepted `:60` and > 3 fractional digits | anchor `isInstant` matches the ledger rule; write + read regressions |
 
 ## Due diligence (2026-09-30, primary sources)
 

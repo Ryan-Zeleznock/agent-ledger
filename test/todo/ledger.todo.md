@@ -22,6 +22,11 @@ Added from Astra's re-review (2026-09-30, round 2), all implemented:
 - [x] scheme-in-value, long words (also keys/URLs), short base64/hex, one decode level, nested JSON/quotes budget, linear renaming/PEM → `test/ledger-redact.test.ts`, `test/ledger-redact-bench.test.ts`
 - [x] contention proof: A holds the lock, B-D blocked (EEXIST) then land after release → `test/ledger-multiprocess.test.ts`
 
+Added from Astra's round 3 (2026-09-30), all implemented:
+- [x] stored line must equal its canonical JCS serialisation (duplicate members, whitespace, reordering, escapes) → `test/ledger-jsonl.test.ts`
+- [x] accessors/Proxies in any contract object rejected before writing; sealed record validated through the read path → `test/ledger-jsonl.test.ts`, `test/ledger-validate.test.ts`
+- [x] common-format redaction table (headers, cookies, env lines, JSON keys, URLs, CLI flags) → `test/ledger-redact.test.ts`
+
 Still to write:
 - [ ] postgres backend (Slice 2): the same chain rules over a table with an append-only role; verify() and read(range) parity with jsonl
 - [ ] pipeline/report: the caller-side anchor comparison (anchored head ∈ verified chain) as a real function, once `src/report/` exists
