@@ -1,13 +1,14 @@
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
 import { parse } from "yaml";
-import { CLASS_DECISION, CLASS_RANK, type Escalation, type ToolClass, type ToolRegistry } from "../src/policy/contract.js";
+import { evaluate, loadRegistry, CLASS_DECISION, CLASS_RANK, type Escalation, type ToolClass, type ToolRegistry } from "../src/policy/contract.js";
 import { BUILTIN_CODEX_SERVER, BUILTIN_SERVER, BUILTIN_SERVER_KEYS, MCP_SERVER_NAME_RE, RESERVED_KEYS, RESERVED_SERVER_NAMES } from "../src/types/index.js";
-import { decide, isReservedKey, isReservedServerName, normalise, splitToolName, validate, type Args } from "./helpers/registry-eval.js";
+import { decide as helperDecide, isReservedKey, isReservedServerName, normalise, splitToolName, validate, type Args } from "./helpers/registry-eval.js";
 
-// Tables over the real registry YAML through the TEST-ONLY evaluator in test/helpers/registry-eval.ts, which
-// mirrors the contracts' documented semantics. Product functions stay stubs until Gate 2 (ADR-002).
-const registry = parse(readFileSync("policies/tools.example.yaml", "utf8")) as ToolRegistry;
+// Real policy owns the decision table; retain the helper as an independent parity oracle.
+const registry = await loadRegistry("policies/tools.example.yaml");
+const decide: typeof helperDecide = (registry, server, tool, args = {}) => evaluate(registry, {
+  callId: "test", sessionId: "session", agentId: "agent", receivedAt: "2026-09-30T00:00:00Z", server, tool, args,
+});
 const row = (cls: ToolClass = "read", extra: object = {}) => ({ class: cls, reviewedBy: "ryan", reviewedAt: "2026-09-29", ...extra });
 const reg = (servers: ToolRegistry["servers"]): ToolRegistry => ({ version: 1, servers });
 
@@ -132,7 +133,7 @@ describe("policies/tools.example.yaml (ADR-004 registry)", () => {
     });
   });
 
-  describe("decision table (test-only evaluator)", () => {
+  describe("decision table (real evaluator)", () => {
     const cases: [string, string, Args, string, string, string][] = [
       // unknown server -> unreviewed
       ["aws", "list_buckets", {}, "require_approval", "unreviewed", "unreviewed:aws/list_buckets"],
@@ -188,6 +189,9 @@ describe("policies/tools.example.yaml (ADR-004 registry)", () => {
     ];
     it.each(cases)("%s/%s(%j) → %s/%s via %s", (server, tool, args, verdict, risk, ruleId) => {
       expect(decide(registry, server, tool, args)).toMatchObject({ verdict, risk, ruleId });
+    });
+    it.each(cases)("real evaluate equals the helper: %s/%s(%j)", (server, tool, args) => {
+      expect(decide(registry, server, tool, args)).toEqual(helperDecide(registry, server, tool, args));
     });
     it("no unreviewed call is ever allowed", () => {
       for (const [server, tool, args] of cases) {

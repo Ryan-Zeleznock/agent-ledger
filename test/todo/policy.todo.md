@@ -1,16 +1,11 @@
-# policy: tests to write after Gate 2
-- [ ] ADR-006 `proxy.codex.serverName`: the loader accepts `agentledger_proxy_7f3a9c2e1b` and refuses: shorter than `CODEX_PROXY_SERVER_NAME_MIN_LENGTH`; a leading or trailing `_` (Codex trims them before the `__`, so the name could never match itself); any character outside `[A-Za-z0-9_]` (Codex's sanitised form); a name that normalises to a reserved builtin name; a name equal, case-insensitively, to any `servers` key (the proxy is not an upstream); `proxy.codex` present without `serverName`
-- [ ] `loadRegistry` parses policies/tools.example.yaml and refuses: unknown version, unknown field, class outside read|write|risky, missing reviewedBy/reviewedAt, duplicate tool (YAML), escalation `to` not above the base class (write→write, risky→write)
-- [ ] `loadRegistry` refuses reserved keys (Astra spec v2 #3): server or tool named `__proto__`, `constructor`, `prototype`, `toString`, `hasOwnProperty`; the parsed structure has no key on any prototype (parse with `mapAsMap`, or assert `Object.getPrototypeOf(servers) === Object.prototype` and every key is own)
-- [ ] `loadRegistry` refuses namespace impersonation (Astra spec v2 #1): server keys `claude-code`, `Claude_Code`, `builtin_claude-code`, `builtin-claude-code`, `Builtin:claude-code`, `builtin:codex` (any `:` other than the exact `builtin:claude-code`), and any key failing `MCP_SERVER_NAME_RE`; accepts `claude-code-helper`
-- [ ] `loadRegistry` refuses two server keys, or two tool keys under one server, equal case-insensitively (`github`/`GitHub`, `Read`/`read`)
-- [ ] `evaluate`: unknown server → require_approval/unreviewed, ruleId `unreviewed:<server>/<tool>`; unknown tool on a known server → same
-- [ ] `evaluate` is own-property and case-sensitive: `github/constructor`, `github/__proto__`, `github/toString`, server `constructor`, server `__proto__`, `GitHub/list_repos`, `github/List_Repos` → unreviewed; `claude-code/Read` (an MCP server) never sees the `builtin:claude-code` rows
-- [ ] `evaluate`: reviewed read → allow/read; write → allow/write; risky → require_approval/risky; ruleId `registry:<server>/<tool>`
-- [ ] `evaluate`: escalateWhen with every argPattern matching raises write→risky and names `#escalate:<i>`; a partial match does not; a missing arg never matches; an argPattern key that is a prototype name matches only an own argument; arguments never lower a class (`deploy_production({environment:"dev"})` on a risky row stays risky)
-- [ ] `evaluate` ignores `trusted` (a trusted server's unreviewed tool is still unreviewed)
-- [ ] regression rows (Astra round 2): `get_then_deploy`, `wipe_bucket`, `terminate_instance`, `push_to_main`, `deploy_production({environment:"dev"})` on servers/tools not in the registry → require_approval/unreviewed
-- [ ] the registry table in test/registry.test.ts moves onto the real loadRegistry/evaluate and test/helpers/registry-eval.ts is deleted
-- [ ] `suggestClass`: name pattern only for untrusted servers (annotations ignored even when present); annotations join for trusted servers; disagreement → higher class, both sources listed; no match → default (risky)
-- [ ] `suggestClass` output is never written to the registry by any code path (reviewedBy is required and comes from a human)
-- [ ] `proxy.codex.serverName` refuses any internal `__` (`agentledger__proxy_x`, `a__b`): the hook name splits at the first `__` after `mcp__`, so such a name could never match itself (row already in `test/codex-proxy.test.ts`, then on the real loader)
+# policy: implementation coverage
+
+All local policy scenarios are executable in `test/policy.test.ts`, `test/registry.test.ts`,
+and `test/suggestions.test.ts`: strict loaders, reserved/prototype keys, both builtin namespaces,
+MCP name/impersonation/case-twin refusal, escalation validation and evaluation, own arguments,
+unknown tools, trusted independence, regression names, proxy syntax/collision checks, and advice isolation.
+
+The original TODO claiming `builtin:codex` is refused was superseded by the frozen ADR-005 contract.
+The decision table now uses real loadRegistry/evaluate and asserts helper equality on every row.
+The helper is retained as requested for parity and for hook/timing tests until Slice 1b implements them.
+No policy-only server-mode items remain.

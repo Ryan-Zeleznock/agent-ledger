@@ -27,8 +27,45 @@ rules:
     class: risky
     reason: Message to recipients outside the company
   # A permission noun alone is not a change (list_roles, get_policy); risky only with a mutating verb before it.
+  # One noun per rule keeps quantified patterns within the 16-path limit.
   - id: risky-iam-change
-    tool: "(grant|revoke|attach|detach|assign|put|create|update|delete|add|remove|set|invite|rotate)[a-z0-9_]*(role|policy|permission|iam|user|group|member|access|token|key)"
+    tool: "(grant|revoke|attach|detach|assign|put|create|update|delete|add|remove|set|invite|rotate)[a-z0-9_]*role"
+    class: risky
+    reason: Permission or credential change
+  - id: risky-iam-change-policy
+    tool: "(grant|revoke|attach|detach|assign|put|create|update|delete|add|remove|set|invite|rotate)[a-z0-9_]*policy"
+    class: risky
+    reason: Permission or credential change
+  - id: risky-iam-change-permission
+    tool: "(grant|revoke|attach|detach|assign|put|create|update|delete|add|remove|set|invite|rotate)[a-z0-9_]*permission"
+    class: risky
+    reason: Permission or credential change
+  - id: risky-iam-change-iam
+    tool: "(grant|revoke|attach|detach|assign|put|create|update|delete|add|remove|set|invite|rotate)[a-z0-9_]*iam"
+    class: risky
+    reason: Permission or credential change
+  - id: risky-iam-change-user
+    tool: "(grant|revoke|attach|detach|assign|put|create|update|delete|add|remove|set|invite|rotate)[a-z0-9_]*user"
+    class: risky
+    reason: Permission or credential change
+  - id: risky-iam-change-group
+    tool: "(grant|revoke|attach|detach|assign|put|create|update|delete|add|remove|set|invite|rotate)[a-z0-9_]*group"
+    class: risky
+    reason: Permission or credential change
+  - id: risky-iam-change-member
+    tool: "(grant|revoke|attach|detach|assign|put|create|update|delete|add|remove|set|invite|rotate)[a-z0-9_]*member"
+    class: risky
+    reason: Permission or credential change
+  - id: risky-iam-change-access
+    tool: "(grant|revoke|attach|detach|assign|put|create|update|delete|add|remove|set|invite|rotate)[a-z0-9_]*access"
+    class: risky
+    reason: Permission or credential change
+  - id: risky-iam-change-token
+    tool: "(grant|revoke|attach|detach|assign|put|create|update|delete|add|remove|set|invite|rotate)[a-z0-9_]*token"
+    class: risky
+    reason: Permission or credential change
+  - id: risky-iam-change-key
+    tool: "(grant|revoke|attach|detach|assign|put|create|update|delete|add|remove|set|invite|rotate)[a-z0-9_]*key"
     class: risky
     reason: Permission or credential change
   # Deploy words are also nouns (get_deploy_status, list_releases). No environment exception: arguments never lower a class.
