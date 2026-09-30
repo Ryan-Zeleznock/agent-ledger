@@ -119,6 +119,8 @@ function readLatest(path: string): AnchorEntry | null {
   if (text.length === 0) return null;
   if (!text.endsWith("\n")) throw new Error(`anchor: ${path} ends with an incomplete line (interrupted write or tampering); recover manually, never truncate`);
   const last = text.slice(0, -1).split("\n").at(-1)!;
+  // Physical LF-only framing (Astra round 3b): a stored entry never contains a raw CR, so `\r\n` or a stray `\r` is damage, not whitespace.
+  if (last.includes("\r")) throw new Error(`anchor: last line of ${path} contains a carriage return; entries are LF-framed canonical JSON only`);
   let parsed: unknown;
   try { parsed = JSON.parse(last); } catch { throw new Error(`anchor: last line of ${path} is not JSON`); }
   try { return validate(parsed); } catch (e) { throw new Error(`anchor: last line of ${path} is not a valid entry: ${message(e)}`); }

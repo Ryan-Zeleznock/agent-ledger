@@ -1,7 +1,6 @@
 import { closeSync, constants, createReadStream, fstatSync, fsyncSync, mkdirSync, openSync, readSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 import { performance } from "node:perf_hooks";
-import { createInterface } from "node:readline";
 import canonicalize from "canonicalize";
 import type { DateRange, LedgerRecord, UnsealedRecord, VerifyResult } from "../types/index.js";
 import type { LedgerStore } from "./contract.js";
@@ -144,8 +143,19 @@ const endsWithNewline = (path: string, size: number) => size === 0 || readLastLi
  * (JSON.parse keeps the last, so a duplicate could carry unhashed text), whitespace, and reordering, so the bytes on
  * disk are exactly the bytes the hash covers.
  */
+/** Best-effort `id` of a damaged line, for `brokenAt`; never trusted for anything else. */
+function idOf(raw: string): { id?: string } {
+  try {
+    const p: unknown = JSON.parse(raw);
+    const id = typeof p === "object" && p !== null ? (p as { id?: unknown }).id : undefined;
+    return typeof id === "string" ? { id } : {};
+  } catch { return {}; }
+}
 function parseStored(raw: string): { rec: LedgerRecord; err?: undefined } | { rec?: undefined; err: string; id?: string } {
   if (raw.length === 0) return { err: "blank line" };
+  // Physical framing first, before any parsing (JSON.parse would tolerate a trailing `\r` as whitespace):
+  // records are LF-framed canonical JSON, which never contains a raw CR, so `\r\n` or a stray `\r` is damage.
+  if (raw.includes("\r")) return { err: "line contains a carriage return; records are LF-framed only", ...idOf(raw) };
   let parsed: unknown;
   try { parsed = JSON.parse(raw); } catch { return { err: "not JSON" }; }
   const id = typeof parsed === "object" && parsed !== null && typeof (parsed as { id?: unknown }).id === "string" ? (parsed as { id: string }).id : undefined;
@@ -272,12 +282,28 @@ export class JsonlLedger implements LedgerStore {
     return this.serialize(() => this.readTail().hash);
   }
 
-  /** Every physical line with its 1-based number. Blank lines are yielded too (they are evidence of damage). */
+  /**
+   * Every physical line with its 1-based number, split on the LF byte ONLY and with nothing normalised away
+   * (Astra round 3b: `readline` stripped `\r\n`, so a CRLF record passed verify()/read() while head()/append()
+   * refused it). A `\r` stays in the line and `parseStored` reports it. Blank lines are yielded too (damage).
+   */
   private async *lines(): AsyncGenerator<{ n: number; raw: string }> {
     if (fileSize(this.path) === 0) return;
-    const rl = createInterface({ input: createReadStream(this.path, { encoding: "utf8" }), crlfDelay: Infinity });
     let n = 0;
-    for await (const raw of rl) yield { n: ++n, raw };
+    let pending: Buffer = Buffer.alloc(0);
+    for await (const chunk of createReadStream(this.path)) {
+      const buf = chunk as Buffer;
+      pending = pending.length === 0 ? buf : Buffer.concat([pending, buf]);
+      let start = 0;
+      for (;;) {
+        const nl = pending.indexOf(0x0a, start);
+        if (nl === -1) break;
+        yield { n: ++n, raw: pending.subarray(start, nl).toString("utf8") };
+        start = nl + 1;
+      }
+      pending = pending.subarray(start);
+    }
+    if (pending.length > 0) yield { n: ++n, raw: pending.toString("utf8") }; // unterminated tail: framing checks report it
   }
 
   /**

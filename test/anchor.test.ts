@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, existsSync, appendFileSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync, appendFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAnchor } from "../src/anchor/contract.js";
@@ -104,6 +104,16 @@ describe("createAnchor('file')", () => {
     appendFileSync(path, `{"at":"2026-09-30T12:34:60Z","hash":"${h("b")}"}\n`);
     await expect(createAnchor("file", path).latest()).rejects.toThrow(/not a valid entry/);
     await expect(createAnchor("file", path).write({ hash: h("c"), at: "2026-10-01T00:00:00Z" })).rejects.toThrow(/not a valid entry/);
+  });
+
+  it("round 3b: CRLF framing is damage: latest() refuses and write() rejects without changing a byte", async () => {
+    const anchor = createAnchor("file", path);
+    await anchor.write({ hash: h("a"), at: "2026-09-30T00:00:00Z" });
+    writeFileSync(path, readFileSync(path, "utf8").replace("\n", "\r\n"));
+    const before = readFileSync(path);
+    await expect(anchor.latest()).rejects.toThrow(/carriage return/);
+    await expect(anchor.write({ hash: h("b"), at: "2026-10-01T00:00:00Z" })).rejects.toThrow(/carriage return/);
+    expect(readFileSync(path).equals(before)).toBe(true);
   });
 
   it("takes the shared lock file and fails closed, in bounded time, when someone else holds it", async () => {

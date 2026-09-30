@@ -327,6 +327,26 @@ describe("createLedger('jsonl'): re-review P1/P2 (integrity, size, duplicate ids
     expect(await ledger.verify()).toEqual({ ok: true, checked: 2 });
   });
 
+  it("round 3b: CRLF framing is a broken record everywhere, consistently: verify, read, head and append all report it", async () => {
+    const { ledger } = await appendN(2);
+    const good = readFileSync(path, "utf8");
+    const crlfLast = good.slice(0, -1) + "\r\n";                       // LF of the last record replaced
+    writeFileSync(path, crlfLast);
+    expect(await ledger.verify()).toEqual({ ok: false, checked: 2, brokenAt: "rec-2" });
+    const range = { from: "2020-01-01T00:00:00Z", to: "2030-01-01T00:00:00Z" };
+    const drain = async (it: AsyncIterable<LedgerRecord>) => { for await (const r of it) void r; };
+    await expect(drain(ledger.read(range))).rejects.toThrow(/carriage return/);
+    await expect(ledger.head()).rejects.toThrow(/carriage return/);
+    await expect(ledger.append(unsealed(3))).rejects.toThrow(/carriage return/);
+    expect(readFileSync(path, "utf8")).toBe(crlfLast);
+    const [l1, l2] = good.split("\n");
+    writeFileSync(path, `${l1}\r\n${l2}\n`);                             // CRLF on the FIRST record only
+    expect(await ledger.verify()).toEqual({ ok: false, checked: 1, brokenAt: "rec-1" });
+    await expect(drain(ledger.read(range))).rejects.toThrow(/line 1 .*carriage return/);
+    writeFileSync(path, `${l1}\n${l2}\n`);
+    expect(await ledger.verify()).toEqual({ ok: true, checked: 2 });
+  });
+
   it("round 3: an accessor anywhere in a contract object is rejected before writing (outcome.durationMs getter that changes its answer)", async () => {
     const { ledger } = await appendN(1);
     const before = readFileSync(path);
