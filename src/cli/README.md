@@ -42,8 +42,7 @@ absolute module-relative path, never a policy file in the calling project's work
 Pre: bounded stdin → parse for configured agent → credential/incoming call → pipeline `decide` →
 formatter → one stdout line, exit 0. Every exception is nonzero so the **watchdog** can deny. The CLI
 upstream stub throws if called; this handler never runs a tool. Pipeline dependencies include
-`hook-ask`, the configured agent and the binary HMAC key. A single `// PIN-1` cast marks the temporary
-compatibility point until Fable adds the required pipeline field.
+`hook-ask`, the configured agent and the binary HMAC key (`argsHmacKey`, checked with `satisfies PipelineDeps`).
 
 Post: parse → outcome adapter → `recordOutcome(tool_use_id, outcome)`. Nothing on stdout; operational
 failures go to stderr and still exit 0. The frozen pipeline constructor requires an absolute deadline

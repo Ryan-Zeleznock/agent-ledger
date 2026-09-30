@@ -6,7 +6,8 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "build": "tsc -p tsconfig.build.json && chmod +x dist/cli/main.js"
+    "build": "tsc -p tsconfig.build.json && chmod +x dist/cli/main.js",
+    "check": "npm run typecheck && npm test && npm run build"
   },
   "devDependencies": {
     "@types/node": "26.6.3",

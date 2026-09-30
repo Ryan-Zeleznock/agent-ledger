@@ -176,7 +176,7 @@ export async function main(argv: string[] = process.argv.slice(2), overrides: Pa
     const pipelineDeps = {
       identity, registry, ledger, argsHmacKey: key, approvals: { kind: "hook-ask" as const }, hookAgent: agent,
       upstream: { async execute() { throw new Error("Decide-only CLI cannot execute tools"); }, async listTools() { throw new Error("Decide-only CLI cannot list tools"); }, async close() {} },
-    } as PipelineDeps & { argsHmacKey: Uint8Array }; // PIN-1: remove cast once Fable's required field lands.
+    } satisfies PipelineDeps;
     // Coordinator decision (2026-09-30, review #3): retain this shim instead of changing
     // the pipeline contract; the recordOutcome-only construction question stays open for Ryan.
     // Post hooks run directly. Supply construction-only timing for the frozen pipeline init check;
