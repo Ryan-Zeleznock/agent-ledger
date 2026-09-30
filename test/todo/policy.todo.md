@@ -13,3 +13,4 @@
 - [ ] the registry table in test/registry.test.ts moves onto the real loadRegistry/evaluate and test/helpers/registry-eval.ts is deleted
 - [ ] `suggestClass`: name pattern only for untrusted servers (annotations ignored even when present); annotations join for trusted servers; disagreement → higher class, both sources listed; no match → default (risky)
 - [ ] `suggestClass` output is never written to the registry by any code path (reviewedBy is required and comes from a human)
+- [ ] `proxy.codex.serverName` refuses any internal `__` (`agentledger__proxy_x`, `a__b`): the hook name splits at the first `__` after `mcp__`, so such a name could never match itself (row already in `test/codex-proxy.test.ts`, then on the real loader)

@@ -16,3 +16,6 @@
 - [ ] `recordOutcome(callId)` appends an outcome record chained to the intent record with that callId; `status: "error"` from PostToolUseFailure keeps `errorClass` and `durationMs`; an unknown callId is recorded as an orphan outcome, not dropped
 - [ ] registry lookups inside the pipeline are own-property and case-sensitive (`github/constructor` → unreviewed; `claude-code/Read` from an MCP server → unreviewed, never the builtin row)
 - [ ] `deps.registry` is the only policy input; the pipeline has no code path that reads suggestions.yaml
+- [ ] spec v2.1 handoff record (Astra 2026-09-30): `decide()` under Codex for server `<registry.proxy.codex.serverName>` appends ONE intent record with `handoff: { kind: "to-proxy", proxyServerName }`, `policy.ruleId = "handoff-to-proxy:<proxyServerName>"`, `reason = HANDOFF_TO_PROXY_REASON`, `risk: "unreviewed"`, no `approval`, THEN returns `{ decision: "allow", kind: "governed-by-proxy" }`; `ledger.append` rejecting → `deny`; no other record type ever carries `handoff`
+- [ ] `recordOutcome` for a governed-by-proxy callId chains the hook's outcome to the handoff record, not to an orphan
+- [ ] `createPipeline` in decide-only mode refuses a missing, non-integer or already-past `AGENT_LEDGER_WATCHDOG_DEADLINE_AT_MS` (init failure → watchdog exit 2); `decide()` passes `deadlineAt` from it into `approvals.requestApproval`
