@@ -1,10 +1,11 @@
 # Agent Ledger: Framework Spec (v2)
 
-**Date:** 2026-09-29 · **Status:** v2 watchdog round (Astra supervisor P1/P1/P2) + Codex adapter (ADR-005), awaiting Astra review · **Author:** Ryan + Fable
+**Date:** 2026-09-30 · **Status:** v2 watchdog fixes (Astra re-review P1/P2×4) + ADR-006 (Codex MCP via proxy, Slack approvals), awaiting Astra review · **Author:** Ryan + Fable
 **Brain:** `~/Desktop/AgentLedger/` (read `_state.md` first)
 **Changed in v2:** ADR-004 reviewed allowlist (§7, §8); MCP 2026-07-28 (§3, §4); hook collector for coding agents (§3, §4, §6); RFC 8785 hashing and IETF draft field alignment (§5). Every external format below was checked against its primary source on 2026-09-29; the URLs are inline and the findings are in the vault (`diligence-2026-09-28.md`, "Verified by Fable").
 **Changed in the v2 fix round (2026-09-29, after Astra's gate FAIL):** built-in tools moved to the reserved `builtin:claude-code` namespace and the loader refuses impersonating or case-twin keys (§6, §8); fail-closed hook supervisor and an honest list of what it cannot catch (§7); own-property registry lookups and refused prototype keys (§8); `ApprovalChannel` union with `hook-ask`, `unavailable` → deny, allow only after the intent record persists (§5, §6, §7); `PostToolUseFailure` event and `error` outcome mapping (§3, §6); the IETF draft alignment is now stated as conceptual, not byte-compatible (§5).
 **Changed in the watchdog round (2026-09-29, after Astra's re-review):** the in-process supervisor is replaced by a **two-process watchdog** that owns stdout, kills a stalled handler on its own timer, validates and re-serialises the handler's payload, and exits 2 on every deny and every failure path, config errors included (§7); **Codex** joins local mode through the same `src/hooks/` module with an `agent` discriminator and the reserved `builtin:codex` namespace (ADR-005; §3, §4, §6, §8); Codex's unsupported `ask` maps to `deny` (§6). Verifications: `diligence-2026-09-28.md`, "Verified by Fable (supervisor + Codex)".
+**Changed in the watchdog-fix + ADR-006 round (2026-09-30, after Astra's second gate FAIL):** the watchdog accepts an allow only after the handler's `exit` **and** `close`, spawns the handler in its own process group and kills the whole group, loops every write to completion, and reads stdin asynchronously (§7); the exit-code table now says exit 1 *without valid decision JSON* continues (§7). **Codex hook names are not MCP identities** (codex-rs trims `_` at the `__` join after hashing), so under Codex every MCP server is an upstream of the Agent Ledger proxy, the proxy is Codex's one configured MCP server, its tools are `governed-by-proxy`, and any other Codex `mcp__*` call is denied (§3, §5, §6, §8). **Slack (Socket Mode, Block Kit buttons) is the Codex approval channel**, bound to callId with an approver allowlist; the final decision (approved / denied / timeout / unavailable / no-channel) is resolved *before* the intent record is written, so nothing is left `delegated` under Codex; the three clocks (approval < watchdog deadline < hook timeout) are configurable and validated at init (§5, §6, §7). Verifications: `diligence-2026-09-28.md`, "Verified by Fable (watchdog fixes + ADR-006, 2026-09-29)".
 
 ## 1. What this is
 
@@ -54,6 +55,19 @@ the tool call"**, so the adapter never emits it (§6). Codex MCP names reach a h
 paths can opt out of the default hook path" and that hosted tools (`WebSearch`) never fire hooks: local mode under
 Codex is visibility over the hooked paths, not a complete boundary, exactly as for Claude Code (§7 residual limits).
 
+**Codex MCP goes through the proxy (ADR-006).** A Codex hook's `mcp__<server>__<tool>` is **not** an MCP identity. Verified
+2026-09-29 in openai/codex `codex-rs/core/src/tools/handlers/mcp.rs`: `join_tool_name` computes
+`namespace.trim_end_matches('_') + "__" + name.trim_start_matches('_')` **after** `codex-mcp/src/tools.rs` has sanitised both
+parts and hash-suffixed collisions, so server `github_` with tool `list_repos` and server `github` with tool `_list_repos`
+both fire as `mcp__github__list_repos` and would inherit a reviewed `github/list_repos` row. Therefore, under Codex: the hook
+gates **built-ins only** (`Bash`, `apply_patch`, `update_plan`, `spawn_agent`, …); every MCP server Codex uses is configured as
+an **upstream of the Agent Ledger proxy**, and the proxy is Codex's **single** configured MCP server, under the name in
+`registry.proxy.codex.serverName`. A hook call for one of the proxy's tools is answered `allow` with
+`kind: "governed-by-proxy"` and **no record**: the proxy has already decided and recorded it with raw upstream identity
+(§6, §9). Any other Codex `mcp__*` call is a **recorded deny**, reason "route this MCP server through the Agent Ledger
+proxy". Claude Code keeps the direct hook path for MCP (its docs make `mcp_server.source` the trust anchor, and its names
+are not aliased this way).
+
 **MCP protocol version: 2026-07-28** (https://modelcontextprotocol.io/specification/2026-07-28/changelog).
 The transport is stateless: no `initialize` handshake, no `Mcp-Session-Id`; every POST carries
 `MCP-Protocol-Version`, `Mcp-Method`, and (for `tools/call`) `Mcp-Name`, so a gateway can route on headers.
@@ -75,7 +89,7 @@ then server mode for design partners.
 | 3 | `src/identity/` | Authenticate the agent; create and track sessions | types |
 | 4 | `src/secrets/` | Hand upstream credentials to `upstream/` only. Backends: env/file (local), Secrets Manager (later). | types |
 | 5 | `src/policy/` | Classify a ToolCall from the reviewed registry (`evaluate`); propose classes for review (`suggestClass`) | types |
-| 6 | `src/approvals/` | Ask a human (Slack) and return an ApprovalResult; `timeout` and `unavailable` both mean deny. The `hook-ask` channel never reaches this module (§6) | types |
+| 6 | `src/approvals/` | Ask a human in **Slack** (Socket Mode + Block Kit buttons, bound to callId, approver allowlist) and return the FINAL ApprovalResult; `timeout` and `unavailable` both mean deny. The `hook-ask` channel never reaches this module (§6). Required under Codex; optional for Claude Code | types (secrets at init) |
 | 7 | `src/ledger/` | Redact, hash-chain (RFC 8785 + SHA-256), append, verify | types, `canonicalize` |
 | 8 | `src/anchor/` | Record the chain head daily somewhere hard to edit. Backends: local file (now), S3 Object Lock (later). | types (it receives the head hash) |
 | 9 | `src/report/` | Turn ledger records for a date range into PDF + CSV mapped to SOC 2 criteria | types, ledger |
@@ -109,11 +123,18 @@ type Verdict = "allow" | "deny" | "require_approval";
 type Risk = "read" | "write" | "risky" | "unreviewed";          // unreviewed = not in the registry (ADR-004)
 interface PolicyDecision { verdict: Verdict; ruleId: string; reason: string; risk: Risk; }
 
-type ApprovalChannel = { kind: "slack"; channelId: string; timeoutMs: number } | { kind: "hook-ask" };   // required in PipelineDeps: "no channel" is said out loud
-interface ApprovalResult {
-  callId: string;
-  decision: "approved" | "denied" | "timeout" | "unavailable" | "delegated";   // only `approved` can become an allow; `delegated` only with hook-ask
-  approver?: string; decidedAt: string; channel: ApprovalChannel["kind"];
+type SecretRef = { kind: "env"; name: string } | { kind: "file"; path: string };   // config carries references, never values
+type ApprovalChannel =                                                              // required in PipelineDeps: "no channel" is said out loud
+  | { kind: "slack"; channelId: string; timeoutMs: number; transport: "socket-mode";
+      botToken: SecretRef /* xoxb-, chat:write */; appToken: SecretRef /* xapp-, connections:write */; approvers: readonly string[] /* Slack user ids */ }
+  | { kind: "hook-ask" };
+interface ApprovalResult {                       // the FINAL decision as the intent record stores it
+  callId: string;                                // bound to one call: a Slack click for another callId is ignored
+  decision: "approved" | "denied" | "timeout" | "unavailable" | "no-channel" | "delegated";
+  //         ^ only `approved` can become an allow; `no-channel` = Codex + hook-ask (cannot ask); `delegated` only under Claude Code hook-ask
+  approver?: string;                             // Slack user id (block_actions.user.id), never a display name
+  reason?: string;                               // why: the click, "no approver answered within N ms", "Slack unreachable: …", "Codex cannot ask and no Slack channel is configured"
+  decidedAt: string; channel: ApprovalChannel["kind"];
 }
 
 type Phase = "intent" | "outcome";
@@ -130,10 +151,22 @@ interface LedgerRecord {
 interface ToolAnnotations { readOnlyHint?: boolean; destructiveHint?: boolean; idempotentHint?: boolean; openWorldHint?: boolean; }
 interface ToolInfo { server: string; name: string; description?: string; inputSchema?: unknown; annotations?: ToolAnnotations; }
 
-interface HookDecision { decision: "allow" | "deny" | "ask"; reason: string; callId: string; }
+interface HookDecision { decision: "allow" | "deny" | "ask"; reason: string; callId: string; kind: "decided" | "governed-by-proxy"; }
+//   governed-by-proxy (Codex only): the proxy decided and recorded this call; the hook says allow and writes nothing (ADR-006)
 
 interface IdentityService { resolveAgent(cred: AgentCredential): Promise<AgentId>; startSession(agentId: AgentId, onBehalfOf?: string): Promise<SessionId>; }
-interface PipelineDeps { identity: IdentityService; registry: ToolRegistry; ledger: LedgerStore; upstream: Upstream; approvals: ApprovalChannel; }
+interface PipelineDeps { identity: IdentityService; registry: ToolRegistry; ledger: LedgerStore; upstream: Upstream; approvals: ApprovalChannel; hookAgent?: HookAgent; }
+
+// Codex MCP identity (ADR-006, §3, §8). The proxy's name in Codex's mcp_servers: hook-visible form, unguessable, never an upstream key.
+const CODEX_PROXY_SERVER_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_]*[A-Za-z0-9]$/;   // Codex sanitises to [A-Za-z0-9_] and trims `_` at the join
+const CODEX_PROXY_SERVER_NAME_MIN_LENGTH = 16;
+interface ProxyIdentity { codex?: { serverName: string } }                     // ToolRegistry.proxy
+
+// The three clocks of a hook call (ADR-006, §7): approvalTimeoutMs + 5 s ≤ deadlineMs ≤ hookTimeoutS × 1000 − 2 s, validated at init
+interface HookTiming { approvalTimeoutMs?: number; deadlineMs: number; hookTimeoutS: number; }
+const DEFAULT_HOOK_TIMING = { deadlineMs: 25_000, hookTimeoutS: 30 };                            // no Slack
+const SLACK_HOOK_TIMING = { approvalTimeoutMs: 300_000, deadlineMs: 310_000, hookTimeoutS: 320 }; // Slack approvals (Codex)
+const WATCHDOG_DEADLINE_ENV = "AGENT_LEDGER_WATCHDOG_DEADLINE_MS";                                // watchdog → handler
 
 // Server identity (§8). Neither agent lets a `:` through to the mcp__<server>__<tool> name a hook sees: Claude Code
 // allows [A-Za-z0-9_-] in MCP server names and rewrites the rest to `_`; Codex sanitises every hook-visible MCP name
@@ -225,7 +258,25 @@ hook's own configuration, never read from the event):
      `[A-Za-z0-9_]`, codex-rs/codex-mcp/src/mcp/mod.rs; both verified 2026-09-29), so these keys are unreachable from MCP by
      construction. Codex built-in names as the hook sends them: `Bash` (shell and `exec_command`), `apply_patch` (all file
      edits; the event never says `Edit`/`Write`), `update_plan`, `spawn_agent`.
-2. Steps 1-4 above, then **stop**: nothing is executed, the agent runs the tool itself.
+   - **Codex only (ADR-006), before the registry is consulted, for any `mcp__` name:** if the server segment equals
+     `registry.proxy.codex.serverName`, `decide` returns `{ decision: "allow", kind: "governed-by-proxy" }` and writes **no
+     record** (the proxy decided and recorded the call with raw identity; recording it again would double-count). Any other
+     server → intent record `{ verdict: "deny", risk: "unreviewed", ruleId: "codex-mcp-not-proxied:<server>/<tool>", reason:
+     CODEX_MCP_NOT_PROXIED_REASON }`, a `blocked` outcome record, answer `deny`. A registry row for that server name changes
+     nothing under Codex: the name is not an identity (§3). With no `proxy.codex` configured, every Codex MCP call is that deny.
+2. Steps 1-4 above, then **stop**: nothing is executed, the agent runs the tool itself. **The approval channel is resolved
+   before the intent record is persisted**, so the record carries the final decision (§5 `ApprovalResult`):
+   - `slack`: `approvals.requestApproval(call, decision, channel)` posts a Block Kit message (`chat.postMessage`, bot token,
+     `chat:write`) with an `actions` block of two buttons, `agent-ledger:approve` / `agent-ledger:deny`, whose `value` and
+     `block_id` carry the callId; waits over **Socket Mode** (app-level token, `connections:write`, `apps.connections.open`; no
+     public Request URL, which suits a homelab or a private network) for a `block_actions` envelope; acks it by `envelope_id`;
+     ignores clicks whose `actions[0].value ≠ callId` or `channel.id ≠ channelId` (anti-replay) or whose `user.id` is not in
+     `approvers`; records the first valid click as `approved` / `denied` with `approver = user.id`; `chat.update` closes the
+     message. No click in `timeoutMs` → `timeout`; transport or API failure → `unavailable`. All Slack facts verified
+     2026-09-29 (docs.slack.dev; `diligence-2026-09-28.md`).
+   - `hook-ask` under **Claude Code** → `delegated`, answer `ask` (unchanged). Under **Codex** → `no-channel` with the reason
+     "Codex cannot ask and no Slack channel is configured", a `blocked` outcome, answer `deny`. **Nothing is ever left as a
+     dangling `delegated` under Codex.**
 3. `hooks.formatPreToolUseOutput(decision, agent)` produces one line
    `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow|deny|ask","permissionDecisionReason":"..."}}`
    which the watchdog validates and prints (exit 0 for allow/ask, exit 2 for deny, §7). Mapping:
@@ -295,7 +346,8 @@ https://learn.chatgpt.com/docs/hooks #pretooluse, #common-output-fields):
 | exit 0 + JSON `allow` | Allow [V] | Allow [V] |
 | exit 0 + JSON `ask` | Prompts the user [V] | **Not supported: hook marked failed, call CONTINUES** [V] |
 | exit 0 without a decision, or plain text | **Continues** [V] | **Continues** ("Exit 0 with no output is treated as success and Codex continues") [V] |
-| exit 1 or any other code | **Continues** (non-blocking error notice) [V] | Reported as a hook failure; **continues** [H, inferred from the failure wording] |
+| exit 1 or any other code **without valid decision JSON** | **Continues** (non-blocking error notice): "Without valid JSON on stdout, Claude Code treats exit code 1 as a non-blocking error and proceeds with the action" [V] | Reported as a hook failure; **continues** [H, inferred from the failure wording] |
+| exit 1 or any other code **with valid decision JSON** | The JSON decides: "With a parsed object that passes schema validation … Claude Code ignores the exit code and the JSON alone decides the outcome" (so exit 1 + a valid `deny` blocks) [V, re-read 2026-09-29]. **We never rely on it**: our policy stays exit 2 on every deny and every failure | Undocumented [H]; same policy |
 | stdout fails JSON parsing or schema validation (exit ≠ 2); two JSON lines | **Continues** [V]; only `{...}` start/end is parsed as JSON | Unsupported fields → failed hook, **continues** [V] |
 | hook reaches its `timeout` (default 600 s in both) | Output discarded, **continues**: "don't count on a stalled hook to act as a gate" [V] | Hook terminated; no decision, **continues** [H] |
 | hook binary missing or not executable (exit 127) | **Continues** [V] | **Continues** [H] |
@@ -308,17 +360,39 @@ or truncation. The fix is a second process. The agent's hook entry runs the **wa
 the handler:
 
 - **Minimal by construction.** The watchdog imports only `node:child_process`, `node:fs`, `node:process`: no registry, no
-  YAML, no pipeline. Its own event loop does nothing but wait for the child and the timer, so nothing can block it.
-- **Spawns the handler as a child** with piped stdio and no shell, forwards the hook event (read from its own stdin, capped at
-  `MAX_STDIN_BYTES` = 4 MiB, over → deny), and **captures the handler's stdout and stderr into bounded buffers**: stdout up
+  YAML, no pipeline. Its own event loop does nothing but wait for the child and the timer, so **almost** nothing can block it:
+  the one synchronous step is `spawn()` itself (fork/exec inside libuv), which cannot be interrupted; the timer fires as soon
+  as it returns. Everything else, stdin included, is asynchronous.
+- **Reads its own stdin asynchronously and bounded** (`process.stdin` data/end events, never `fs.readFileSync(0)`, which would
+  hang forever on a stdin the agent never closes), capped at `MAX_STDIN_BYTES` = 4 MiB (over → deny `stdin-too-large`, handler
+  never spawned). No EOF by the deadline → deny `deadline:stdin` (never-EOF regression in `test/todo/hooks.todo.md`).
+- **Spawns the handler `detached: true`**, i.e. as the leader of its own process group (Node: "the child process will be made
+  the leader of a new process group and session"), with piped stdio and no shell, `AGENT_LEDGER_WATCHDOG_DEADLINE_MS` in its
+  env, forwards the hook event on its stdin, and **captures the handler's stdout and stderr into bounded buffers**: stdout up
   to `maxOutputBytes` (+1 byte to detect overflow; default `DEFAULT_MAX_OUTPUT_BYTES` = 8,192, legal range 512–65,536, kept
   under Claude Code's 10,000-character spill limit), stderr up to `MAX_HANDLER_STDERR_BYTES` = 16 KiB. **The watchdog
   exclusively owns its stdout**; the handler never writes to the agent.
+- **Accepts an allow only after `exit` (code 0) AND `close`.** Node's child_process docs (read 2026-09-29): "When the 'exit'
+  event is triggered, child process stdio streams might still be open"; "The 'close' event is emitted after a process has ended
+  *and* the stdio streams of a child process have been closed … since multiple processes might share the same stdio streams."
+  A grandchild that inherited the pipes can therefore append to stdout after the handler exits 0; validating at `exit` would
+  accept an incomplete or later-polluted buffer (Astra P1). The deadline keeps running while the pipes are open: `exit` 0 but
+  no `close` by the deadline → deny `deadline:pipes-open`. A non-zero `exit` denies at once, without waiting for `close`.
 - **Enforces `deadlineMs` with its own timer**, started before stdin is read or the child spawned. At the deadline it
-  **SIGKILLs** the handler (not SIGTERM, which a stalled process may ignore), writes the deny, and exits 2 at once. It never
-  awaits the child's exit or close events; unfinished handler work is abandoned. `DEFAULT_DEADLINE_MS` = 25 s sits at least
-  `WATCHDOG_MIN_MARGIN_MS` = 2 s below the `timeout` we configure in both agents (`HOOK_TIMEOUT_S` = 30 s; their own 600 s
-  default must not be relied on).
+  **SIGKILLs the handler's whole process group** (`process.kill(-pid, "SIGKILL")`; kill(2): "If pid is less than -1, then sig
+  is sent to every process in the process group whose ID is -pid"), not SIGTERM, which a stalled process may ignore, and not
+  the handler pid alone, which would leave grandchildren alive (Astra P2); writes the deny; exits 2 at once. It never awaits
+  `exit` or `close` after the kill; unfinished handler work is abandoned. **Every failure path that follows a spawn also
+  group-kills** before exiting, so no descendant survives a deny. The deadline is configurable (`HookTiming`, §5):
+  `DEFAULT_DEADLINE_MS` = 25 s under the 30 s hook `timeout` (no Slack), 310 s under a 320 s `timeout` with Slack approvals;
+  in both cases at least `WATCHDOG_MIN_MARGIN_MS` = 2 s below the agent's `timeout` (their own 600 s default must not be
+  relied on), and at least `APPROVAL_MIN_MARGIN_MS` = 5 s above `approvals.timeoutMs`, validated at init (`validateHookTiming`,
+  violation → exit 2). Both agents take `timeout` in seconds with no upper clamp on PreToolUse (Codex source:
+  `timeout_sec.unwrap_or(600).max(1)`; only SessionEnd/Interrupt clamp to 3 s; verified 2026-09-29).
+- **Writes loop until every byte is out.** `fs.writeSync` "Returns: <number> The number of bytes written", so a short write is
+  legal; `writeAllSync` loops on that count and retries `EAGAIN` a bounded number of times (a pipe fd may be non-blocking).
+  Any other error, including inside the failure reporter, is still **exit 2** (`write` reason on whichever fd still works,
+  best effort). Nothing is lost to an unflushed stream: every write is synchronous and followed by `process.exit`.
 - **Emits exit 2 for EVERY deny and EVERY failure path**, always with the reason on stderr (`watchdog:<class>`) AND a deny
   JSON on stdout: handler crash or non-zero exit (`handler-exit:<code>`, `handler-signal:<sig>`), oversized or invalid output
   (`output:too-large`, `output:not-json`, `output:not-object`, `output:multiple`, `output:extra-key:<key>`,
@@ -346,16 +420,34 @@ interpreter is gone (exit 127); the watchdog itself is killed by the OS (OOM, SI
 edits the hook entry in their own settings (Claude Code `settings.json`; Codex `hooks.json`/`config.toml`, where changing a
 non-managed hook also resets its trust hash and Codex skips it until re-trusted); `disableAllHooks` / `[features].hooks =
 false` in non-managed config (neither can disable *managed* hooks); and, Codex only, "some specialized tool paths can opt
-out of the default hook path" and hosted tools (`WebSearch`) never fire hooks. Mitigations live in the agents'
-configuration, not in our code:
+out of the default hook path" and hosted tools (`WebSearch`) never fire hooks. **Orphaning:** if the watchdog itself is
+SIGKILLed (OOM, or the agent's timeout after a deadline misconfiguration), nobody kills the detached handler group and it runs
+on as an orphan. Codex kills the *hook's* process group at its timeout (verified in `codex-rs/hooks/src/engine/command_runner.rs`:
+`process_mode(NewSession)`, `kill_process_group` on drop), but the detached handler is a different group, so that kill does not
+reach it either; Claude Code's process-tree behaviour at timeout is undocumented [H]. Hence the deadline must sit below the hook
+timeout (validated at init) and the orphan is a stated residual, not a covered case. **Codex MCP impersonation (ADR-006):**
+a locally configured MCP server named `<proxyServerName>_` or `<proxyServerName>-` produces the proxy's exact hook names
+(codex-rs trims `_` at the join, `-` sanitises to `_`), so the hook alone would answer `governed-by-proxy`. Our own mitigations:
+the proxy's name is long and random (unguessable, `CODEX_PROXY_SERVER_NAME_MIN_LENGTH` = 16, refused if it ends in `_`), and
+the proxy refuses any upstream not on its allowlist (§9), so an impostor gains a hook allow but no credentials. The **closer**
+lives in Codex's managed configuration, below. Mitigations live in the agents' configuration, not in our code:
 - **Claude Code:** deploy the hook through **managed settings** (`managed-settings.json`, MDM, or server-managed settings)
   with **`allowManagedHooksOnly: true`**, so user, project, local, and plugin hooks are blocked and the user cannot remove
   ours (https://code.claude.com/docs/en/settings-reference#allowmanagedhooksonly, verified 2026-09-29; precedence:
   https://code.claude.com/docs/en/settings). Managed hooks merge with, and cannot be disabled by, lower levels.
 - **Codex:** deploy through **`requirements.toml`** (`/etc/codex/requirements.toml`, MDM, or cloud-managed) with
   **`allow_managed_hooks_only = true`**, **`[features].hooks = true`** pinned, and the hook under `[[hooks.PreToolUse]]` with
-  `timeout = 30`, scripts installed under `[hooks].managed_dir` (https://learn.chatgpt.com/docs/hooks #managed-hooks-from-
-  requirementstoml, verified 2026-09-29). Managed hooks are "trusted by policy and can't be disabled from the user hook browser".
+  `timeout = 30` (`320` with Slack approvals), scripts installed under `[hooks].managed_dir` (https://learn.chatgpt.com/docs/hooks
+  #managed-hooks-from-requirementstoml, verified 2026-09-29). Managed hooks are "trusted by policy and can't be disabled from the
+  user hook browser". **And an `mcp_servers` allowlist in the same `requirements.toml`** (verified 2026-09-29,
+  https://learn.chatgpt.com/docs/enterprise/managed-configuration: "The local client enables an MCP server only when both its
+  name and identity match an approved entry; otherwise, the client disables it"; "If `mcp_servers` is present but empty, the
+  local client disables all MCP servers") with exactly one entry, the proxy. Identity is the stdio `command` or the HTTP `url`;
+  source (`codex-rs/config/src/mcp_requirements.rs`) shows the simple form `identity = { command = "node" }` compares the
+  executable string only, so use the **structured matcher**, which also pins the args:
+  `identity = { command = { executable = "/usr/local/bin/node", args = [{ match = "exact", value = "/opt/agent-ledger/proxy.js" }] } }`
+  (or `identity = { url = "https://…/mcp" }` for the HTTP proxy). Then `<proxyServerName>_` cannot be enabled at all, and the
+  impersonation residual is closed for managed installs. Unmanaged installs keep it as a residual, stated in the setup guide.
 - A **health check** in both: a `SessionStart` hook that verifies the watchdog runs and writes a heartbeat record; the report
   flags a session that has tool calls but no heartbeat, or a heartbeat but a gap in `PreToolUse` intent records.
 - Server mode has none of this: the proxy holds the credentials, so a dead hook cannot let a call through.
@@ -409,6 +501,13 @@ servers:
   The two built-in keys are distinct servers: a Codex `Read` never sees the Claude Code row and a Claude Code `apply_patch`
   never sees the Codex row.
 - an **MCP server name** matching `/^[A-Za-z0-9_-]+$/`.
+
+**`proxy.codex.serverName` (ADR-006).** A top-level, optional `proxy: { codex: { serverName } }` names the Agent Ledger proxy as
+Codex sees it. The loader accepts only Codex's hook-visible form (`CODEX_PROXY_SERVER_NAME_RE`: `[A-Za-z0-9_]`, no leading or
+trailing `_`, because codex-rs trims those at the `__` join and a name ending in `_` could never match itself), at least 16
+characters (a random suffix, so the name is not guessable), not normalising to a reserved builtin name, and not equal
+(case-insensitively) to any `servers` key: the proxy is not an upstream. Under Codex this name is the only MCP server the hook
+ever allows (`governed-by-proxy`), and only because the proxy itself applies this registry to the raw upstream identity.
 
 The loader **refuses** a registry with: any other key containing `:` (`builtin:cursor` waits for a cursor adapter); a
 non-builtin key that **normalises** (lowercase, strip everything outside `[a-z0-9]`) to `claudecode`, `builtinclaudecode`,
@@ -484,6 +583,19 @@ Vitest. Must-have tests:
   watchdog's exit code is only ever 0 or 2.
 - Codex adapter: `ask` → `deny` with `CODEX_ASK_UNSUPPORTED_REASON` and the output never contains `"ask"`; a non-object
   `tool_input` → deny; the Codex PostToolUse fixture (exit code 1 in `tool_response`) → outcome `ok`.
+- Watchdog, Astra re-review (runtime): a grandchild holding the handler's pipes → no allow at `exit`, deny `deadline:pipes-open`
+  at the deadline, both pids gone; group kill leaves no survivors on every failure path; a short-write injection (1 byte per
+  `writeSync`) still emits the full payload, and a throwing `writeSync` on both fds is still exit 2; a never-EOF stdin → deny
+  `deadline:stdin`, handler never spawned; `validateHookTiming` cases (approval ≥ deadline, deadline ≥ timeout, NaN/∞/0/1.5).
+- ADR-006 (Codex MCP identity): `github_`/`list_repos` and `github`/`_list_repos` both produce `mcp__github__list_repos` and are
+  **never** allowed under Codex despite the reviewed `github/list_repos` row; a non-proxy `mcp__x__y` under Codex → deny with
+  `CODEX_MCP_NOT_PROXIED_REASON`; a proxy tool → allow + `governed-by-proxy` with no record; `<proxy>_` is asserted as the
+  stated residual; `proxy.codex.serverName` refusal rows (`test/codex-proxy.test.ts`, then the product functions).
+- ADR-006 (final decision): under Codex + hook-ask, the intent record carries `no-channel` and a reason, and no record says
+  `delegated`; under Codex + Slack, `denied` / `timeout` / `unavailable` are recorded with the outcome `blocked`.
+- Slack contract: message blocks carry the callId in `block_id` and both button `value`s; a click for another callId or from a
+  non-approver is ignored; `approver` is the Slack user id; `chat.update` closes the message (`test/approvals-shape.test.ts` now,
+  `test/todo/approvals.todo.md` after Gate 2).
 - An approval timeout blocks the call and records `timeout`; an unreachable channel records `unavailable` and blocks.
 - An approved risky call is allowed only after the intent record persisted; a failed append after approval is a deny.
 - A secret in args never appears in stored records.
@@ -500,4 +612,8 @@ Vitest. Must-have tests:
 1. Do customers accept fail-open for read-only calls?
 2. What do their agents run on? (That decides which framework and MCP setup to support first.)
 3. Will auditors accept a generated report, or do they insist on raw log access?
-4. Codex design partners: is "risky = deny unless Slack is configured" acceptable, given Codex hooks cannot ask (§6)?
+4. Codex design partners: is "risky = deny unless Slack is configured" acceptable, given Codex hooks cannot ask (§6)? ADR-006
+   makes Slack the Codex channel and the first thing built after Gate 2; the question becomes whether a 5-minute Slack approval
+   (`SLACK_HOOK_TIMING`) is a workable loop for their engineers.
+5. Codex design partners: are their Codex installs managed (`requirements.toml`)? Without it the proxy-name impersonation
+   residual (§7) stays open, and the setup guide must say so.
