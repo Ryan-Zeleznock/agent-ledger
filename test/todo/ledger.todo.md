@@ -16,6 +16,12 @@ Added from Astra's review (2026-09-30), all implemented:
 - [x] leftover lock fails closed and is never deleted; symlink/FIFO lock paths; tail re-read; blank lines; duplicate ids; 1e400; read() framing → `test/ledger-jsonl.test.ts`
 - [x] a full re-chain passes verify(); trusted-anchor comparison catches it → `test/ledger-jsonl.test.ts`
 
+Added from Astra's re-review (2026-09-30, round 2), all implemented:
+- [x] injected stored field breaks verify/head/append; redacted-size rejection; duplicate ids under the lock → `test/ledger-jsonl.test.ts`
+- [x] strict stored projection, descriptor snapshot (getters never invoked, Proxies), :60 and >3 fractional digits refused → `test/ledger-validate.test.ts`
+- [x] scheme-in-value, long words (also keys/URLs), short base64/hex, one decode level, nested JSON/quotes budget, linear renaming/PEM → `test/ledger-redact.test.ts`, `test/ledger-redact-bench.test.ts`
+- [x] contention proof: A holds the lock, B-D blocked (EEXIST) then land after release → `test/ledger-multiprocess.test.ts`
+
 Still to write:
 - [ ] postgres backend (Slice 2): the same chain rules over a table with an append-only role; verify() and read(range) parity with jsonl
 - [ ] pipeline/report: the caller-side anchor comparison (anchored head ∈ verified chain) as a real function, once `src/report/` exists

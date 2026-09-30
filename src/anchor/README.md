@@ -14,7 +14,8 @@ Files: `file.ts`, `contract.ts`. Tests: `test/anchor.test.ts`.
 
 - **`write({hash, at})`** validates the entry BEFORE anything is queued: `hash` is 64 lowercase hex characters (a
   ledger head) or `"0"` (an empty chain), `at` is RFC 3339 **with an explicit offset** (`Z` or `±hh:mm`) naming a real
-  calendar day (`"0"`, `2026-09-30T00:00:00`, February 30 are refused), and no other field is allowed. Then, under the
+  calendar day, with at most 3 fractional digits and no `:60` (`"0"`, `2026-09-30T00:00:00`, February 30, leap seconds
+  and sub-millisecond fractions are refused; the ledger README "Timestamps" says why), and no other field is allowed. Then, under the
   lock, it checks the existing file's framing and last entry: a file that does not end with `\n`, or whose last line
   is not a valid entry, makes the write **reject without changing a byte** (Astra #11: a torn write is preserved for
   recovery, never joined into a new line and hidden). Only then does it append ONE line, the entry's RFC 8785 form plus
@@ -33,7 +34,9 @@ The lock, not the single write, is the interleaving guarantee (a logical line ca
 a short write). Limits: NFS unsupported (Linux documents `O_APPEND`/`O_EXCL` as unreliable there); macOS `fsync`
 does not force the drive cache (`F_FULLFSYNC` not exposed by Node). Sources: ledger README "Due diligence" [V].
 The anchor may not import the ledger module (only `pipeline/` imports across modules), so the lock and timestamp
-helpers are duplicated here on purpose.
+helpers are duplicated here on purpose. Tested across real processes (`test/anchor-multiprocess.test.ts`): 4 writers ×
+25 entries → 100 complete lines; and a contention proof: while A holds `<path>.lock`, B–D report it held by A's pid and
+write nothing; after release all 30 entries land.
 
 ## Trust boundary and what this anchor proves
 
