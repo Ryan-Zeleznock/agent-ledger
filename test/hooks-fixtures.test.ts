@@ -197,7 +197,25 @@ describe("two-process watchdog contract (spec §7)", () => {
     const opts: WatchdogOptions = { handlerCommand: ["node", "/opt/agent-ledger/hook-handler.js"], deadlineMs: DEFAULT_DEADLINE_MS, maxOutputBytes: DEFAULT_MAX_OUTPUT_BYTES, agent: "codex" };
     expect(opts.handlerCommand.length).toBeGreaterThan(0);
     expect(WATCHDOG_REASON_PREFIX).toBe("watchdog:");
-    for (const r of ["config", "deadline", "handler-exit", "output:too-large", "output:extra-key", "handler-deny", "internal"]) expect(WATCHDOG_REASONS).toContain(r);
+    for (const r of ["config", "deadline", "handler-exit", "output:too-large", "output:extra-key", "handler-deny", "write", "internal"]) expect(WATCHDOG_REASONS).toContain(r);
+    // Astra watchdog P1/P2 (2026-09-29): the deadline names what it ran out on, and a failed write is still exit 2
+    expect(hooks.WATCHDOG_DEADLINE_DETAILS).toEqual(["stdin", "handler", "pipes-open"]);
+    expect(hooks.WATCHDOG_KILL_SIGNAL).toBe("SIGKILL");
+    expect(typeof hooks.writeAllSync).toBe("function");
+  });
+  it("the three clocks are ordered: approval < watchdog deadline < hook timeout, in both timing profiles (ADR-006)", () => {
+    const ordered = (t: hooks.HookTiming) =>
+      (t.approvalTimeoutMs === undefined || t.approvalTimeoutMs + hooks.APPROVAL_MIN_MARGIN_MS <= t.deadlineMs) &&
+      t.deadlineMs + WATCHDOG_MIN_MARGIN_MS <= t.hookTimeoutS * 1000;
+    expect(hooks.DEFAULT_HOOK_TIMING).toEqual({ deadlineMs: DEFAULT_DEADLINE_MS, hookTimeoutS: HOOK_TIMEOUT_S });
+    expect(ordered(hooks.DEFAULT_HOOK_TIMING)).toBe(true);
+    expect(hooks.SLACK_HOOK_TIMING.approvalTimeoutMs).toBe(300_000); // five minutes for a human
+    expect(ordered(hooks.SLACK_HOOK_TIMING)).toBe(true);
+    // the Slack profile needs a hook timeout above 30 s; both agents accept it (Codex: no upper clamp on PreToolUse, verified in source 2026-09-29)
+    expect(hooks.SLACK_HOOK_TIMING.hookTimeoutS).toBeGreaterThan(HOOK_TIMEOUT_S);
+    expect(hooks.SLACK_HOOK_TIMING.hookTimeoutS).toBeLessThan(CODEX_DEFAULT_HOOK_TIMEOUT_S);
+    expect(hooks.WATCHDOG_DEADLINE_ENV).toBe("AGENT_LEDGER_WATCHDOG_DEADLINE_MS");
+    expect(typeof hooks.validateHookTiming).toBe("function");
   });
   it("the failure-path result is a deny JSON AND exit 2; exit 1 is not a legal result; allow is exit 0 with a re-serialised payload", () => {
     const denied: WatchdogResult = {

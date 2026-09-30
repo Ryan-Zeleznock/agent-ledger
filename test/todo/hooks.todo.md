@@ -35,4 +35,16 @@
 - [ ] the watchdog module imports only `node:child_process`, `node:fs`, `node:process` (static import scan), so it cannot fail on the registry, YAML, or the pipeline
 - [ ] every deny writes the reason to stderr AND a deny JSON to stdout (both agents block on either channel)
 - [ ] the hook command exits 0 with JSON on a decision and exits 2 (block) when the ledger is down and the class is write, risky, or unreviewed (spec §7)
+
+## Watchdog, Astra re-review 2026-09-29 (exit vs close, group kill, short writes, async stdin)
+- [ ] a handler that writes a valid allow, spawns a grandchild that inherits its stdout/stderr and sleeps, then exits 0 → NO exit 0 at `exit`; at the deadline → deny `watchdog:deadline:pipes-open`, exit 2; both the handler's and the grandchild's pids are gone afterwards (group kill)
+- [ ] a handler that exits 0 while a grandchild holding the pipes appends `{"x":1}` before closing → `close` fires, validation sees two JSON values → deny `watchdog:output:multiple`
+- [ ] group kill leaves no survivors: a handler that spawns two detached-ignoring children (`setsid` not allowed to escape: they stay in the handler's group) and loops → after the deadline deny, `kill -0` on every pid fails; repeat for every failure path after a spawn (non-zero exit, bad output, write failure): no descendant survives
+- [ ] the handler is spawned `detached: true` (it is its own process group leader: `getpgid(child) === child.pid`) and the kill is `process.kill(-pid, "SIGKILL")`, never `child.kill()` alone
+- [ ] short-write injection: stub `fs.writeSync` to write 1 byte per call → the full one-line payload still reaches stdout byte-for-byte (writeAllSync loops); stub it to throw `EPIPE` on stdout → exit 2 with the reason on stderr; stub BOTH fds to throw (the failure reporter itself fails) → exit code is still 2 and nothing is on stdout
+- [ ] `writeAllSync` retries `EAGAIN` up to its bound and then fails → exit 2
+- [ ] never-EOF stdin: the test harness keeps the watchdog's stdin open without writing → the handler is never spawned, deny `watchdog:deadline:stdin`, exit 2 at the deadline; stdin is consumed asynchronously (a static scan asserts no `readFileSync(0)` / `readFileSync("/dev/stdin")` in the watchdog module)
+- [ ] a handler that exits 1 AFTER writing a valid deny → deny is `watchdog:handler-exit:1`, emitted at `exit` without waiting for `close`
+- [ ] `validateHookTiming`: `{ deadlineMs: 25_000, hookTimeoutS: 30 }` valid; `{ approvalTimeoutMs: 300_000, deadlineMs: 310_000, hookTimeoutS: 320 }` valid; `approvalTimeoutMs: 306_000` with deadline 310_000 → `approval-not-below-deadline`; `deadlineMs: 319_000` with timeout 320 → `deadline-not-below-hook-timeout`; NaN/∞/0/1.5/negative anywhere → violation; a handler started with `AGENT_LEDGER_WATCHDOG_DEADLINE_MS=25000` and a Slack `timeoutMs: 300000` fails init → watchdog deny `watchdog:init`, exit 2 (never exit 1)
+- [ ] a Codex hook configured with `timeout = 320` runs the Slack profile end to end with a fake Slack that answers at 299 s → allow; at 301 s → `timeout` → deny before the deadline
 - [ ] health check: the SessionStart hook writes a heartbeat record; the report flags a session with tool calls and no heartbeat

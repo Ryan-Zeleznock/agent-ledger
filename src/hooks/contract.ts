@@ -162,6 +162,13 @@ export function parseHookInput(raw: string, agent: HookAgent): AnyHookEvent { th
  *   agent can produce a `:` in an MCP server segment (see types), so these keys are unreachable from MCP.
  * - Codex only: `tool_input` that is not a plain object (null, array, string, number) → throw. Every documented Codex
  *   tool sends an object; anything else is unknown ground and a deny is the fail-closed answer.
+ * - Codex only (ADR-006): the `<server>` segment of an `mcp__` name is NOT an identity. Verified 2026-09-29 in
+ *   openai/codex `codex-rs/core/src/tools/handlers/mcp.rs`: `join_tool_name` trims trailing `_` from the sanitised,
+ *   collision-hashed namespace and leading `_` from the tool, so `github_`/`list_repos` and `github`/`_list_repos`
+ *   both arrive as `mcp__github__list_repos`. This function still splits the name (so the pipeline can name the
+ *   attempt), but `pipeline.decide` under `hookAgent: "codex"` never consults the registry for an MCP server: it
+ *   answers `allow` + `kind: "governed-by-proxy"` when `<server> === registry.proxy.codex.serverName` (the proxy
+ *   decides and records with raw identity), and a RECORDED deny (CODEX_MCP_NOT_PROXIED_REASON) for any other server.
  */
 export function toIncomingCall(ev: AnyPreToolUseEvent, credential: AgentCredential, agent: HookAgent): IncomingCall { throw notImplemented("hooks.toIncomingCall"); }
 
@@ -184,8 +191,9 @@ export const CODEX_ASK_UNSUPPORTED_REASON =
  * Serialises a HookDecision as one line of PreToolUseOutput JSON (the watchdog prints it with exit 0 for allow/ask and
  * exit 2 for deny, §7). Claude Code: decision copied as is. Codex: `ask` becomes `deny` with
  * CODEX_ASK_UNSUPPORTED_REASON, because Codex treats `ask` as a failed hook and CONTINUES the tool call (verified
- * 2026-09-29). The pipeline still writes the intent record with `approval.decision = "delegated"` before this
- * runs, so the ledger shows "asked, denied by adapter"; a Slack channel is the way to get a real approval under Codex.
+ * 2026-09-29). Since ADR-006 the pipeline never produces `ask` under Codex: with `hook-ask` it resolves the channel
+ * BEFORE persisting and records `approval.decision = "no-channel"` (a final, reasoned deny), so this rewrite is a
+ * belt-and-braces guard, not the normal path. A Slack channel is the only way to get a real approval under Codex.
  */
 export function formatPreToolUseOutput(d: HookDecision, agent: HookAgent): string { throw notImplemented("hooks.formatPreToolUseOutput"); }
 
@@ -214,6 +222,25 @@ export const CODEX_DEFAULT_HOOK_TIMEOUT_S = 600;
 export const WATCHDOG_MIN_MARGIN_MS = 2_000;
 /** Internal deadline: the hook timeout minus a margin, so the deny is written before the agent cancels us. */
 export const DEFAULT_DEADLINE_MS = (HOOK_TIMEOUT_S - 5) * 1000;
+/** A Slack answer must be back, recorded and formatted at least this long before the watchdog's deadline kills the handler. */
+export const APPROVAL_MIN_MARGIN_MS = 5_000;
+/**
+ * The three clocks of one hook call (ADR-006). Invariant, validated at init (`validateHookTiming`):
+ *   approvalTimeoutMs + APPROVAL_MIN_MARGIN_MS ≤ deadlineMs   and   deadlineMs + WATCHDOG_MIN_MARGIN_MS ≤ hookTimeoutS × 1000.
+ * The agents' `timeout` is in seconds for both (Claude Code: "Seconds before canceling", default 600 for command hooks;
+ * Codex: "`timeout` is in seconds. If `timeout` is omitted, Codex uses `600` seconds for most hooks", and in source
+ * `timeout_sec.unwrap_or(600).max(1)` with NO upper clamp for PreToolUse; only SessionEnd/Interrupt are clamped to 3 s.
+ * Both verified 2026-09-29). So a 320 s PreToolUse hook is legal in both agents.
+ */
+export interface HookTiming { approvalTimeoutMs?: number; deadlineMs: number; hookTimeoutS: number; }
+/** No Slack channel (Claude Code hook-ask, or Codex with every require_approval a recorded deny): fast. */
+export const DEFAULT_HOOK_TIMING: HookTiming = { deadlineMs: DEFAULT_DEADLINE_MS, hookTimeoutS: HOOK_TIMEOUT_S };
+/** Slack approvals (required under Codex): a human gets 5 minutes; the watchdog and the agent wait a little longer, in that order. */
+export const SLACK_HOOK_TIMING: HookTiming = { approvalTimeoutMs: 300_000, deadlineMs: 310_000, hookTimeoutS: 320 };
+/** The watchdog hands its deadline to the handler through this env var so the handler can validate its approval timeout against it at init. */
+export const WATCHDOG_DEADLINE_ENV = "AGENT_LEDGER_WATCHDOG_DEADLINE_MS" as const;
+/** Always SIGKILL, always the whole process group (`process.kill(-pid)`): a stalled handler or its grandchild may ignore SIGTERM. */
+export const WATCHDOG_KILL_SIGNAL = "SIGKILL" as const;
 /** Cap on the handler's stdout. Anything above it is a deny. Sits well below Claude Code's 10,000-character spill limit. */
 export const DEFAULT_MAX_OUTPUT_BYTES = 8_192;
 export const MIN_MAX_OUTPUT_BYTES = 512;
@@ -228,7 +255,11 @@ export const MAX_REASON_CHARS = 1_000;
 export interface WatchdogOptions {
   /** argv of the handler, e.g. ["node", "/opt/agent-ledger/hook-handler.js"]. Spawned directly, no shell. */
   handlerCommand: string[];
-  /** SIGKILL the handler and deny when it has not exited by then. Must be a finite integer, > 0, and ≤ timeoutS*1000 − WATCHDOG_MIN_MARGIN_MS. */
+  /**
+   * SIGKILL the handler's whole process group and deny when the handler has not exited AND closed its pipes by then.
+   * Finite integer, > 0, ≤ timeoutS*1000 − WATCHDOG_MIN_MARGIN_MS. Configurable per deployment (DEFAULT_HOOK_TIMING
+   * without Slack, SLACK_HOOK_TIMING with it); the same value is exported to the handler as WATCHDOG_DEADLINE_ENV.
+   */
   deadlineMs: number;
   /** Handler stdout above this many bytes is a deny. Finite integer in [MIN_MAX_OUTPUT_BYTES, MAX_MAX_OUTPUT_BYTES]. */
   maxOutputBytes: number;
@@ -259,8 +290,15 @@ export const WATCHDOG_REASON_PREFIX = "watchdog:" as const;
 export const WATCHDOG_REASONS = [
   "config", "init", "spawn", "stdin-too-large", "deadline", "handler-exit", "handler-signal",
   "output:empty", "output:too-large", "output:not-json", "output:not-object", "output:multiple",
-  "output:extra-key", "output:missing-key", "output:bad-value", "handler-deny", "internal",
+  "output:extra-key", "output:missing-key", "output:bad-value", "handler-deny", "write", "internal",
 ] as const;
+/**
+ * `deadline` carries a detail saying which wait the clock ran out on: `stdin` (the agent never closed our stdin: a
+ * never-EOF regression), `handler` (the handler is still running), `pipes-open` (the handler exited 0 but its stdout/
+ * stderr pipes are still held, usually by a grandchild). `write` = a write to fd 1 or 2 failed or could not be
+ * completed; the exit code is still 2 (the reporter itself may fail; exit 2 is what the agent sees either way).
+ */
+export const WATCHDOG_DEADLINE_DETAILS = ["stdin", "handler", "pipes-open"] as const;
 
 /** A handler payload the watchdog has accepted: exact key set, known decision, bounded reason. Nothing else passes. */
 export type ValidatedHandlerOutput =
@@ -288,21 +326,66 @@ export function validateHandlerOutput(raw: string, agent: HookAgent): ValidatedH
  *    handlerCommand a non-empty string array). Any failure → deny `watchdog:config:<field>`, exit 2. A plain exit 1
  *    is never used: the agents treat it as "continue".
  * 3. Start the deadline timer BEFORE reading stdin or spawning. It runs on the watchdog's own event loop, which nothing
- *    else uses, so a handler spinning in a synchronous loop cannot delay it.
- * 4. Read own stdin up to MAX_STDIN_BYTES (more → deny `watchdog:stdin-too-large`); spawn the handler with
- *    stdio ["pipe","pipe","pipe"] and no shell; write the event to its stdin and close it (EPIPE ignored: the handler
+ *    else uses, so a handler spinning in a synchronous loop cannot delay it. Qualification: the one synchronous step
+ *    the watchdog itself takes is `spawn()` (fork/exec inside libuv); a slow spawn cannot be interrupted, and the timer
+ *    fires as soon as it returns. Nothing else in the watchdog blocks.
+ * 4. Read own stdin ASYNCHRONOUSLY (`process.stdin.on("data" | "end")`), never `fs.readFileSync(0)`: a synchronous read
+ *    of a stdin the agent never closes would hang past every timer. Bound it at MAX_STDIN_BYTES (more → deny
+ *    `watchdog:stdin-too-large`, handler never spawned). EOF → spawn the handler `detached: true` (Node: "the child
+ *    process will be made the leader of a new process group and session"), stdio ["pipe","pipe","pipe"], no shell, env
+ *    carrying WATCHDOG_DEADLINE_ENV = deadlineMs; write the event to its stdin and close it (EPIPE ignored: the handler
  *    then decides on what it read, or fails, and either way the watchdog decides). Spawn error → deny `watchdog:spawn:<code>`.
+ *    No EOF before the deadline → deny `watchdog:deadline:stdin`.
  * 5. Capture handler stdout into a buffer of maxOutputBytes + 1 (overflow noted, further bytes dropped) and stderr into
  *    MAX_HANDLER_STDERR_BYTES. The handler's stdout is never connected to the agent.
- * 6. At the deadline: SIGKILL the handler (not SIGTERM, which a stalled process may ignore), emit deny `watchdog:deadline`,
- *    exit 2 immediately. Do NOT await the child's exit or close events; unfinished handler work is abandoned.
- * 7. On handler exit: code ≠ 0 → deny `watchdog:handler-exit:<code>`; killed by signal → `watchdog:handler-signal:<sig>`;
- *    code 0 → validateHandlerOutput. Invalid → that deny. Valid deny → deny `watchdog:handler-deny` with the handler's
- *    reason as permissionDecisionReason, exit 2. Valid allow, or ask under claude-code → re-serialised payload, exit 0.
- * 8. Every write to fds 1 and 2 is synchronous (fs.writeSync) and followed by process.exit, so no verdict is lost to an
- *    unflushed stream. Every deny writes BOTH the deny JSON on stdout (one line) and the reason on stderr.
+ * 6. Accept an allow/ask ONLY after BOTH the child's `exit` (code 0) AND its `close` event. Node (child_process docs,
+ *    verified 2026-09-29): "When the 'exit' event is triggered, child process stdio streams might still be open"; "The
+ *    'close' event is emitted after a process has ended and the stdio streams of a child process have been closed ...
+ *    since multiple processes might share the same stdio streams." So a grandchild that inherited the pipes can keep
+ *    writing after the handler exits 0; validating on `exit` would accept an incomplete or later-polluted buffer. The
+ *    deadline keeps running while the pipes are open: `exit` 0 but no `close` by the deadline → group kill + deny
+ *    `watchdog:deadline:pipes-open`, exit 2. Whatever a grandchild appended before `close` is part of the validated
+ *    buffer (→ `output:multiple` / `output:too-large` when it is junk).
+ * 7. At the deadline (any of stdin, handler, pipes-open): `process.kill(-child.pid, "SIGKILL")`, the WHOLE process group
+ *    (kill(2): "If pid is less than -1, then sig is sent to every process in the process group whose ID is -pid"), not
+ *    SIGTERM, which a stalled process may ignore; then deny, exit 2 immediately. Do NOT await `exit` or `close` after
+ *    the kill; unfinished work is abandoned. Every other failure path that follows a spawn (non-zero exit, signal,
+ *    invalid output, write failure, internal error) also group-kills before exiting, so no descendant survives a deny.
+ * 8. On `exit`: code ≠ 0 → group kill, deny `watchdog:handler-exit:<code>` at once (no wait for `close`); killed by
+ *    signal → `watchdog:handler-signal:<sig>`; code 0 → wait for `close` (step 6), then validateHandlerOutput. Invalid
+ *    → that deny. Valid deny → deny `watchdog:handler-deny` with the handler's reason, exit 2. Valid allow, or ask
+ *    under claude-code → re-serialised payload, exit 0.
+ * 9. Every write to fds 1 and 2 goes through `writeAllSync`: a loop that calls `fs.writeSync` until the sum of its
+ *    return values ("Returns: <number> The number of bytes written", so a short write is legal) covers every byte,
+ *    retrying EAGAIN (a pipe fd may be non-blocking) a bounded number of times. Any other error, or the retry bound,
+ *    is a write failure: the watchdog still exits 2 (`watchdog:write` on whichever fd still works, best effort), even
+ *    when the failure happens inside the failure reporter itself. Writes are followed by `process.exit`, so no verdict
+ *    is lost to an unflushed stream. Every deny writes BOTH the deny JSON on stdout (one line) and the reason on stderr.
  * It never throws, never exits 0 without a validated payload, and never exits with any code but 0 or 2.
  * Residual limits (spec §7): a missing watchdog binary, a watchdog killed by the OS, or a user-edited hook entry produce
  * no output at all, and both agents continue. Those are closed by managed configuration and a heartbeat, not by code.
+ * Orphaning: if the WATCHDOG itself is SIGKILLed (OOM, or the agent's own timeout after a deadline misconfiguration),
+ * nobody group-kills the detached handler and it runs on as an orphan. Codex kills the hook's own process group at its
+ * timeout (verified 2026-09-29: `process_mode(NewSession)` + `kill_process_group` in codex-rs hooks
+ * `command_runner.rs`), and the detached handler is in a different group, so Codex's kill does not reach it either;
+ * Claude Code's process-tree behaviour at timeout is undocumented [H]. Hence the deadline must sit below the hook
+ * timeout (validated, step 2), and the orphan is a documented residual, not a covered case.
  */
 export function runWatchdog(opts: WatchdogOptions): Promise<WatchdogResult> { throw notImplemented("hooks.runWatchdog"); }
+
+/**
+ * Writes every byte of `data` to `fd` with `fs.writeSync`, looping on the returned byte count and retrying EAGAIN up to
+ * `maxAttempts` times. Throws on any other error or when the attempts run out; the watchdog turns that into exit 2.
+ */
+export function writeAllSync(fd: 1 | 2, data: Uint8Array, maxAttempts?: number): void { throw notImplemented("hooks.writeAllSync"); }
+
+/**
+ * Validates the three clocks (ADR-006) and returns the violations, one string each; empty = valid. Called by the
+ * watchdog on its own options (hook timeout vs deadline → `watchdog:config:deadlineMs`) and by the handler at init on
+ * `approvals.timeoutMs` vs the deadline it received through WATCHDOG_DEADLINE_ENV (a violation is an init failure, so
+ * the watchdog denies with exit 2). Rules: every present value a finite integer > 0;
+ * `approvalTimeoutMs + APPROVAL_MIN_MARGIN_MS ≤ deadlineMs` (`approval-not-below-deadline`);
+ * `deadlineMs + WATCHDOG_MIN_MARGIN_MS ≤ hookTimeoutS * 1000` (`deadline-not-below-hook-timeout`).
+ * Claude Code's hook-ask path has no approvalTimeoutMs and keeps DEFAULT_HOOK_TIMING; Slack is optional there.
+ */
+export function validateHookTiming(t: HookTiming): string[] { throw notImplemented("hooks.validateHookTiming"); }
