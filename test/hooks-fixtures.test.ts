@@ -202,6 +202,10 @@ describe("two-process watchdog contract (spec §7)", () => {
     expect(hooks.WATCHDOG_DEADLINE_DETAILS).toEqual(["stdin", "handler", "pipes-open"]);
     expect(hooks.WATCHDOG_KILL_SIGNAL).toBe("SIGKILL");
     expect(typeof hooks.writeAllSync).toBe("function");
+    // Astra P1 (2026-09-30): output writes are time-bounded on non-blocking fds, so a full pipe cannot outlive the deadline
+    expect(typeof hooks.setNonBlocking).toBe("function");
+    expect(hooks.WATCHDOG_WRITE_BUDGET_MS).toBeGreaterThan(0);
+    expect(hooks.WATCHDOG_WRITE_BUDGET_MS).toBeLessThan(WATCHDOG_MIN_MARGIN_MS); // the verdict is out before the agent's timeout even on a slow reader
   });
   it("the three clocks are ordered: approval < watchdog deadline < hook timeout, in both timing profiles (ADR-006)", () => {
     const ordered = (t: hooks.HookTiming) =>
@@ -215,6 +219,9 @@ describe("two-process watchdog contract (spec §7)", () => {
     expect(hooks.SLACK_HOOK_TIMING.hookTimeoutS).toBeGreaterThan(HOOK_TIMEOUT_S);
     expect(hooks.SLACK_HOOK_TIMING.hookTimeoutS).toBeLessThan(CODEX_DEFAULT_HOOK_TIMEOUT_S);
     expect(hooks.WATCHDOG_DEADLINE_ENV).toBe("AGENT_LEDGER_WATCHDOG_DEADLINE_MS");
+    // Astra P2 (2026-09-30): the handler also receives the ABSOLUTE deadline, so time the watchdog spent on stdin never extends the Slack wait
+    expect(hooks.WATCHDOG_DEADLINE_AT_ENV).toBe("AGENT_LEDGER_WATCHDOG_DEADLINE_AT_MS");
+    expect(hooks.WATCHDOG_DEADLINE_AT_ENV).not.toBe(hooks.WATCHDOG_DEADLINE_ENV);
     expect(typeof hooks.validateHookTiming).toBe("function");
   });
   it("the failure-path result is a deny JSON AND exit 2; exit 1 is not a legal result; allow is exit 0 with a re-serialised payload", () => {

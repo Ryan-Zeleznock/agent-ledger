@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  APPROVAL_DECISIONS, BUILTIN_CODEX_SERVER, BUILTIN_NAMESPACE, BUILTIN_SERVER, BUILTIN_SERVERS, BUILTIN_SERVER_KEYS, HOOK_AGENTS, HOOK_DECISIONS, HOOK_DECISION_KINDS,
+  APPROVAL_DECISIONS, BUILTIN_CODEX_SERVER, BUILTIN_NAMESPACE, BUILTIN_SERVER, BUILTIN_SERVERS, BUILTIN_SERVER_KEYS, HANDOFF_TO_PROXY_REASON, HANDOFF_TO_PROXY_RULE_PREFIX, HOOK_AGENTS, HOOK_DECISIONS, HOOK_DECISION_KINDS,
   RESERVED_KEYS, RESERVED_SERVER_NAMES, RISKS, VERDICTS,
   type ApprovalChannel, type ApprovalResult, type HookAgent, type HookDecision, type IncomingCall, type LedgerRecord, type ToolCall, type ToolInfo, type UnsealedRecord,
 } from "../src/types/index.js";
@@ -91,6 +91,20 @@ describe("types", () => {
     expect(genesis.parentRecordId).toBeNull();
     expect(next.parentRecordId).toBe("r1");
     expect("parentRecordId" in unsealed).toBe(false);
+  });
+  it("a handoff-to-proxy intent record names the proxy and classifies nothing (ADR-006, spec v2.1; Astra 2026-09-30)", () => {
+    const proxy = "agentledger_proxy_7f3a9c2e1b04";
+    const handoff: UnsealedRecord = {
+      id: "r3", phase: "intent",
+      call: { callId: "call_9", sessionId: "s1", agentId: "astra", server: proxy, tool: "list_repos", args: {}, receivedAt: "2026-09-30T00:00:00Z" },
+      policy: { verdict: "allow", ruleId: `${HANDOFF_TO_PROXY_RULE_PREFIX}${proxy}`, reason: HANDOFF_TO_PROXY_REASON, risk: "unreviewed" },
+      handoff: { kind: "to-proxy", proxyServerName: proxy },
+    };
+    expect(handoff.handoff?.proxyServerName).toBe(proxy);
+    expect(handoff.policy.ruleId).toBe("handoff-to-proxy:" + proxy);
+    expect(handoff.approval).toBeUndefined(); // the hook asked nobody; the proxy's own record carries any approval
+    const plain: UnsealedRecord = { ...handoff, handoff: undefined };
+    expect(plain.handoff).toBeUndefined(); // absent on every other record
   });
   it("ToolInfo carries the four MCP annotation hints, all optional", () => {
     const t: ToolInfo = { server: "github", name: "list_repos", annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true } };

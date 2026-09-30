@@ -202,8 +202,11 @@ export function formatPreToolUseOutput(d: HookDecision, agent: HookAgent): strin
 // Verified 2026-09-29. Claude Code (https://code.claude.com/docs/en/hooks #exit-code-2, #other-exit-codes,
 // #timeouts, #json-output): "exit 2 blocks whether or not you print JSON: even a JSON permissionDecision of
 // "allow" can't override it"; the blocking message is the JSON deny reason when there is one, else stderr, and
-// Claude sees it; exit 0 without a decision, exit 1 or any other code, unparseable or schema-failing stdout, a hook
-// that reaches its `timeout`, and a hook that cannot start (exit 127) all let the tool call CONTINUE. Stdout is
+// Claude sees it; exit 0 without a decision, exit 1 or any other non-2 code WITHOUT valid decision JSON, unparseable
+// or schema-failing stdout, a hook that reaches its `timeout`, and a hook that cannot start (exit 127) all let the
+// tool call CONTINUE. With valid decision JSON on a non-2 exit, "Claude Code ignores the exit code and the JSON alone
+// decides" (re-read 2026-09-29), so exit 1 + a valid deny does block there; we never rely on it and stay exit 2 on
+// every deny (spec §7 table). Stdout is
 // read as JSON only when it starts with `{` and ends with `}`; two JSON lines are a parse failure; plain stdout is
 // capped at 10,000 characters and spilled to a file above that. Codex (https://learn.chatgpt.com/docs/hooks
 // #pretooluse): "You can also use exit code 2 and write the blocking reason to stderr"; unsupported output fields
@@ -237,10 +240,29 @@ export interface HookTiming { approvalTimeoutMs?: number; deadlineMs: number; ho
 export const DEFAULT_HOOK_TIMING: HookTiming = { deadlineMs: DEFAULT_DEADLINE_MS, hookTimeoutS: HOOK_TIMEOUT_S };
 /** Slack approvals (required under Codex): a human gets 5 minutes; the watchdog and the agent wait a little longer, in that order. */
 export const SLACK_HOOK_TIMING: HookTiming = { approvalTimeoutMs: 300_000, deadlineMs: 310_000, hookTimeoutS: 320 };
-/** The watchdog hands its deadline to the handler through this env var so the handler can validate its approval timeout against it at init. */
+/** The watchdog hands its configured deadline DURATION to the handler through this env var, for the static three-clock check at init (`validateHookTiming`). */
 export const WATCHDOG_DEADLINE_ENV = "AGENT_LEDGER_WATCHDOG_DEADLINE_MS" as const;
+/**
+ * The watchdog also hands the handler its ABSOLUTE deadline: `Date.now() + deadlineMs`, taken when the watchdog's timer
+ * starts (BEFORE stdin is read or the child spawned), as epoch milliseconds. The handler budgets everything, above all
+ * the Slack wait, from `deadlineAt - Date.now()` at the moment it needs the budget, never from the duration: the
+ * watchdog may have spent seconds of the duration on stdin and spawn before the handler ran, and a handler that waited
+ * the full `approvalTimeoutMs` after a late start would be killed mid-wait with an unrecorded approval (Astra P2,
+ * 2026-09-30). Missing, non-integer, or already-past value → handler init failure → watchdog deny, exit 2.
+ */
+export const WATCHDOG_DEADLINE_AT_ENV = "AGENT_LEDGER_WATCHDOG_DEADLINE_AT_MS" as const;
 /** Always SIGKILL, always the whole process group (`process.kill(-pid)`): a stalled handler or its grandchild may ignore SIGTERM. */
 export const WATCHDOG_KILL_SIGNAL = "SIGKILL" as const;
+/**
+ * Output writes are TIME-bounded, not only count-bounded (Astra P1, 2026-09-30): a blocking `fs.writeSync` to a pipe
+ * whose reader has stopped draining (a full 64 KiB pipe buffer) never returns and would stall the watchdog past its
+ * own deadline. So fds 1 and 2 are put into non-blocking mode before the first write, every `writeSync` can then return
+ * EAGAIN instead of blocking, and `writeAllSync` retries within this budget. Zero progress (no byte accepted) for the
+ * whole budget is a write failure → exit 2, whatever was flushed. The budget is small: the agent reads at most one line.
+ */
+export const WATCHDOG_WRITE_BUDGET_MS = 1_000;
+/** Retry back-off inside the write budget; keeps the retry loop from spinning while the reader catches up. */
+export const WATCHDOG_WRITE_RETRY_SLEEP_MS = 5;
 /** Cap on the handler's stdout. Anything above it is a deny. Sits well below Claude Code's 10,000-character spill limit. */
 export const DEFAULT_MAX_OUTPUT_BYTES = 8_192;
 export const MIN_MAX_OUTPUT_BYTES = 512;
@@ -333,7 +355,9 @@ export function validateHandlerOutput(raw: string, agent: HookAgent): ValidatedH
  *    of a stdin the agent never closes would hang past every timer. Bound it at MAX_STDIN_BYTES (more → deny
  *    `watchdog:stdin-too-large`, handler never spawned). EOF → spawn the handler `detached: true` (Node: "the child
  *    process will be made the leader of a new process group and session"), stdio ["pipe","pipe","pipe"], no shell, env
- *    carrying WATCHDOG_DEADLINE_ENV = deadlineMs; write the event to its stdin and close it (EPIPE ignored: the handler
+ *    carrying WATCHDOG_DEADLINE_ENV = deadlineMs (the duration, for the static clock check) AND WATCHDOG_DEADLINE_AT_ENV
+ *    = the epoch-ms instant the timer of step 3 fires (the handler budgets its Slack wait from THIS, so time the
+ *    watchdog spent on stdin never extends the handler's real deadline); write the event to its stdin and close it (EPIPE ignored: the handler
  *    then decides on what it read, or fails, and either way the watchdog decides). Spawn error → deny `watchdog:spawn:<code>`.
  *    No EOF before the deadline → deny `watchdog:deadline:stdin`.
  * 5. Capture handler stdout into a buffer of maxOutputBytes + 1 (overflow noted, further bytes dropped) and stderr into
@@ -351,19 +375,33 @@ export function validateHandlerOutput(raw: string, agent: HookAgent): ValidatedH
  *    SIGTERM, which a stalled process may ignore; then deny, exit 2 immediately. Do NOT await `exit` or `close` after
  *    the kill; unfinished work is abandoned. Every other failure path that follows a spawn (non-zero exit, signal,
  *    invalid output, write failure, internal error) also group-kills before exiting, so no descendant survives a deny.
+ *    Kill semantics (Astra P2, 2026-09-30): `process.kill(-pid)` throwing ESRCH means the group is already gone; that
+ *    is NOT an error, the deny proceeds unchanged. The group id is `child.pid`, kept from spawn, and it is used for
+ *    exactly ONE kill attempt per failure path: after the group has disappeared the watchdog never kills by that id
+ *    again, because the kernel may reuse a PGID for an unrelated process. A descendant that calls `setsid()` leaves
+ *    the handler's group and the group kill cannot reach it: that is a stated residual of local mode (spec §7), not a
+ *    covered case; the watchdog does not walk the process tree.
  * 8. On `exit`: code ≠ 0 → group kill, deny `watchdog:handler-exit:<code>` at once (no wait for `close`); killed by
  *    signal → `watchdog:handler-signal:<sig>`; code 0 → wait for `close` (step 6), then validateHandlerOutput. Invalid
  *    → that deny. Valid deny → deny `watchdog:handler-deny` with the handler's reason, exit 2. Valid allow, or ask
  *    under claude-code → re-serialised payload, exit 0.
- * 9. Every write to fds 1 and 2 goes through `writeAllSync`: a loop that calls `fs.writeSync` until the sum of its
- *    return values ("Returns: <number> The number of bytes written", so a short write is legal) covers every byte,
- *    retrying EAGAIN (a pipe fd may be non-blocking) a bounded number of times. Any other error, or the retry bound,
- *    is a write failure: the watchdog still exits 2 (`watchdog:write` on whichever fd still works, best effort), even
- *    when the failure happens inside the failure reporter itself. Writes are followed by `process.exit`, so no verdict
- *    is lost to an unflushed stream. Every deny writes BOTH the deny JSON on stdout (one line) and the reason on stderr.
+ * 9. Every write to fds 1 and 2 goes through `writeAllSync`, and both fds are switched to NON-BLOCKING mode before the
+ *    first write (Astra P1, 2026-09-30: a blocking `writeSync` to a pipe the reader has stopped draining never returns
+ *    and would stall the watchdog past its own deadline). `writeAllSync` loops on `fs.writeSync`'s return value
+ *    ("Returns: <number> The number of bytes written", so a short write is legal) until every byte is out, retrying
+ *    EAGAIN with a short sleep, bounded by TIME (WATCHDOG_WRITE_BUDGET_MS), not only by a count. Zero progress for the
+ *    whole budget, running out of budget, or any other error is a write failure: the watchdog still exits 2
+ *    (`watchdog:write` on whichever fd still works, best effort, within the same budget), even when the failure happens
+ *    inside the failure reporter itself. Writes are followed by `process.exit`, so no verdict is lost to an unflushed
+ *    stream. Every deny writes BOTH the deny JSON on stdout (one line) and the reason on stderr.
  * It never throws, never exits 0 without a validated payload, and never exits with any code but 0 or 2.
- * Residual limits (spec §7): a missing watchdog binary, a watchdog killed by the OS, or a user-edited hook entry produce
- * no output at all, and both agents continue. Those are closed by managed configuration and a heartbeat, not by code.
+ * Trust boundary (spec §3, §7): all of this is best-effort gating on a machine the user controls. A user who owns the
+ * machine can remove the hook entry, kill the watchdog, or preload code into the "approved" proxy through the launch
+ * environment (`NODE_OPTIONS=--import=…`, which Codex's managed `mcp_servers` matcher does not inspect). Local mode is
+ * visibility + tamper-evident logging + best-effort gating; the enforcement boundary is SERVER mode, where the proxy
+ * holds the credentials. Residual limits (spec §7): a missing watchdog binary, a watchdog killed by the OS, or a
+ * user-edited hook entry produce no output at all, and both agents continue; a `setsid()` descendant escapes the group
+ * kill. Those are narrowed by managed configuration, a protected launch environment and a heartbeat, not closed by code.
  * Orphaning: if the WATCHDOG itself is SIGKILLed (OOM, or the agent's own timeout after a deadline misconfiguration),
  * nobody group-kills the detached handler and it runs on as an orphan. Codex kills the hook's own process group at its
  * timeout (verified 2026-09-29: `process_mode(NewSession)` + `kill_process_group` in codex-rs hooks
@@ -374,16 +412,30 @@ export function validateHandlerOutput(raw: string, agent: HookAgent): ValidatedH
 export function runWatchdog(opts: WatchdogOptions): Promise<WatchdogResult> { throw notImplemented("hooks.runWatchdog"); }
 
 /**
- * Writes every byte of `data` to `fd` with `fs.writeSync`, looping on the returned byte count and retrying EAGAIN up to
- * `maxAttempts` times. Throws on any other error or when the attempts run out; the watchdog turns that into exit 2.
+ * Writes every byte of `data` to `fd` with `fs.writeSync`, looping on the returned byte count and retrying EAGAIN
+ * (sleeping WATCHDOG_WRITE_RETRY_SLEEP_MS between attempts) until the bytes are out or `budgetMs` (default
+ * WATCHDOG_WRITE_BUDGET_MS) has elapsed since the first attempt. The caller has put `fd` into non-blocking mode first
+ * (`setNonBlocking`), so a full pipe surfaces as EAGAIN instead of a blocking call that outlives the deadline. Throws
+ * on any other error, when the budget runs out, or when no byte at all was accepted within the budget (zero
+ * progress); the watchdog turns every throw into exit 2. `now` is injectable for the runtime tests.
  */
-export function writeAllSync(fd: 1 | 2, data: Uint8Array, maxAttempts?: number): void { throw notImplemented("hooks.writeAllSync"); }
+export function writeAllSync(fd: 1 | 2, data: Uint8Array, budgetMs?: number, now?: () => number): void { throw notImplemented("hooks.writeAllSync"); }
+
+/**
+ * Puts fd 1 or 2 into O_NONBLOCK mode (a small native-free step: on POSIX Node exposes it through the stream's handle;
+ * the implementation may fall back to `net.Socket`/`tty.WriteStream` with `setBlocking(false)`). Idempotent. A failure
+ * to switch is itself a write failure → exit 2, because a blocking fd cannot be written within a time bound.
+ */
+export function setNonBlocking(fd: 1 | 2): void { throw notImplemented("hooks.setNonBlocking"); }
 
 /**
  * Validates the three clocks (ADR-006) and returns the violations, one string each; empty = valid. Called by the
  * watchdog on its own options (hook timeout vs deadline → `watchdog:config:deadlineMs`) and by the handler at init on
- * `approvals.timeoutMs` vs the deadline it received through WATCHDOG_DEADLINE_ENV (a violation is an init failure, so
- * the watchdog denies with exit 2). Rules: every present value a finite integer > 0;
+ * `approvals.timeoutMs` vs the deadline DURATION it received through WATCHDOG_DEADLINE_ENV (a violation is an init
+ * failure, so the watchdog denies with exit 2). This is the static check. The RUNTIME budget is separate: the handler
+ * reads WATCHDOG_DEADLINE_AT_ENV and, when it is about to wait on Slack, uses
+ * `min(approvalTimeoutMs, deadlineAt - Date.now() - APPROVAL_MIN_MARGIN_MS)`; if that is ≤ 0 the approval is
+ * `timeout` without a Slack round trip (recorded, then deny). Rules: every present value a finite integer > 0;
  * `approvalTimeoutMs + APPROVAL_MIN_MARGIN_MS ≤ deadlineMs` (`approval-not-below-deadline`);
  * `deadlineMs + WATCHDOG_MIN_MARGIN_MS ≤ hookTimeoutS * 1000` (`deadline-not-below-hook-timeout`).
  * Claude Code's hook-ask path has no approvalTimeoutMs and keeps DEFAULT_HOOK_TIMING; Slack is optional there.
