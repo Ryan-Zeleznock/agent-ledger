@@ -3,7 +3,7 @@ import {
   BUILTIN_SERVER_KEYS, MCP_SERVER_NAME_RE, RESERVED_KEYS, RESERVED_SERVER_NAMES,
   CODEX_PROXY_SERVER_NAME_RE, CODEX_PROXY_SERVER_NAME_MIN_LENGTH,
 } from "../types/index.js";
-import { mapping, readYaml, regex, sequence, string, version } from "./schema.js";
+import { compileRegex, mapping, readYaml, regex, sequence, string, version } from "./schema.js";
 
 // ---------- Registry: the authority (ADR-004) ----------
 
@@ -13,8 +13,8 @@ export type ToolClass = (typeof TOOL_CLASSES)[number];
 export const CLASS_RANK: Record<ToolClass, number> = { read: 0, write: 1, risky: 2 };
 
 /**
- * Raises the class when EVERY argPattern matches (case-insensitive regex over String(args[key]); a missing arg never
- * matches). `to` must rank strictly above the row's base class: the loader refuses a registry where it does not,
+ * Raises the class when EVERY argPattern matches (case-insensitive regex over primitives; missing args never
+ * match). Structured values and text over 1024 UTF-16 code units count as matched without coercion. `to` must rank strictly above the row's base class: the loader refuses a registry where it does not,
  * and evaluate() takes max(base, to) anyway, so an escalation can never lower a class.
  */
 export interface Escalation { argPattern: Record<string, string>; to: "write" | "risky"; }
@@ -142,10 +142,28 @@ function toolEntry(value: unknown, at: string): ToolEntry {
     if (to === "read" || CLASS_RANK[to] <= CLASS_RANK[cls]) throw new Error(`${where}: to must rank above ${cls}`);
     const patterns = mapping(e.get("argPattern"), `${where}.argPattern`);
     // Prototype names are legal argument names; fromEntries defines own data properties, even __proto__.
-    const argPattern = Object.fromEntries([...patterns].map(([key, value]) => [key, regex(value, `${where}.argPattern.${key}`)]));
+    const argPattern = Object.fromEntries(patterns) as Record<string, string>;
     return { to, argPattern };
   });
+  compiledPatterns(row);
   return row;
+}
+
+// Keep compiled state out of the frozen public shapes. A changed row invalidates its cache.
+const compiled = new WeakMap<ToolEntry, { source: string; patterns: [string, RegExp][][] }>();
+function compiledPatterns(row: ToolEntry): [string, RegExp][][] {
+  const source = JSON.stringify(row.escalateWhen ?? []);
+  const cached = compiled.get(row);
+  if (cached?.source === source) return cached.patterns;
+  const patterns = (row.escalateWhen ?? []).map((e, i) => Object.entries(e.argPattern)
+    .map(([key, pattern]): [string, RegExp] => [key, compileRegex(pattern, `escalate:${i}.${key}`)]));
+  compiled.set(row, { source, patterns });
+  return patterns;
+}
+function matchesValue(pattern: RegExp, value: unknown): boolean {
+  if ((typeof value === "object" && value !== null) || typeof value === "function") return true;
+  const text = String(value);
+  return text.length > 1024 || pattern.test(text);
 }
 
 /**
@@ -156,15 +174,17 @@ function toolEntry(value: unknown, at: string): ToolEntry {
  * `builtin:claude-code` rows. Invariant: the effective class is max(row.class, every matching escalation.to).
  */
 export function evaluate(registry: ToolRegistry, call: ToolCall): PolicyDecision {
-  const { server, tool, args } = call;
+  const { server, tool } = call;
+  const args = typeof call.args === "object" && call.args !== null ? call.args : {};
   const s = Object.hasOwn(registry.servers, server) ? registry.servers[server] : undefined;
   const row = s && Object.hasOwn(s.tools, tool) ? s.tools[tool] : undefined;
-  if (!row) return { verdict: "require_approval", risk: "unreviewed", ruleId: `unreviewed:${server}/${tool}`, reason: "Tool not in the reviewed registry" };
+  if (!row || !Object.hasOwn(CLASS_DECISION, row.class)) return { verdict: "require_approval", risk: "unreviewed", ruleId: `unreviewed:${server}/${tool}`, reason: "Tool not in the reviewed registry" };
   let cls = row.class;
   let ruleId = `registry:${server}/${tool}`;
+  const patterns = compiledPatterns(row);
   for (const [i, escalation] of (row.escalateWhen ?? []).entries()) {
-    const matches = Object.entries(escalation.argPattern).every(([key, pattern]) =>
-      Object.hasOwn(args, key) && new RegExp(pattern, "i").test(String(args[key])));
+    const matches = patterns[i]!.every(([key, pattern]) =>
+      Object.hasOwn(args, key) && matchesValue(pattern, args[key]));
     if (matches && CLASS_RANK[escalation.to] > CLASS_RANK[cls]) {
       cls = escalation.to;
       ruleId = `registry:${server}/${tool}#escalate:${i}`;

@@ -1,6 +1,5 @@
-// TEST-ONLY validator + evaluator + hook name split, mirroring the contracts' documented semantics (spec §6, §8).
-// The product functions (src/policy loadRegistry/evaluate, src/hooks toIncomingCall) stay stubs until Gate 2
-// (ADR-002); when they land, the tables move onto them and this file is deleted (test/todo/policy.todo.md).
+// Test-only independent decision oracle and schema checks; product policy is implemented.
+// Retained for generated policy parity and unfinished hook contracts (ADR-008).
 import { CLASS_DECISION, CLASS_RANK, TOOL_CLASSES, type ToolClass, type ToolEntry, type ToolRegistry } from "../../src/policy/contract.js";
 import { APPROVAL_MIN_MARGIN_MS, MCP_TOOL_PREFIX, WATCHDOG_MIN_MARGIN_MS, type HookTiming } from "../../src/hooks/contract.js";
 import {
@@ -13,7 +12,13 @@ const isBuiltinKey = (server: string) => (BUILTIN_SERVER_KEYS as readonly string
 export type Args = Record<string, unknown>;
 const re = (p: string) => new RegExp(p, "i");
 const argsMatch = (patterns: Record<string, string>, args: Args) =>
-  Object.entries(patterns).every(([k, p]) => Object.hasOwn(args, k) && re(p).test(String(args[k])));
+  Object.entries(patterns).every(([k, p]) => {
+    if (typeof args !== "object" || args === null || !Object.hasOwn(args, k)) return false;
+    const value = args[k];
+    if ((typeof value === "object" && value !== null) || typeof value === "function") return true;
+    const text = String(value);
+    return text.length > 1024 || re(p).test(text);
+  });
 const isClass = (c: unknown): c is ToolClass => (TOOL_CLASSES as readonly unknown[]).includes(c);
 
 /** Collision normalisation (types: RESERVED_SERVER_NAMES): lowercase, then strip everything outside [a-z0-9]. */
@@ -114,7 +119,7 @@ function lookup(reg: ToolRegistry, server: string, tool: string): ToolEntry | un
 
 export function decide(reg: ToolRegistry, server: string, tool: string, args: Args = {}): PolicyDecision {
   const row = lookup(reg, server, tool);
-  if (!row) return { verdict: "require_approval", risk: "unreviewed", ruleId: `unreviewed:${server}/${tool}`, reason: "Tool not in the reviewed registry" };
+  if (!row || !isClass(row.class)) return { verdict: "require_approval", risk: "unreviewed", ruleId: `unreviewed:${server}/${tool}`, reason: "Tool not in the reviewed registry" };
   let cls: ToolClass = row.class;
   let ruleId = `registry:${server}/${tool}`;
   for (const [i, e] of (row.escalateWhen ?? []).entries()) {

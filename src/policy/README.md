@@ -40,5 +40,20 @@ Due diligence, checked 2026-09-30 against installed `yaml` 2.9.1:
 - [H] Reviewer names identify actual human review. Schema validation can require metadata, not
   establish that a human performed the review. Configuration authors remain trusted.
 
-Residual: administrator-authored JavaScript regexes are validated for syntax, not execution cost;
-pathological expressions/inputs can stall synchronous evaluation. The hook watchdog is a later slice.
+Regexes use a conservative subset, including in suggestions: at most 512 UTF-16 code units,
+one quantifier total (`*`, `+`, `?`, `{n}`, `{n,m}`, `{n,}`), on a single character/class only;
+finite counts must be ≤1024. Groups and alternatives are allowed but groups cannot be quantified; expanding alternatives
+across concatenated groups may produce at most 256 paths.
+Lookaround, backreferences, named groups, lazy quantifiers, and numeric/hex/Unicode escapes
+are refused. Character classes and escaped punctuation are supported. This intentionally rejects
+some safe regexes to exclude nested repetition, ambiguous repeated alternatives and overlapping
+repetition. Invalid syntax is also refused. Compiled escalation regexes are cached per tool entry;
+editing escalation rules invalidates that entry's cache without changing public contract shapes.
+
+Only primitives are converted to text. Any object/array/function argument value counts as matched
+without invoking coercion; text over 1024 UTF-16 code units also counts as matched. The cap is checked
+before regex execution. Missing arguments still do not match, and all predicates in a rule must match.
+Null/non-object `args` are treated as an empty argument mapping. Unknown classes in hand-built
+registries receive the complete `require_approval / unreviewed` decision.
+The ReDoS regression runs in a supervised child with a 2-second SIGKILL deadline; the reported
+pattern must be refused or its 41-character attack must escalate in under 50 ms.
