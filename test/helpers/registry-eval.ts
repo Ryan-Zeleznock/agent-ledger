@@ -2,8 +2,11 @@
 // The product functions (src/policy loadRegistry/evaluate, src/hooks toIncomingCall) stay stubs until Gate 2
 // (ADR-002); when they land, the tables move onto them and this file is deleted (test/todo/policy.todo.md).
 import { CLASS_DECISION, CLASS_RANK, TOOL_CLASSES, type ToolClass, type ToolEntry, type ToolRegistry } from "../../src/policy/contract.js";
-import { MCP_TOOL_PREFIX } from "../../src/hooks/contract.js";
-import { BUILTIN_SERVERS, BUILTIN_SERVER_KEYS, MCP_SERVER_NAME_RE, RESERVED_KEYS, RESERVED_SERVER_NAMES, type HookAgent, type PolicyDecision } from "../../src/types/index.js";
+import { APPROVAL_MIN_MARGIN_MS, MCP_TOOL_PREFIX, WATCHDOG_MIN_MARGIN_MS, type HookTiming } from "../../src/hooks/contract.js";
+import {
+  BUILTIN_SERVERS, BUILTIN_SERVER_KEYS, CODEX_MCP_NOT_PROXIED_REASON, CODEX_PROXY_SERVER_NAME_MIN_LENGTH, CODEX_PROXY_SERVER_NAME_RE,
+  MCP_SERVER_NAME_RE, RESERVED_KEYS, RESERVED_SERVER_NAMES, type HookAgent, type HookDecisionKind, type PolicyDecision,
+} from "../../src/types/index.js";
 
 const isBuiltinKey = (server: string) => (BUILTIN_SERVER_KEYS as readonly string[]).includes(server);
 
@@ -48,6 +51,57 @@ export function validate(reg: ToolRegistry): string[] {
       }
     }
   }
+  // ADR-006: the proxy's Codex server name, in Codex's hook-visible form, unguessable, and not an upstream key
+  if (reg.proxy?.codex !== undefined) {
+    const name = reg.proxy.codex.serverName;
+    if (typeof name !== "string" || name.length === 0) problems.push("proxy.codex.serverName: missing");
+    else {
+      if (!CODEX_PROXY_SERVER_NAME_RE.test(name)) problems.push("proxy.codex.serverName: must be [A-Za-z0-9_] with no leading or trailing _ (Codex trims those)");
+      if (name.length < CODEX_PROXY_SERVER_NAME_MIN_LENGTH) problems.push(`proxy.codex.serverName: shorter than ${CODEX_PROXY_SERVER_NAME_MIN_LENGTH}`);
+      if (isReservedServerName(name)) problems.push("proxy.codex.serverName: collides with the builtin namespace");
+      if (Object.keys(reg.servers).some((k) => k.toLowerCase() === name.toLowerCase())) problems.push("proxy.codex.serverName: equals a servers key (the proxy is not an upstream)");
+    }
+  }
+  return problems;
+}
+
+// ---------- Codex MCP naming, as openai/codex does it (read 2026-09-29) ----------
+
+/** codex-rs/codex-mcp/src/mcp/mod.rs `sanitize_responses_api_tool_name`: keep ASCII alphanumerics and `_`, everything else → `_`; empty → `_`. */
+export const codexSanitize = (s: string) => { const out = s.replace(/[^A-Za-z0-9_]/g, "_"); return out.length ? out : "_"; };
+/**
+ * codex-rs/core/src/tools/handlers/mcp.rs `hook_tool_name` = ensure_mcp_prefix(join_tool_name(namespaced(callable_namespace, callable_name))),
+ * where join_tool_name does `namespace.trim_end_matches('_')` + "__" + `name.trim_start_matches('_')`, AFTER sanitising
+ * (and, on a collision, hash-suffixing) both parts in codex-mcp/src/tools.rs. This helper models the no-collision case.
+ */
+export function codexHookToolName(rawServer: string, rawTool: string): string {
+  const ns = ("mcp__" + codexSanitize(rawServer)).replace(/_+$/, "");
+  const tool = codexSanitize(rawTool).replace(/^_+/, "");
+  return `${ns}__${tool}`;
+}
+
+/** What `pipeline.decide` does with a Codex hook call before the registry is consulted (ADR-006). */
+export type CodexRoute =
+  | { kind: "builtin"; server: string; tool: string }
+  | { kind: Extract<HookDecisionKind, "governed-by-proxy">; decision: "allow" }
+  | { kind: "deny-not-proxied"; decision: "deny"; reason: string; ruleId: string };
+export function routeCodexHookCall(toolName: string, proxyServerName: string | undefined): CodexRoute {
+  const { server, tool } = splitToolName(toolName, false, "codex");
+  if (!toolName.startsWith(MCP_TOOL_PREFIX)) return { kind: "builtin", server, tool };
+  if (proxyServerName !== undefined && server === proxyServerName) return { kind: "governed-by-proxy", decision: "allow" };
+  return { kind: "deny-not-proxied", decision: "deny", reason: CODEX_MCP_NOT_PROXIED_REASON, ruleId: `codex-mcp-not-proxied:${server}/${tool}` };
+}
+
+/** hooks.validateHookTiming as documented: every present value a finite integer > 0, and the two margins hold. */
+export function checkHookTiming(t: HookTiming): string[] {
+  const problems: string[] = [];
+  const bad = (n: unknown) => typeof n !== "number" || !Number.isFinite(n) || !Number.isInteger(n) || n <= 0;
+  if (t.approvalTimeoutMs !== undefined && bad(t.approvalTimeoutMs)) problems.push("approvalTimeoutMs");
+  if (bad(t.deadlineMs)) problems.push("deadlineMs");
+  if (bad(t.hookTimeoutS)) problems.push("hookTimeoutS");
+  if (problems.length) return problems;
+  if (t.approvalTimeoutMs !== undefined && t.approvalTimeoutMs + APPROVAL_MIN_MARGIN_MS > t.deadlineMs) problems.push("approval-not-below-deadline");
+  if (t.deadlineMs + WATCHDOG_MIN_MARGIN_MS > t.hookTimeoutS * 1000) problems.push("deadline-not-below-hook-timeout");
   return problems;
 }
 

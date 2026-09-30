@@ -8,6 +8,18 @@
 #
 # Build this file at setup from `tools/list` with `suggestClass`, then have a human confirm each row.
 version: 1
+# ADR-006: how the Agent Ledger proxy is known to Codex. Codex hook names are NOT MCP identities (codex-rs trims `_` at
+# the `__` join after sanitising, so `github_`/`list_repos` and `github`/`_list_repos` both fire as
+# `mcp__github__list_repos`). So every MCP server Codex uses is an UPSTREAM of the proxy, and the proxy is Codex's one
+# configured MCP server, under this name: Codex's hook-visible form ([A-Za-z0-9_], no leading/trailing `_`), at least 16
+# characters with a random suffix so it cannot be guessed, never also a `servers` key. A Codex hook call
+# `mcp__<serverName>__<tool>` is answered `allow` (governed-by-proxy: the proxy decided and recorded it); any other
+# Codex `mcp__*` call is denied with "route this MCP server through the Agent Ledger proxy". Pair it with Codex's
+# managed requirements.toml `mcp_servers` allowlist (name AND identity must match, everything else is disabled) so a
+# local server named `<serverName>_` cannot borrow this allow.
+proxy:
+  codex:
+    serverName: agentledger_proxy_7f3a9c2e1b04
 servers:
   github:
     trusted: true
