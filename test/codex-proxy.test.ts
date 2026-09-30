@@ -44,7 +44,7 @@ describe("Codex MCP identity (ADR-006; Astra P1 2026-09-29)", () => {
       expect(route.kind === "deny-not-proxied" && route.reason).toMatch(/route this MCP server through the Agent Ledger proxy/);
     });
 
-  it("a call to one of the proxy's tools is allow + governed-by-proxy: the proxy decided and recorded it, the hook writes nothing", () => {
+  it("a call to one of the proxy's tools is allow + governed-by-proxy: the proxy decides and records it, the hook writes only a handoff-to-proxy record", () => {
     for (const tool of ["list_repos", "delete_repo", "anything_at_all"]) {
       expect(routeCodexHookCall(`mcp__${PROXY}__${tool}`, PROXY)).toEqual({ kind: "governed-by-proxy", decision: "allow" });
     }
@@ -81,8 +81,13 @@ describe("Codex MCP identity (ADR-006; Astra P1 2026-09-29)", () => {
       ["leading underscore", "_agentledger_proxy_7f3a9c2e1b"],
       ["hyphen (not Codex's sanitised form)", "agentledger-proxy-7f3a9c2e1b04"],
       ["colon", "agentledger:proxy:7f3a9c2e1b04"],
+      ["internal __ (the hook name splits at the first __, so it could never match itself; Astra 2026-09-30)", "agentledger__proxy_7f3a9c2e1b04"],
+      ["internal __ at the end of the stem", "agentledger_proxy__7f3a9c2e1b04"],
     ])("refuses %s", (_why, name) => {
-      expect(validate(withProxy(name))).toContain("proxy.codex.serverName: must be [A-Za-z0-9_] with no leading or trailing _ (Codex trims those)");
+      expect(validate(withProxy(name))).toContain("proxy.codex.serverName: must be [A-Za-z0-9_] with no leading, trailing or internal __ (Codex trims the ends; the hook name splits at the first __)");
+    });
+    it("a single internal _ is still fine (it is the separator inside a name, not the join)", () => {
+      expect(validate(withProxy("agentledger_proxy_7f3a9c2e1b04"))).toEqual([]);
     });
     it("refuses a short (guessable) name", () => {
       expect(validate(withProxy("proxy"))).toContain(`proxy.codex.serverName: shorter than ${CODEX_PROXY_SERVER_NAME_MIN_LENGTH}`);

@@ -78,17 +78,22 @@ export const RESERVED_KEYS = ["__proto__", "constructor", "prototype"] as const;
  * allows an `mcp__*` call on the name's say-so. Instead every MCP server Codex uses is configured to go THROUGH the
  * Agent Ledger proxy, which appears to Codex as exactly one MCP server named `registry.proxy.codex.serverName`, sees
  * raw upstream identity, decides, and records. The hook's job for that server is to say `allow` with
- * `kind: "governed-by-proxy"` and write NO record (the proxy already did). Any other `mcp__*` server → deny.
+ * `kind: "governed-by-proxy"` and write a small `handoff-to-proxy` intent record (callId + proxy server name, no
+ * classification: `LedgerRecord.handoff`), which the report later reconciles against the proxy's own record for that
+ * call (spec v2.1, Astra 2026-09-30: a call cancelled before the proxy sees it, or an alias, must still leave a trace).
+ * Any other `mcp__*` server → deny.
  *
  * What the configured name must look like: Codex's hook-visible form, `[A-Za-z0-9_]` only (its sanitiser turns
  * everything else into `_`), no leading or trailing `_` (Codex trims those before the `__`, so a name ending in `_`
- * would never match itself), at least CODEX_PROXY_SERVER_NAME_MIN_LENGTH characters with a random suffix so it is not
- * guessable, and not a reserved builtin name. The RESIDUAL: a locally added server named e.g. `<name>_` (or `<name>-`)
- * produces identical hook names and would inherit the allow. The closer is Codex's managed `requirements.toml`
+ * would never match itself), NO internal `__` (the hook name is split at the first `__` after `mcp__`, so
+ * `a__b` would be read as server `a`, tool `b__<tool>`, and could never match itself either), at least
+ * CODEX_PROXY_SERVER_NAME_MIN_LENGTH characters with a random suffix so it is not guessable, and not a reserved
+ * builtin name. The RESIDUAL (local mode): a locally added server named e.g. `<name>_` (or `<name>-`) produces
+ * identical hook names and would inherit the allow. The closer is Codex's managed `requirements.toml`
  * `mcp_servers` allowlist, which enables a server only when BOTH its name AND its identity (stdio `command`, or the
  * structured `executable` + `args` matcher; HTTP `url`) match, and disables everything else (spec §7, §8).
  */
-export const CODEX_PROXY_SERVER_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_]*[A-Za-z0-9]$/;
+export const CODEX_PROXY_SERVER_NAME_RE = /^[A-Za-z0-9](?!.*__)[A-Za-z0-9_]*[A-Za-z0-9]$/;
 export const CODEX_PROXY_SERVER_NAME_MIN_LENGTH = 16;
 /** What the Codex hook answers for an `mcp__*` server that is not the proxy. Approval cannot fix it; configuration can. */
 export const CODEX_MCP_NOT_PROXIED_REASON =
@@ -157,9 +162,21 @@ export interface ApprovalResult {
 export type Phase = "intent" | "outcome";
 export interface Outcome { status: "ok" | "error" | "blocked"; errorClass?: string; durationMs?: number; }
 
+/**
+ * Present only on the hook's `handoff-to-proxy` intent record (Codex, ADR-006, spec v2.1): the hook saw a call for the
+ * proxy's tool and handed the decision to the proxy without classifying it. `policy` on such a record is
+ * `{ verdict: "allow", risk: "unreviewed", ruleId: "handoff-to-proxy:<proxyServerName>", reason: HANDOFF_TO_PROXY_REASON }`.
+ * The report reconciles every handoff with the proxy's record for the same callId and flags the ones with none.
+ */
+export interface ProxyHandoff { kind: "to-proxy"; proxyServerName: string; }
+export const HANDOFF_TO_PROXY_RULE_PREFIX = "handoff-to-proxy:" as const;
+export const HANDOFF_TO_PROXY_REASON = "agent-ledger: tool of the Agent Ledger proxy; the proxy decides and records this call with raw upstream identity" as const;
+
 export interface LedgerRecord {
   id: string; phase: Phase; call: ToolCall;
   policy: PolicyDecision; approval?: ApprovalResult; outcome?: Outcome;
+  /** Only on a `handoff-to-proxy` intent record (hook, Codex). Absent everywhere else. */
+  handoff?: ProxyHandoff;
   /** Id of the previous record; null on the genesis record (draft-sharif `parent_record_id`). */
   parentRecordId: string | null;
   /**
@@ -195,8 +212,9 @@ export const HOOK_DECISIONS = ["allow", "deny", "ask"] as const;
 /**
  * `decided`: the pipeline classified the call against the registry and wrote (or tried to write) the intent record.
  * `governed-by-proxy` (Codex only, ADR-006): the call is a tool of the Agent Ledger proxy, Codex's one MCP server; the
- * proxy makes the real decision with raw upstream identity and records it, so the hook answers `allow` and writes NO
- * record (no double-recording). Never used for a built-in tool and never under Claude Code.
+ * proxy makes the real decision with raw upstream identity and records it, so the hook answers `allow` and writes
+ * only a `handoff-to-proxy` intent record (`LedgerRecord.handoff`; no classification, no double-counting of the
+ * decision). Never used for a built-in tool and never under Claude Code.
  */
 export const HOOK_DECISION_KINDS = ["decided", "governed-by-proxy"] as const;
 export type HookDecisionKind = (typeof HOOK_DECISION_KINDS)[number];

@@ -13,7 +13,7 @@ version: 1
 # `mcp__github__list_repos`). So every MCP server Codex uses is an UPSTREAM of the proxy, and the proxy is Codex's one
 # configured MCP server, under this name: Codex's hook-visible form ([A-Za-z0-9_], no leading/trailing `_`), at least 16
 # characters with a random suffix so it cannot be guessed, never also a `servers` key. A Codex hook call
-# `mcp__<serverName>__<tool>` is answered `allow` (governed-by-proxy: the proxy decided and recorded it); any other
+# `mcp__<serverName>__<tool>` is answered `allow` (governed-by-proxy: the proxy decides and records it; the hook writes a handoff-to-proxy record); any other
 # Codex `mcp__*` call is denied with "route this MCP server through the Agent Ledger proxy". Pair it with Codex's
 # managed requirements.toml `mcp_servers` allowlist (name AND identity must match, everything else is disabled) so a
 # local server named `<serverName>_` cannot borrow this allow.
