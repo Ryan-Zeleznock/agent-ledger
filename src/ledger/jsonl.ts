@@ -7,7 +7,7 @@ import type { DateRange, LedgerRecord, UnsealedRecord, VerifyResult } from "../t
 import type { LedgerStore } from "./contract.js";
 import { sha256Jcs } from "./hash.js";
 import { redactArgs } from "./redact.js";
-import { parseInstant, projectStored, projectUnsealed } from "./validate.js";
+import { assertJsonData, parseInstant, projectStored, projectUnsealed } from "./validate.js";
 
 /**
  * Append-only JSONL ledger (local mode, spec §3, §5, §9). One record per line, stored in its RFC 8785 form, so the
@@ -149,12 +149,18 @@ function parseStored(raw: string): { rec: LedgerRecord; err?: undefined } | { re
 
 // ---------- sealing ----------
 
-/** Validate + project (nothing unnamed survives), redact args, then seal. */
+/**
+ * Validate + project (nothing unnamed survives), redact args, re-validate the REDACTED args against the storage limits
+ * (redaction can expand text: `a@b.co` → `[REDACTED:email]`; a record the store could not read back must never be
+ * written; re-review P1 "successful append can disable subsequent appends"), then seal.
+ */
 function seal(record: UnsealedRecord, tail: Tail): LedgerRecord {
   const u = projectUnsealed(record);
+  const args = redactArgs(u.call.args);
+  try { assertJsonData(args, "record.call.args"); } catch (e) { throw new Error(`ledger.append: after redaction, ${message(e).replace(/^ledger: /, "")}; nothing was written`); }
   const preimage: Omit<LedgerRecord, "hash"> = {
     ...u,
-    call: { ...u.call, args: redactArgs(u.call.args) },
+    call: { ...u.call, args },
     parentRecordId: tail.id,
     prevHash: tail.hash,
     writtenAt: new Date().toISOString(),
@@ -166,6 +172,9 @@ function seal(record: UnsealedRecord, tail: Tail): LedgerRecord {
 
 export class JsonlLedger implements LedgerStore {
   private queue: Promise<unknown> = Promise.resolve();
+  /** Ids seen in the file up to `idsOffset` bytes (re-review P2 "append permits duplicate IDs"); refreshed under the lock. */
+  private ids: Set<string> | null = null;
+  private idsOffset = 0;
 
   constructor(private readonly path: string) {
     if (typeof path !== "string" || path.length === 0) throw new Error("ledger: jsonl target must be a file path");
@@ -191,14 +200,42 @@ export class JsonlLedger implements LedgerStore {
     return { id: p.rec.id, hash };
   }
 
+  /**
+   * Brings the id index up to `size` by reading only the bytes appended since the last refresh (amortised linear over
+   * the ledger's life). Called under the lock, after `readTail()` proved the file ends with "\n", so `size` is a line
+   * boundary. A shrunken file (rewritten) triggers a full rescan. Malformed lines are skipped here; verify() reports them.
+   */
+  private refreshIds(size: number): Set<string> {
+    if (this.ids === null || size < this.idsOffset) { this.ids = new Set(); this.idsOffset = 0; }
+    if (size > this.idsOffset) {
+      const fd = openSync(this.path, "r");
+      const buf = Buffer.alloc(size - this.idsOffset);
+      try { readSync(fd, buf, 0, buf.length, this.idsOffset); } finally { closeSync(fd); }
+      for (const line of buf.toString("utf8").split("\n")) {
+        if (line.length === 0) continue;
+        try {
+          const p: unknown = JSON.parse(line);
+          if (typeof p === "object" && p !== null && typeof (p as { id?: unknown }).id === "string") this.ids.add((p as { id: string }).id);
+        } catch { /* verify() reports it */ }
+      }
+      this.idsOffset = size;
+    }
+    return this.ids;
+  }
+
   append(record: UnsealedRecord): Promise<LedgerRecord> {
     return this.serialize(async () => {
       const timeoutMs = lockTimeoutMs();
       mkdirSync(dirname(this.path), { recursive: true }); // the lock file lives next to the ledger
       const release = await acquireLock(`${this.path}.lock`, timeoutMs);
       try {
-        const sealed = seal(record, this.readTail());
+        const tail = this.readTail();
+        const ids = this.refreshIds(fileSize(this.path));
+        const sealed = seal(record, tail);
+        if (ids.has(sealed.id)) throw new Error(`ledger.append: duplicate id ${JSON.stringify(sealed.id)}; ids must be unique per ledger (replay or caller bug); nothing was written`);
         appendLine(this.path, `${canonicalize(sealed)!}\n`);
+        ids.add(sealed.id);
+        this.idsOffset = fileSize(this.path);
         return sealed;
       } finally {
         release();

@@ -287,6 +287,49 @@ describe("createLedger('jsonl'): strict evidence validation (Astra #9, #10)", ()
   });
 });
 
+describe("createLedger('jsonl'): re-review P1/P2 (integrity, size, duplicate ids)", () => {
+  it("P1 integrity: a field injected into a STORED line (hash untouched) breaks verify(), head() and append()", async () => {
+    const { ledger } = await appendN(2);
+    const raw = lines();
+    const injected = JSON.parse(raw[1]!) as Record<string, Record<string, unknown>>;
+    injected.policy!.credential = "UNHASHED-SECRET";
+    writeFileSync(path, `${raw[0]}\n${JSON.stringify(injected)}\n`);
+    expect(await ledger.verify()).toEqual({ ok: false, checked: 2, brokenAt: "rec-2" });
+    await expect(ledger.head()).rejects.toThrow(/unknown field/);
+    await expect(ledger.append(unsealed(3))).rejects.toThrow(/unknown field/);
+    // the same at the top level and inside call
+    const top = JSON.parse(raw[1]!) as Record<string, unknown>; top.extra = 1;
+    writeFileSync(path, `${raw[0]}\n${JSON.stringify(top)}\n`);
+    expect(await ledger.verify()).toEqual({ ok: false, checked: 2, brokenAt: "rec-2" });
+    const call = JSON.parse(raw[1]!) as Record<string, Record<string, unknown>>; call.call!.credential = { kind: "api_key", value: "x" };
+    writeFileSync(path, `${raw[0]}\n${JSON.stringify(call)}\n`);
+    expect(await ledger.verify()).toEqual({ ok: false, checked: 2, brokenAt: "rec-2" });
+  });
+
+  it("P1 size: a record whose REDACTED args exceed the storage limits is rejected before writing; the file is untouched and stays usable", async () => {
+    const { ledger } = await appendN(1);
+    const before = readFileSync(path);
+    await expect(ledger.append(unsealed(2, { text: "a@b.co ".repeat(35_000) }))).rejects.toThrow(/after redaction.*longer than.*nothing was written/s);
+    expect(readFileSync(path).equals(before)).toBe(true);
+    const r3 = await ledger.append(unsealed(3));
+    expect(r3.parentRecordId).toBe("rec-1");
+    expect(await ledger.verify()).toEqual({ ok: true, checked: 2 });
+    expect(await ledger.head()).toBe(r3.hash);
+  });
+
+  it("P2 duplicate ids: the second append of an id is refused under the lock, also from another store instance, and after reopen", async () => {
+    const a = createLedger("jsonl", path); const b = createLedger("jsonl", path);
+    await a.append(unsealed(1));
+    await expect(a.append(unsealed(1))).rejects.toThrow(/duplicate id "rec-1"/);
+    await expect(b.append(unsealed(1))).rejects.toThrow(/duplicate id "rec-1"/);
+    await b.append(unsealed(2));
+    await expect(a.append(unsealed(2))).rejects.toThrow(/duplicate id "rec-2"/);
+    await expect(createLedger("jsonl", path).append(unsealed(1))).rejects.toThrow(/duplicate id/);
+    expect(await a.verify()).toEqual({ ok: true, checked: 2 });
+    expect(lines().length).toBe(2);
+  });
+});
+
 describe("createLedger('jsonl'): residual limit (Astra #13)", () => {
   it("a FULL re-chain by whoever can write the file passes verify(); only a comparison with an independently kept anchor catches it", async () => {
     const { createAnchor } = await import("../src/anchor/contract.js");

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseInstant, assertJsonData, projectUnsealed, projectStored, ValidationError, MAX_DEPTH } from "../src/ledger/validate.js";
+import { parseInstant, assertJsonData, snapshotJsonData, projectUnsealed, projectStored, ValidationError, MAX_DEPTH } from "../src/ledger/validate.js";
 import { unsealed, sealedWithoutHash } from "./helpers/ledger-fixtures.js";
 import { hashRecord } from "../src/ledger/contract.js";
 
@@ -8,8 +8,15 @@ describe("parseInstant (Astra #12: explicit offset, real calendar)", () => {
     expect(parseInstant("2026-09-30T00:00:00Z", "t")).toBe(Date.UTC(2026, 8, 30));
     expect(parseInstant("2026-09-30T02:00:00+02:00", "t")).toBe(Date.UTC(2026, 8, 30));
     expect(parseInstant("2026-09-29T19:00:00.250-05:00", "t")).toBe(Date.UTC(2026, 8, 30, 0, 0, 0, 250));
-    expect(parseInstant("2026-09-30T00:00:00.123456789Z", "t")).toBe(Date.UTC(2026, 8, 30, 0, 0, 0, 123));
+    expect(parseInstant("2026-09-30T00:00:00.1Z", "t")).toBe(Date.UTC(2026, 8, 30, 0, 0, 0, 100));
     expect(parseInstant(new Date().toISOString(), "t")).toBeTypeOf("number");
+  });
+  it("re-review: refuses leap seconds (:60) instead of shifting them, and more than 3 fractional digits instead of losing their order", () => {
+    expect(() => parseInstant("2026-09-30T12:34:60Z", "t")).toThrow(/leap second/);
+    expect(() => parseInstant("2026-12-31T23:59:60Z", "t")).toThrow(/leap second/);
+    expect(() => parseInstant("2026-09-30T00:00:00.0001Z", "t")).toThrow(/fractional digits/);
+    expect(() => parseInstant("2026-09-30T00:00:00.000000001Z", "t")).toThrow(/fractional digits/);
+    expect(parseInstant("2026-09-30T00:00:00.001Z", "t")).toBeGreaterThan(parseInstant("2026-09-30T00:00:00.000Z", "t"));
   });
   it("rejects timezone-free, impossible-calendar, epoch-like and non-string values whatever the host TZ", () => {
     const prev = process.env.TZ;
@@ -49,6 +56,25 @@ describe("assertJsonData (Astra #5: JSON-only boundary; #6: limits)", () => {
     ];
     for (const [name, v] of cases) expect(() => assertJsonData(v, "args"), name).toThrow(ValidationError);
   });
+  it("re-review: never invokes getters: array index accessors, Proxies, holes and extra array properties are rejected; the result is a snapshot", () => {
+    let reads = 0;
+    const arr: unknown[] = ["safe"];
+    Object.defineProperty(arr, 1, { get() { reads++; return reads <= 2 ? "safe" : { toJSON() { return { password: "RAW" }; } }; }, enumerable: true, configurable: true });
+    expect(() => snapshotJsonData({ arr }, "args")).toThrow(/accessor/);
+    expect(reads).toBe(0);
+    expect(() => snapshotJsonData({ p: new Proxy([1, 2], {}) }, "args")).toThrow(/Proxy/);
+    expect(() => snapshotJsonData({ p: new Proxy({ a: 1 }, {}) }, "args")).toThrow(/Proxy/);
+    const sparse = [1, , 3]; // eslint-disable-line no-sparse-arrays
+    expect(() => snapshotJsonData({ sparse }, "args")).toThrow(/sparse|hole/);
+    const extra = [1, 2] as unknown[] & { foo?: string }; extra.foo = "x";
+    expect(() => snapshotJsonData({ extra }, "args")).toThrow(/extra properties/);
+    const src = { a: [{ b: "c" }] };
+    const snap = snapshotJsonData(src, "args") as typeof src;
+    expect(snap).toEqual(src);
+    src.a[0]!.b = "mutated";
+    expect(snap.a[0]!.b).toBe("c");
+  });
+
   it("rejects nesting deeper than MAX_DEPTH and oversize strings before any expensive processing", () => {
     let deep: unknown = "leaf";
     for (let i = 0; i < MAX_DEPTH + 2; i++) deep = [deep];
@@ -82,6 +108,25 @@ describe("projectUnsealed / projectStored (Astra #1, #9)", () => {
     expect(bad((r) => { (r.call as Record<string, unknown>).args = [1]; })).toThrow(/args/);
     expect(bad((r) => { r.id = ""; })).toThrow(/id/);
   });
+  it("re-review P1: projectStored REJECTS unknown fields at every level, so an injected field can never be dropped before hashing", () => {
+    const rec = sealedWithoutHash(1);
+    const full = { ...rec, hash: hashRecord(rec), approval: undefined, outcome: { status: "ok" as const }, handoff: { kind: "to-proxy" as const, proxyServerName: "agentledger_abc123def456" } };
+    delete (full as { approval?: unknown }).approval;
+    const withHash = { ...full, hash: hashRecord(full) };
+    expect(projectStored(withHash)).toEqual(withHash);
+    const inject = (mut: (r: Record<string, unknown>) => void) => { const r = structuredClone(withHash) as unknown as Record<string, unknown>; mut(r); return () => projectStored(r); };
+    expect(inject((r) => { r.credential = "UNHASHED"; })).toThrow(/record has unknown field\(s\): credential/);
+    expect(inject((r) => { (r.policy as Record<string, unknown>).credential = "UNHASHED-SECRET"; })).toThrow(/record\.policy has unknown field/);
+    expect(inject((r) => { (r.call as Record<string, unknown>).credential = { kind: "api_key", value: "x" }; })).toThrow(/record\.call has unknown field/);
+    expect(inject((r) => { (r.outcome as Record<string, unknown>).note = "x"; })).toThrow(/record\.outcome has unknown field/);
+    expect(inject((r) => { (r.handoff as Record<string, unknown>).extra = 1; })).toThrow(/record\.handoff has unknown field/);
+    expect(inject((r) => { r.approval = { callId: "c", decision: "approved", decidedAt: "2026-09-30T12:00:00Z", channel: "slack", rawArgs: {} }; })).toThrow(/record\.approval has unknown field/);
+    // append stays lenient: the same junk is DROPPED there, never stored
+    const dirty = structuredClone(withHash) as unknown as Record<string, unknown>;
+    (dirty.policy as Record<string, unknown>).credential = "x";
+    expect(JSON.stringify(projectUnsealed(dirty))).not.toContain("credential");
+  });
+
   it("projectStored requires the four sealed fields to be well-formed and genesis-consistent", () => {
     const rec = sealedWithoutHash(1);
     const full = { ...rec, hash: hashRecord(rec) };
