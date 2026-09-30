@@ -139,7 +139,21 @@ const oneOf = <T extends string>(v: unknown, allowed: readonly T[], field: strin
   if (typeof v !== "string" || !allowed.includes(v as T)) return fail(field, `must be one of ${allowed.join("|")}`);
   return v as T;
 };
-const obj = (v: unknown, field: string): Record<string, unknown> => (isPlainObject(v) ? v : fail(field, "must be a plain object"));
+/**
+ * A contract object as a plain SNAPSHOT: prototype checked, Proxy refused, every own property read once through its
+ * descriptor (accessors refused), so the values validated are the values sealed (round 3: `outcome.durationMs` getter).
+ */
+const obj = (v: unknown, field: string): Record<string, unknown> => {
+  if (!isPlainObject(v)) return fail(field, "must be a plain object");
+  if (types.isProxy(v)) return fail(field, "is a Proxy, not data");
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(v)) {
+    const desc = Object.getOwnPropertyDescriptor(v, key)!;
+    if (!("value" in desc)) fail(`${field}.${key}`, "is an accessor property, not data");
+    Object.defineProperty(out, key, { value: desc.value, enumerable: true, writable: true, configurable: true });
+  }
+  return out;
+};
 const instant = (v: unknown, field: string): string => { parseInstant(v, field); return v as string; };
 const withOpt = <T extends object>(base: T, extras: Record<string, unknown>): T => {
   for (const [k, val] of Object.entries(extras)) if (val !== undefined) (base as Record<string, unknown>)[k] = val;

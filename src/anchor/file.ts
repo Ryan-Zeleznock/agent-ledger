@@ -20,19 +20,25 @@ const ALLOWED_KEYS = new Set(["hash", "at"]);
 const LOCK_TIMEOUT_ENV = "AGENT_LEDGER_LOCK_TIMEOUT_MS";
 const LOCK_TIMEOUT_DEFAULT_MS = 5_000;
 const LOCK_RETRY_MS = 5;
-const RFC3339 = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?([Zz]|[+-]\d{2}:\d{2})$/;
+const RFC3339 = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?([Zz]|[+-]\d{2}:\d{2})$/;
 
 const isErrno = (e: unknown, code: string) => typeof e === "object" && e !== null && (e as { code?: string }).code === code;
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-/** RFC 3339 with explicit offset and a real calendar day; the same rule as the ledger's `parseInstant`. */
+/**
+ * RFC 3339 with explicit offset, a real calendar day, seconds <= 59 (no leap seconds: ECMAScript time cannot represent
+ * them) and at most 3 fractional digits (millisecond precision keeps ordering exact): the SAME rule as the ledger's
+ * `parseInstant` (ledger README "Timestamps"; round 3 made the anchor match it).
+ */
+const MAX_FRACTION_DIGITS = 3;
 function isInstant(v: unknown): boolean {
   if (typeof v !== "string") return false;
   const m = RFC3339.exec(v);
   if (!m) return false;
   const [y, mo, d, h, mi, s] = [m[1], m[2], m[3], m[4], m[5], m[6]].map(Number) as number[];
-  if (mo! < 1 || mo! > 12 || d! < 1 || h! > 23 || mi! > 59 || s! > 60) return false;
+  if (mo! < 1 || mo! > 12 || d! < 1 || h! > 23 || mi! > 59 || s! > 59) return false;
+  if (m[7] !== undefined && m[7].length > MAX_FRACTION_DIGITS) return false;
   const check = new Date(Date.UTC(y!, mo! - 1, d!));
   if (check.getUTCFullYear() !== y || check.getUTCMonth() !== mo! - 1 || check.getUTCDate() !== d) return false;
   const off = m[8]!;

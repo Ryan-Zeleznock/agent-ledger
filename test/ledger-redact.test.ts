@@ -18,13 +18,13 @@ describe("ledger.redact: key layer (spec §9)", () => {
     gone(out, "hunter2", "dXNlcjpwYXNz", "fullwidth");
   });
   it("keeps ordinary field names and values intact", () => {
-    const args = { path: "/tmp/a.txt", count: 3, ok: true, none: null, sort_key: "name", author: "ryan", tokens: 42 };
+    const args = { path: "/tmp/a.txt", count: 3, ok: true, none: null, sort_key: "name", author: "ryan", notes: 42, keyboard: "x" };
     expect(redact(args)).toEqual(args);
   });
   it("redacts a whole non-string value under a secret key; the placeholder names OUR keyword, never the caller's key", () => {
     const out = redact({ credentials: { user: "u", pass: "p" }, tokens_list: ["a", "b"], [`${GH}_password`]: "x" });
     expect(out.credentials).toBe("[REDACTED:key:credentials]");
-    expect(out.tokens_list).toEqual(["a", "b"]);
+    expect(out.tokens_list).toBe("[REDACTED:key:token]"); // round 3: keys CONTAINING a sensitive word are redacted
     gone(out, GH);
     expect(Object.keys(out)).toContain("[REDACTED:key#1]");
     expect(out["[REDACTED:key#1]"]).toBe("[REDACTED:key:password]");
@@ -51,7 +51,7 @@ describe("ledger.redact: nested structures", () => {
   });
   it("Astra #4: argv pairs, header triples and name/value header objects", () => {
     const out = redact({
-      argv: ["curl", "--password", "hunter2", "-u", "user", "--token=abc", "--verbose"],
+      argv: ["curl", "--password", "hunter2", "-H", "x: y", "--token=abc", "--verbose"],
       header: ["Authorization", "Bearer", "opaqueCredential"],
       header2: ["X-Api-Key", "k123"],
       obj: { name: "Authorization", value: "opaqueCredential2" },
@@ -61,6 +61,7 @@ describe("ledger.redact: nested structures", () => {
     gone(out, "hunter2", "opaqueCredential", "k123", "sid=abc", "--token=abc");
     expect((out.argv as string[])[0]).toBe("curl");
     expect((out.argv as string[])[6]).toBe("--verbose");
+    expect((out.argv as string[])[4]).toBe("x: y");
     expect(out.header).toEqual(["Authorization", "Bearer", "[REDACTED:pair]"]);
     expect((out.benign as { value: string }).value).toBe("text/html");
   });
@@ -79,7 +80,7 @@ describe("ledger.redact: free text (Astra #2)", () => {
     });
     gone(out, "two word secret", "alpha,beta", "escaped", "hunter2", "unterminated secret");
     expect(out.a).toBe('password="[REDACTED:assignment]" next=1');
-    expect(out.d).toBe("DB_PASSWORD=[REDACTED:assignment] && echo ok");
+    expect(out.d).toBe("DB_PASSWORD=[REDACTED:assignment]"); // round 3: unquoted values run to the end of the line
     expect(out.f).toBe("password: [REDACTED:assignment]\nuser: ryan");
   });
   it("redacts JSON carried inside a string structurally", () => {
@@ -99,15 +100,18 @@ describe("ledger.redact: free text (Astra #2)", () => {
     expect(out.e).toBe("token=[REDACTED:assignment]");
   });
   it("redacts well-known token shapes inside free text, keeping the surrounding text", () => {
-    const cmd = `curl -H "Authorization: Bearer ${JWT}" https://api.example.com && echo ${AWS_KEY} && export AWS_SECRET_ACCESS_KEY=${AWS_SECRET} && echo ${GH} sk-abcdefghijklmnopqrstuvwxyz012345 xoxb-1234567890-abcdefghijklmnop AIzaSyA-abcdefghijklmnopqrstuvwxyz01234 ${JWT}`;
-    const out = redact({ command: cmd }).command as string;
+    const cmd = `curl -H "Authorization: Bearer ${JWT}" https://api.example.com && echo ${AWS_KEY} ${GH} sk-abcdefghijklmnopqrstuvwxyz012345 xoxb-1234567890-abcdefghijklmnop AIzaSyA-abcdefghijklmnopqrstuvwxyz01234 ${JWT}`;
+    const env = `export AWS_SECRET_ACCESS_KEY=${AWS_SECRET} && echo done`;
+    const both = redact({ command: cmd, env });
+    const out = both.command as string;
+    expect(both.env).toBe("export AWS_SECRET_ACCESS_KEY=[REDACTED:assignment]");
     expect(out).toContain("curl -H");
     expect(out).toContain("https://api.example.com");
     gone(out, "SflKxwRJ", AWS_KEY, "wJalrXUtnFEMI", "ghp_ABCDEF", "sk-abcdef", "xoxb-1234", "AIzaSyA-");
-    expect(out).toMatch(/\[REDACTED:bearer\]/);
+    expect(out).toContain('"Authorization: [REDACTED:assignment]"'); // whole header value, whatever the scheme
     expect(out).toMatch(/\[REDACTED:aws-access-key-id\]/);
     expect(out).toMatch(/\[REDACTED:jwt\]/);
-    expect(out).toMatch(/AWS_SECRET_ACCESS_KEY=\[REDACTED:assignment\]/);
+    expect(out).toMatch(/\[REDACTED:github-token\].*\[REDACTED:sk-token\].*\[REDACTED:slack-token\].*\[REDACTED:google-api-key\]/);
   });
   it("redacts PEM private key blocks, URL credentials and secret query parameters", () => {
     const out = redact({ key: PEM, url: "postgres://admin:S3cret!@db.internal:5432/app", note: `see ${PEM} end`, q: "https://h.example/cb?access_token=abc&state=xyz" });
@@ -139,8 +143,8 @@ describe("ledger.redact: re-review cases (Astra 2026-09-30, round 2)", () => {
   it("P1: a scheme inside an assignment value, with or without a space, loses its credential", () => {
     const out = redact({ a: "authorization:bearer opaqueCredential", b: "Authorization:Basic dXNlcjpwYXNz", c: "x-auth-token: Bearer tok123 tail" });
     gone(out, "opaqueCredential", "dXNlcjpwYXNz", "tok123");
-    expect(out.a).toBe("authorization:bearer [REDACTED:bearer]");
-    expect(out.c).toBe("x-auth-token: Bearer [REDACTED:bearer] tail");
+    expect(out.a).toBe("authorization:[REDACTED:assignment]");
+    expect(out.c).toBe("x-auth-token: [REDACTED:assignment]");
   });
   it("P1: words over 1 KiB are replaced whole, wherever they are (value, key, URL userinfo), never left unscanned", () => {
     const long = "x".repeat(1024) + "/ghp_" + "A".repeat(36);
@@ -194,6 +198,48 @@ describe("ledger.redact: re-review cases (Astra 2026-09-30, round 2)", () => {
     gone(out, "two words", "abc123", '"b\\"', "unterminated");
     expect(out.b).toBe("it's fine, don't panic; the Bearer [REDACTED:bearer] must go");
     expect(out.e).toBe("note: nothing secret here");
+  });
+});
+
+describe("ledger.redact: round-3 common formats (Astra 2026-09-30), one table", () => {
+  const CRED = "opaqueCredential";
+  const cases: [string, string, string[]][] = [
+    // [name, input, secrets that must be gone]
+    ["Authorization: ApiKey", `Authorization: ApiKey ${CRED}`, [CRED]],
+    ["Authorization: Token", `Authorization: Token ${CRED}`, [CRED]],
+    ["Authorization: Bearer", `Authorization: Bearer ${CRED}`, [CRED]],
+    ["Cookie header, every cookie", "Cookie: session=first; csrf=second", ["first", "second"]],
+    ["Set-Cookie", "Set-Cookie: sid=abc; Path=/; HttpOnly", ["abc"]],
+    ["env PASSWORD with comma", "PASSWORD=alpha,beta", ["alpha", "beta"]],
+    ["env PASS", `PASS=${CRED}`, [CRED]],
+    ["env DATABASE_URL userinfo", `DATABASE_URL=postgres://user:${CRED}@localhost/db`, [CRED, "user:"]],
+    ["env line with trailing shell", `export TOKEN=${CRED} && echo done`, [CRED]],
+    ["JSON key contains password", JSON.stringify({ db_password_value: CRED }), [CRED]],
+    ["JSON key contains api_key", JSON.stringify({ api_key_value: CRED }), [CRED]],
+    ["URL userinfo with comma", "https://user:alpha,beta@localhost/path", ["alpha", "beta", "user:"]],
+    ["URL api_key param with comma", "https://host/?api_key=alpha,beta&x=1", ["alpha", "beta"]],
+    ["URL pwd param", `https://host/?pwd=${CRED}`, [CRED]],
+    ["URL token param before fragment", `https://host/p?token=${CRED}#frag`, [CRED]],
+    ["CLI --password with comma", "--password alpha,beta", ["alpha", "beta"]],
+    ["CLI --password dash value", `--password -${CRED}`, [CRED]],
+    ["CLI --auth", `--auth ${CRED}`, [CRED]],
+    ["CLI -p", `mysql -p ${CRED} -h db`, [CRED]],
+    ["CLI --token=", `--token=${CRED}`, [CRED]],
+    ["header object Cookie", JSON.stringify({ name: "Cookie", value: "a=b; c=d" }), ["a=b", "c=d"]],
+    ["quoted value stays bounded by its quotes", `password="line one\nline two" user=u`, ["line one", "line two"]],
+  ];
+  it.each(cases)("%s", (_name, input, secrets) => {
+    const out = redact({ s: input, arr: [input], nested: { deep: input } });
+    gone(out, ...secrets);
+    expect(redact(out)).toEqual(out); // idempotent
+  });
+  it("keeps what should stay: header/flag names, URL host and path, other query params, the next line", () => {
+    const out = redact({ a: "Authorization: ApiKey x\nAccept: */*", b: "https://host/path?api_key=k&page=2", c: "DATABASE_URL=postgres://u:p@localhost/db", d: ["mysql", "-p", "x", "-h", "db"], e: `password="line one\nline two" user=u` });
+    expect(out.a).toBe("Authorization: [REDACTED:assignment]\nAccept: */*");
+    expect(out.b).toBe("https://host/path?api_key=[REDACTED:assignment]&page=2");
+    expect(out.c).toBe("DATABASE_URL=postgres://[REDACTED:url-credentials]@localhost/db");
+    expect(out.d).toEqual(["mysql", "-p", "[REDACTED:pair]", "-h", "db"]);
+    expect(out.e).toBe('password="[REDACTED:assignment]" user=u');
   });
 });
 

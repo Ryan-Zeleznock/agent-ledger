@@ -127,6 +127,21 @@ describe("projectUnsealed / projectStored (Astra #1, #9)", () => {
     expect(JSON.stringify(projectUnsealed(dirty))).not.toContain("credential");
   });
 
+  it("round 3: every contract object is a descriptor snapshot: accessors and Proxies are rejected at any level, getters never run", () => {
+    let reads = 0;
+    const r = structuredClone(unsealed(1)) as unknown as Record<string, unknown>;
+    r.outcome = Object.defineProperty({ status: "ok" }, "durationMs", { get() { reads++; return 1; }, enumerable: true });
+    expect(() => projectUnsealed(r)).toThrow(/outcome\.durationMs is an accessor/);
+    expect(reads).toBe(0);
+    expect(() => projectUnsealed(new Proxy(structuredClone(unsealed(1)), {}))).toThrow(/Proxy/);
+    const r2 = structuredClone(unsealed(1)) as unknown as Record<string, unknown>;
+    r2.approval = new Proxy({ callId: "c", decision: "approved", decidedAt: "2026-09-30T12:00:00Z", channel: "slack" }, {});
+    expect(() => projectUnsealed(r2)).toThrow(/approval is a Proxy/);
+    const r3 = structuredClone(unsealed(1)) as unknown as { policy: Record<string, unknown> };
+    Object.defineProperty(r3.policy, "verdict", { get: () => "allow", enumerable: true });
+    expect(() => projectUnsealed(r3)).toThrow(/policy\.verdict is an accessor/);
+  });
+
   it("projectStored requires the four sealed fields to be well-formed and genesis-consistent", () => {
     const rec = sealedWithoutHash(1);
     const full = { ...rec, hash: hashRecord(rec) };

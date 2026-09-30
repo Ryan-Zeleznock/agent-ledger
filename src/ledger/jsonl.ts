@@ -138,13 +138,23 @@ function fileSize(path: string): number {
 
 const endsWithNewline = (path: string, size: number) => size === 0 || readLastLine(path, size).complete;
 
-/** Parses and strictly validates one stored line; returns the record or the reason it is not one. */
+/**
+ * Parses and strictly validates one stored line; returns the record or the reason it is not one. The line must be
+ * EXACTLY the RFC 8785 serialisation of the validated record (round 3): that one rule rejects duplicate member names
+ * (JSON.parse keeps the last, so a duplicate could carry unhashed text), whitespace, and reordering, so the bytes on
+ * disk are exactly the bytes the hash covers.
+ */
 function parseStored(raw: string): { rec: LedgerRecord; err?: undefined } | { rec?: undefined; err: string; id?: string } {
   if (raw.length === 0) return { err: "blank line" };
   let parsed: unknown;
   try { parsed = JSON.parse(raw); } catch { return { err: "not JSON" }; }
   const id = typeof parsed === "object" && parsed !== null && typeof (parsed as { id?: unknown }).id === "string" ? (parsed as { id: string }).id : undefined;
-  try { return { rec: projectStored(parsed) }; } catch (e) { return { err: message(e), ...(id !== undefined && { id }) }; }
+  let rec: LedgerRecord;
+  try { rec = projectStored(parsed); } catch (e) { return { err: message(e), ...(id !== undefined && { id }) }; }
+  let canonical: string | undefined;
+  try { canonical = canonicalize(rec); } catch (e) { return { err: `not canonicalisable: ${message(e)}`, id: rec.id }; }
+  if (canonical !== raw) return { err: "line is not the canonical (RFC 8785) serialisation of its record: duplicate members, whitespace or reordering", id: rec.id };
+  return { rec };
 }
 
 // ---------- sealing ----------
@@ -166,6 +176,20 @@ function seal(record: UnsealedRecord, tail: Tail): LedgerRecord {
     writtenAt: new Date().toISOString(),
   };
   return { ...preimage, hash: sha256Jcs(preimage) };
+}
+
+/**
+ * The exact line to write, proven readable first (round 3): the sealed record is serialised, then pushed through the
+ * SAME strict read path (`parseStored`) and its hash recomputed. Only bytes that verify() will accept are written.
+ */
+function sealedLine(sealed: LedgerRecord): string {
+  const line = canonicalize(sealed);
+  if (typeof line !== "string") throw new Error("ledger.append: sealed record has no JSON representation; nothing was written");
+  const p = parseStored(line);
+  if (p.err !== undefined) throw new Error(`ledger.append: sealed record fails stored validation (${p.err}); nothing was written`);
+  const { hash, ...preimage } = p.rec;
+  if (sha256Jcs(preimage) !== hash || hash !== sealed.hash) throw new Error("ledger.append: sealed record does not re-hash to itself; nothing was written");
+  return `${line}\n`;
 }
 
 // ---------- the store ----------
@@ -233,7 +257,8 @@ export class JsonlLedger implements LedgerStore {
         const ids = this.refreshIds(fileSize(this.path));
         const sealed = seal(record, tail);
         if (ids.has(sealed.id)) throw new Error(`ledger.append: duplicate id ${JSON.stringify(sealed.id)}; ids must be unique per ledger (replay or caller bug); nothing was written`);
-        appendLine(this.path, `${canonicalize(sealed)!}\n`);
+        const line = sealedLine(sealed);
+        appendLine(this.path, line);
         ids.add(sealed.id);
         this.idsOffset = fileSize(this.path);
         return sealed;

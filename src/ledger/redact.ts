@@ -1,25 +1,29 @@
 import { assertJsonData, MAX_DEPTH } from "./validate.js";
 
 /**
- * Redaction of tool arguments before hashing and storage (spec §9). Rewritten after Astra's reviews (2026-09-30).
+ * Redaction of tool arguments before hashing and storage (spec §9). Rewritten after Astra's reviews (2026-09-30, three rounds).
  * DESIGN NOTE: redaction is best-effort defence in depth. Pattern matching cannot prove the absence of a secret, so the
  * ledger never relies on it as its only control: the pipeline strips credentials by projection (spec §5), the
  * JSON-only boundary (validate.ts) runs before AND after redaction, and over-redaction is the accepted failure direction.
  *
  * Three layers, applied at every nesting level of objects and arrays:
- *  1. KEY layer: a field whose (NFKC-normalised) name says "secret" has its WHOLE value replaced with a placeholder
- *     naming OUR keyword. A key that itself carries a secret shape is renamed `[REDACTED:key#n]` (collision-safe, Set-based).
- *  2. STRUCTURE layer: argv pairs (`["--password", "x"]`), header triples (`["Authorization", "Bearer", "x"]`) and
- *     name/value header objects (`{name: "Authorization", value: "x"}`).
+ *  1. KEY layer: a field whose (NFKC-normalised) name ends with, equals, or CONTAINS a sensitive word
+ *     (`db_password_value`, `api_key_value`) has its WHOLE value replaced with a placeholder naming OUR keyword. A key
+ *     that itself carries a secret shape is renamed `[REDACTED:key#n]` (collision-safe, Set-based).
+ *  2. STRUCTURE layer: argv pairs (`["--password", "x"]`, `["-p", "x"]`, next argument even if it starts with `-`),
+ *     header triples (`["Authorization", "Bearer", "x"]`) and name/value header objects (`{name: "Cookie", value: "x"}`).
  *  3. VALUE layer: a string that parses as JSON (within the remaining depth budget) is redacted structurally; every
- *     other string goes through a LINEAR, NON-RECURSIVE tokeniser (whitespace, words, placeholders, punctuation incl.
- *     quotes) and rules on the token stream: assignments `name=value` / `name: value` / `"name": "value"` /
- *     `name = value` / `--flag value` whose name carries a keyword (values may be quoted with escapes, multi-word,
- *     unterminated, or start with an auth scheme), auth schemes (case-insensitive), URL userinfo and query parameters,
- *     vendor token shapes, e-mail (hand-rolled), and ONE level of percent/base64/hex decoding when the decoded text
- *     itself carries a secret. Words longer than WORD_MAX are replaced whole (`[REDACTED:long-word]`): fail safe rather
- *     than leave them unscanned. On the whole string only linear scans run: PEM blocks (indexOf, no rescans) and
- *     bounded-quantifier regexes for SSNs and Luhn-valid card numbers.
+ *     other string goes through a LINEAR, NON-RECURSIVE tokeniser and format-aware rules (round 3):
+ *     - `NAME=VALUE` / `NAME: VALUE` / `"NAME": "VALUE"` / `NAME = VALUE` whose name is sensitive: a quoted value is
+ *       redacted to its closing quote (escape-aware; unterminated = to the end); an unquoted value is redacted to the
+ *       END OF THE LINE. That one boundary covers `Authorization: <any scheme> <cred>`, `Cookie: a=b; c=d`,
+ *       `PASSWORD=alpha,beta`, `PASS=x`, `?pwd=` and `TOKEN=x && echo` (the tail is lost: accepted over-redaction).
+ *     - CLI flags `--password`, `--token`, `--secret`, `--auth`, `-p`, ... : the next argument, even if it starts with `-`.
+ *     - URLs anywhere in a word (also inside `DATABASE_URL=...`): userinfo replaced entirely (commas included);
+ *       sensitive query parameters redacted up to the next `&` or `#`.
+ *     - auth schemes in prose (`Bearer x`), vendor token shapes, e-mail (hand-rolled), ONE level of percent/base64/hex
+ *       decoding when the decoded text carries a secret, words longer than WORD_MAX replaced whole, PEM blocks, SSNs,
+ *       Luhn-valid card numbers.
  * A placeholder `[REDACTED:<kind>]` counts only when it is the COMPLETE value. Inputs must be JSON data.
  */
 
@@ -31,30 +35,38 @@ export const WORD_MAX = 1024;         // longer words are replaced whole
 const JSON_IN_STRING_MAX = 64 * 1024;
 const DECODE_MAX = 64 * 1024;
 
-// ---------- key classification ----------
+// ---------- sensitivity ----------
 
 /** Normalised key ENDS WITH one of these → secret. Longest first so the reported keyword is the most specific. */
 const KEY_SUFFIXES = [
   "clientsecret", "credentials", "credential", "authorization", "passphrase", "privatekey", "accesskey", "secretkey",
   "setcookie", "password", "passwd", "apikey", "secret", "cookie", "token",
 ] as const;
-/** Normalised key EQUALS one of these → secret. Exact, so `sort_key` and `author` stay. */
+/** Normalised key EQUALS one of these → secret. */
 const KEY_EXACT = ["pwd", "pass", "auth", "bearer", "key", "ssn", "otp", "pin"] as const;
-/** Substrings that make an assignment NAME (in free text) or an argv flag secret-bearing. Containment, on purpose. */
-const NAME_KEYWORDS = ["password", "passwd", "passphrase", "secret", "token", "apikey", "privatekey", "accesskey", "authorization", "credential", "cookie"] as const;
+/** Normalised key or assignment name CONTAINS one of these → secret (`db_password_value`, `x-auth-token`, `?access_token=`). */
+const CONTAINS = ["password", "passwd", "passphrase", "secret", "token", "apikey", "privatekey", "accesskey", "authorization", "credential", "cookie"] as const;
+/** Bare CLI flag names (after the dashes) that take a secret as the NEXT argument. */
+const FLAG_EXACT = new Set(["p", "auth", "pass", "pwd", "key", "u"]);
 const SCHEMES = new Set(["bearer", "basic", "digest", "negotiate"]);
 
 const normalise = (s: string) => s.normalize("NFKC").toLowerCase().replace(/[-_.\s]/g, "");
-/** The keyword (from OUR lists, never the caller's text) that makes `key` secret, or null. */
-export function secretKeyword(key: string): string | null {
-  const k = normalise(key);
+/** The keyword (from OUR lists, never the caller's text) that makes `name` secret, or null. */
+export function secretKeyword(name: string): string | null {
+  const k = normalise(name);
   if ((KEY_EXACT as readonly string[]).includes(k)) return k;
   for (const s of KEY_SUFFIXES) if (k.endsWith(s)) return s;
+  for (const c of CONTAINS) if (k.includes(c)) return c;
   return null;
 }
-export const isSecretKey = (key: string) => secretKeyword(key) !== null;
-const nameHasKeyword = (name: string) => { const n = normalise(name); return NAME_KEYWORDS.some((k) => n.includes(k)); };
+export const isSecretKey = (name: string) => secretKeyword(name) !== null;
 const isScheme = (s: string) => SCHEMES.has(s.toLowerCase());
+/** `--password`, `-p`, `--auth`, `--db-token`: a flag whose next argument is a secret. */
+function flagIsSensitive(flag: string): boolean {
+  if (!/^--?[^\s=:]+$/.test(flag)) return false;
+  const bare = flag.replace(/^-+/, "");
+  return FLAG_EXACT.has(normalise(bare)) || secretKeyword(bare) !== null;
+}
 
 // ---------- whole-string passes (linear) ----------
 
@@ -65,7 +77,7 @@ function redactPem(s: string): string {
   for (;;) {
     const b = s.indexOf(BEGIN, i);
     if (b === -1) return out + s.slice(i);
-    const header = s.slice(b, b + 80); // "-----BEGIN <TYPE> PRIVATE KEY-----" fits; bounded window
+    const header = s.slice(b, b + 80);
     const h = header.indexOf(PK);
     if (h === -1 || header.slice(0, h).includes("\n")) { out += s.slice(i, b + BEGIN.length); i = b + BEGIN.length; continue; }
     out += s.slice(i, b) + PLACEHOLDER("private-key");
@@ -73,12 +85,12 @@ function redactPem(s: string): string {
     const end = noEndAfter !== -1 && noEndAfter <= bodyStart ? -1 : s.indexOf(END, bodyStart);
     if (end === -1) noEndAfter = bodyStart;
     const nextBegin = s.indexOf(BEGIN, bodyStart);
-    if (end === -1 && nextBegin === -1) return out;                // no footer, no further header: the rest is key body
-    if (end !== -1 && (nextBegin === -1 || end < nextBegin)) {      // proper footer
+    if (end === -1 && nextBegin === -1) return out;
+    if (end !== -1 && (nextBegin === -1 || end < nextBegin)) {
       const footer = s.slice(end, end + 80); const f = footer.indexOf(PK);
       i = f === -1 ? end + END.length : end + f + PK.length;
     } else {
-      i = nextBegin;                                                 // another header before any footer: body ran until it
+      i = nextBegin;
     }
   }
 }
@@ -100,7 +112,6 @@ function luhnValid(s: string): boolean {
 
 const WORD_PATTERNS: readonly { kind: string; re: RegExp }[] = [
   { kind: "jwt", re: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g },
-  // No trailing \b: a token glued to a suffix (`ghp_…_password`, `AKIA…:x`) is still a token.
   { kind: "aws-access-key-id", re: /\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ASCA)[0-9A-Z]{16}/g },
   { kind: "github-token", re: /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}/g },
   { kind: "stripe-key", re: /\b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{10,}/g },
@@ -108,12 +119,13 @@ const WORD_PATTERNS: readonly { kind: string; re: RegExp }[] = [
   { kind: "slack-token", re: /\bxox[abprs]-[A-Za-z0-9-]{10,}|\bxapp-[A-Za-z0-9-]{10,}/g },
   { kind: "google-api-key", re: /\bAIza[0-9A-Za-z_-]{35}/g },
 ];
-const URL_CRED_RE = /^([a-z][a-z0-9+.-]*:\/\/)([^/@]+)@/i;
+/** Unanchored: the URL may sit after `DATABASE_URL=`; userinfo runs to the `@` (commas and colons included), bounded by the word. */
+const URL_CRED_RE = /([a-z][a-z0-9+.-]*:\/\/)([^/@]+)@/i;
 
-const isLocalChar = (c: number) => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 46 || c === 95 || c === 37 || c === 43 || c === 45; // [A-Za-z0-9._%+-]
-const isDomainChar = (c: number) => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 46 || c === 45;          // [A-Za-z0-9.-]
+const isLocalChar = (c: number) => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 46 || c === 95 || c === 37 || c === 43 || c === 45;
+const isDomainChar = (c: number) => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 46 || c === 45;
 const isAlpha = (c: number) => (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
-/** Linear e-mail finder: expand around each `@` (a regex with `[...]+@` backtracks quadratically on long runs). */
+/** Linear e-mail finder: expand around each `@`. */
 function redactEmails(w: string): string {
   if (!w.includes("@")) return w;
   let out = ""; let i = 0; let from = 0;
@@ -140,9 +152,11 @@ function redactEmails(w: string): string {
 
 type TokType = "ws" | "word" | "punct" | "ph";
 interface Tok { t: TokType; s: string }
-const DELIMS = new Set([...'"\'`,;&|<>()[]{}']);
+/** `,` and `&` are word characters on purpose: values like `alpha,beta` and query strings `a=1&token=x` stay in one word. */
+const DELIMS = new Set([...'"\'`;|<>()[]{}']);
 const QUOTES = new Set(['"', "'", "`"]);
 const isWs = (c: string) => c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f" || c === "\v";
+const hasNewline = (s: string) => s.includes("\n") || s.includes("\r");
 
 function tokenize(s: string): Tok[] {
   const toks: Tok[] = [];
@@ -167,18 +181,30 @@ function tokenize(s: string): Tok[] {
 
 const isValueTok = (tk: Tok | undefined) => tk !== undefined && (tk.t === "word" || tk.t === "ph");
 const isQuote = (tk: Tok | undefined) => tk !== undefined && tk.t === "punct" && QUOTES.has(tk.s);
-const skipWs = (toks: Tok[], i: number) => (i < toks.length && toks[i]!.t === "ws" ? i + 1 : i);
+/** Skips one whitespace token unless it contains a line break (a value never starts on the next line). */
+const skipWs = (toks: Tok[], i: number) => (i < toks.length && toks[i]!.t === "ws" && !hasNewline(toks[i]!.s) ? i + 1 : i);
 const join = (toks: Tok[], from: number, to: number) => { let s = ""; for (let k = from; k < to; k++) s += toks[k]!.s; return s; };
-/** [start, end) of the adjacent value tokens beginning at `start` (words and placeholders). */
 function valueRun(toks: Tok[], start: number): number { let end = start; while (isValueTok(toks[end])) end++; return end; }
-/** A quote token is escaped when the token before it is a word ending in an odd number of backslashes. */
+/**
+ * End (exclusive) of the current value's line: the first whitespace token containing a line break, the closing quote of
+ * the enclosing quoted context (`-H "Authorization: Bearer x" https://…` must keep the URL), or the end.
+ */
+function lineEnd(toks: Tok[], start: number, stopQuote: string | null): number {
+  let j = start;
+  while (j < toks.length) {
+    const tk = toks[j]!;
+    if (tk.t === "ws" && hasNewline(tk.s)) break;
+    if (stopQuote !== null && tk.t === "punct" && tk.s === stopQuote && !escaped(toks, j)) break;
+    j++;
+  }
+  return j;
+}
 function escaped(toks: Tok[], j: number): boolean {
   const prev = toks[j - 1];
   if (prev === undefined || prev.t !== "word") return false;
   let n = 0; for (let k = prev.s.length - 1; k >= 0 && prev.s[k] === "\\"; k--) n++;
   return n % 2 === 1;
 }
-/** Index of the quote closing the one at `open`, or -1 when unterminated. Linear: each token is visited once. */
 function closingQuote(toks: Tok[], open: number): number {
   const q = toks[open]!.s;
   for (let j = open + 1; j < toks.length; j++) if (toks[j]!.t === "punct" && toks[j]!.s === q && !escaped(toks, j)) return j;
@@ -186,81 +212,103 @@ function closingQuote(toks: Tok[], open: number): number {
 }
 
 interface Consumed { text: string; next: number }
-/** Replaces the value starting at `start`: a quoted span (escape-aware, unterminated = to the end), or a run of words/placeholders. */
-function replaceValueAt(toks: Tok[], start: number, kind: string): Consumed | null {
+/** A quoted value at `start`: redacted to its closing quote (escape-aware; unterminated = to the end). */
+function replaceQuoted(toks: Tok[], start: number, kind: string): Consumed | null {
+  const tk = toks[start]!;
+  const close = closingQuote(toks, start);
+  const innerEnd = close === -1 ? toks.length : close;
+  if (innerEnd === start + 1) return null;
+  const inner = toks.slice(start + 1, innerEnd);
+  if (inner.length === 1 && inner[0]!.t === "ph") return { text: join(toks, start, innerEnd) + (close === -1 ? "" : tk.s), next: close === -1 ? toks.length : close + 1 };
+  return { text: `${tk.s}${PLACEHOLDER(kind)}${close === -1 ? "" : tk.s}`, next: close === -1 ? toks.length : close + 1 };
+}
+/** ONE value at `start`: a quoted span, or one run of words/placeholders (CLI argument, prose `Bearer x`). */
+function replaceOne(toks: Tok[], start: number, kind: string): Consumed | null {
   const tk = toks[start];
   if (tk === undefined) return null;
-  if (isQuote(tk)) {
-    const close = closingQuote(toks, start);
-    const innerEnd = close === -1 ? toks.length : close;
-    if (innerEnd === start + 1) return null;                                   // empty quotes: nothing to redact
-    const inner = toks.slice(start + 1, innerEnd);
-    if (inner.length === 1 && inner[0]!.t === "ph") return { text: join(toks, start, innerEnd) + (close === -1 ? "" : tk.s), next: innerEnd + (close === -1 ? 0 : 1) };
-    return { text: `${tk.s}${PLACEHOLDER(kind)}${close === -1 ? "" : tk.s}`, next: close === -1 ? toks.length : close + 1 };
-  }
+  if (isQuote(tk)) return replaceQuoted(toks, start, kind);
   if (!isValueTok(tk)) return null;
   const end = valueRun(toks, start);
-  if (end - start === 1 && tk.t === "word" && isScheme(tk.s)) {               // `Bearer <credential>`
-    const j = skipWs(toks, end);
-    const v = replaceValueAt(toks, j, tk.s.toLowerCase());
-    if (v) return { text: tk.s + join(toks, end, j) + v.text, next: v.next };
-  }
-  if (end - start === 1 && tk.t === "ph") return { text: tk.s, next: end };  // already redacted
+  if (end - start === 1 && tk.t === "ph") return { text: tk.s, next: end };
+  return { text: PLACEHOLDER(kind), next: end };
+}
+/** The value of a sensitive assignment: a quoted span, or EVERYTHING to the end of the line (round 3: format-aware boundary). */
+function replaceToLineEnd(toks: Tok[], start: number, kind: string, stopQuote: string | null): Consumed | null {
+  const tk = toks[start];
+  if (tk === undefined || tk.t === "ws") return null;
+  if (isQuote(tk)) return tk.s === stopQuote ? null : replaceQuoted(toks, start, kind);
+  const end = lineEnd(toks, start, stopQuote);
+  if (end === start) return null;
+  if (end - start === 1 && tk.t === "ph") return { text: tk.s, next: end };
   return { text: PLACEHOLDER(kind), next: end };
 }
 
 // ---------- token rules ----------
 
 /**
- * Assignments whose NAME carries a keyword: `name=value`, `name:value`, `name: value`, `name = value`, `"name": "value"`,
- * `--flag value`, `authorization:bearer <credential>`. Returns the replacement text and the index to continue from.
+ * Sensitive assignments: `NAME=VALUE`, `NAME:VALUE`, `NAME: VALUE`, `NAME = VALUE`, `"NAME": "VALUE"`, `--flag VALUE`.
+ * Returns the replacement text and the index to continue from.
  */
-function tryAssignment(toks: Tok[], i: number): Consumed | null {
+/** ctx[k] = the quote character enclosing token k (null outside quotes), from one linear pass over unescaped quote tokens. */
+function quoteContext(toks: Tok[]): (string | null)[] {
+  const ctx: (string | null)[] = new Array(toks.length + 1);
+  let open: string | null = null;
+  for (let k = 0; k < toks.length; k++) {
+    ctx[k] = open;
+    const tk = toks[k]!;
+    if (isQuote(tk) && !escaped(toks, k)) open = open === null ? tk.s : open === tk.s ? null : open;
+  }
+  ctx[toks.length] = open;
+  return ctx;
+}
+
+function tryAssignment(toks: Tok[], i: number, ctx: (string | null)[]): Consumed | null {
   const tk = toks[i]!;
   const eq = tk.s.indexOf("="); const colon = tk.s.indexOf(":");
   const idx = eq === -1 ? colon : colon === -1 ? eq : Math.min(eq, colon);
-  let name: string; let rest: string; let head: string; let after: number;
   if (idx !== -1) {
-    name = tk.s.slice(0, idx); rest = tk.s.slice(idx + 1);
-    if (!nameHasKeyword(name)) return null;
-    head = tk.s.slice(0, idx + 1); after = i + 1;
-  } else {
-    if (!nameHasKeyword(tk.s)) return null;
-    if (tk.s.startsWith("-")) {                                                // argv: `--password hunter2`
-      const vs = skipWs(toks, i + 1);
-      if (toks[vs]?.t === "word" && toks[vs]!.s.startsWith("-")) return null;
-      const v = replaceValueAt(toks, vs, "argv");
-      return v ? { text: tk.s + join(toks, i + 1, vs) + v.text, next: v.next } : null;
+    const name = tk.s.slice(0, idx); const rest = tk.s.slice(idx + 1);
+    if (name.length === 0 || !isSecretKey(name)) return null;
+    const head = tk.s.slice(0, idx + 1);
+    if (rest.length > 0) {                                                     // value begins inside the word: it and the rest of the line go
+      const end = lineEnd(toks, i + 1, ctx[i + 1] ?? null);
+      if (end === i + 1 && PLACEHOLDER_FULL.test(rest)) return { text: head + rest, next: end };
+      return { text: head + PLACEHOLDER("assignment"), next: end };
     }
-    let j = i + 1;
-    if (isQuote(toks[j])) j++;                                                 // `"password": ...` (closing quote of the name)
-    j = skipWs(toks, j);
-    const sep = toks[j];
-    if (sep === undefined || sep.t !== "word" || !(sep.s.startsWith("=") || sep.s.startsWith(":"))) return null;
-    name = tk.s; rest = sep.s.slice(1);
-    head = join(toks, i, j) + sep.s[0]!; after = j + 1;
+    const vs = skipWs(toks, i + 1);
+    const v = replaceToLineEnd(toks, vs, "assignment", ctx[vs] ?? null);
+    return v ? { text: head + join(toks, i + 1, vs) + v.text, next: v.next } : null;
   }
+  if (tk.s.startsWith("-")) {                                                  // CLI flag: the NEXT argument, even if it starts with `-`
+    if (!flagIsSensitive(tk.s)) return null;
+    const vs = skipWs(toks, i + 1);
+    const v = replaceOne(toks, vs, "argv");
+    return v ? { text: tk.s + join(toks, i + 1, vs) + v.text, next: v.next } : null;
+  }
+  if (!isSecretKey(tk.s)) return null;
+  let j = i + 1;
+  if (isQuote(toks[j])) j++;                                                   // `"password": ...` (closing quote of the name)
+  j = skipWs(toks, j);
+  const sep = toks[j];
+  if (sep === undefined || sep.t !== "word" || !(sep.s.startsWith("=") || sep.s.startsWith(":"))) return null;
+  const rest = sep.s.slice(1);
+  const head = join(toks, i, j) + sep.s[0]!;
   if (rest.length > 0) {
-    if (isScheme(rest)) {                                                      // `authorization:bearer X`
-      const vs = skipWs(toks, after);
-      const v = replaceValueAt(toks, vs, rest.toLowerCase());
-      if (v) return { text: head + rest + join(toks, after, vs) + v.text, next: v.next };
-    }
-    const end = valueRun(toks, after);                                         // value began inside the word; adjacent tokens belong to it
-    if (end === after && PLACEHOLDER_FULL.test(rest)) return { text: head + rest, next: after };
+    const end = lineEnd(toks, j + 1, ctx[j + 1] ?? null);
+    if (end === j + 1 && PLACEHOLDER_FULL.test(rest)) return { text: head + rest, next: end };
     return { text: head + PLACEHOLDER("assignment"), next: end };
   }
-  const vs = skipWs(toks, after);
-  const v = replaceValueAt(toks, vs, "assignment");
-  return v ? { text: head + join(toks, after, vs) + v.text, next: v.next } : null;
+  const vs = skipWs(toks, j + 1);
+  const v = replaceToLineEnd(toks, vs, "assignment", ctx[vs] ?? null);
+  return v ? { text: head + join(toks, j + 1, vs) + v.text, next: v.next } : null;
 }
 
-/** `Bearer xyz`, `basic dXNlcjpwYXNz` (case-insensitive): the next value is the credential. */
+/** `Bearer xyz`, `basic dXNlcjpwYXNz` in prose (case-insensitive): the next value is the credential. */
 function tryScheme(toks: Tok[], i: number): Consumed | null {
   const tk = toks[i]!;
   if (!isScheme(tk.s)) return null;
   const vs = skipWs(toks, i + 1);
-  const v = replaceValueAt(toks, vs, tk.s.toLowerCase());
+  const v = replaceOne(toks, vs, tk.s.toLowerCase());
   return v ? { text: tk.s + join(toks, i + 1, vs) + v.text, next: v.next } : null;
 }
 
@@ -278,7 +326,7 @@ function decodedHasSecret(word: string): boolean {
   if (word.length > DECODE_MAX) return false;
   const candidates: string[] = [];
   if (/%[0-9A-Fa-f]{2}/.test(word)) { try { const d = decodeURIComponent(word); if (d !== word) candidates.push(d); } catch { /* not percent-encoded */ } }
-  if (word.length >= 8 && B64_RE.test(word) && word.length % 4 !== 1) {       // unpadded base64/base64url has length ≡ 0, 2 or 3 (mod 4)
+  if (word.length >= 8 && B64_RE.test(word) && word.length % 4 !== 1) {
     const buf = Buffer.from(word.replace(/-/g, "+").replace(/_/g, "/"), "base64");
     if (buf.length >= 4 && printableRatio(buf) >= 0.9) candidates.push(buf.toString("utf8"));
   }
@@ -289,18 +337,27 @@ function decodedHasSecret(word: string): boolean {
   return candidates.some((c) => scanString(c, 0, true) !== c);
 }
 
+/** Query string handling: every `k=v` pair (split on `&`) with a sensitive `k` is redacted up to the next `&` or `#`. */
+function redactQuery(w: string): string {
+  const q = w.indexOf("?");
+  if (q === -1) return w;
+  const hash = w.indexOf("#", q);
+  const query = w.slice(q + 1, hash === -1 ? undefined : hash);
+  const pairs = query.split("&").map((p) => {
+    const e = p.indexOf("=");
+    if (e <= 0) return p;
+    const k = p.slice(0, e); const v = p.slice(e + 1);
+    if (v.length === 0 || PLACEHOLDER_FULL.test(v) || !isSecretKey(k)) return p;
+    return `${k}=${PLACEHOLDER("assignment")}`;
+  });
+  return w.slice(0, q + 1) + pairs.join("&") + (hash === -1 ? "" : w.slice(hash));
+}
+
 function redactWord(word: string, decoded: boolean): string {
-  if (word.length > WORD_MAX) return PLACEHOLDER("long-word");                // fail safe: never leave a long word unscanned
+  if (word.length > WORD_MAX) return PLACEHOLDER("long-word");
   let w = word;
   if (w.includes("://")) w = w.replace(URL_CRED_RE, (_m, scheme: string) => `${scheme}${PLACEHOLDER("url-credentials")}@`);
-  const q = w.indexOf("?");
-  if (q !== -1) {                                                              // first query parameter lives in this word (`&` splits words)
-    const param = w.slice(q + 1);
-    const e = param.indexOf("=");
-    if (e > 0 && nameHasKeyword(param.slice(0, e)) && e + 1 < param.length && !PLACEHOLDER_FULL.test(param.slice(e + 1))) {
-      w = `${w.slice(0, q + 1)}${param.slice(0, e + 1)}${PLACEHOLDER("assignment")}`;
-    }
-  }
+  w = redactQuery(w);
   for (const p of WORD_PATTERNS) { p.re.lastIndex = 0; w = w.replace(p.re, PLACEHOLDER(p.kind)); }
   w = redactEmails(w);
   if (w === word && !decoded && decodedHasSecret(word)) return PLACEHOLDER("encoded");
@@ -310,10 +367,11 @@ function redactWord(word: string, decoded: boolean): string {
 function scanTokens(toks: Tok[], decoded: boolean): string {
   let out = "";
   let i = 0;
+  const ctx = quoteContext(toks);                                              // enclosing quoted context per token, for value boundaries
   while (i < toks.length) {
     const tk = toks[i]!;
     if (tk.t === "word") {
-      const a = tryAssignment(toks, i) ?? tryScheme(toks, i);
+      const a = tryAssignment(toks, i, ctx) ?? tryScheme(toks, i);
       if (a) { out += a.text; i = a.next; continue; }
       out += redactWord(tk.s, decoded); i++; continue;
     }
@@ -342,7 +400,7 @@ function tryJsonInString(s: string, depth: number, decoded: boolean): string | n
   const first = s.trimStart()[0];
   if (first !== "{" && first !== "[") return null;
   let parsed: unknown;
-  try { parsed = JSON.parse(s); } catch { return null; }                       // includes RangeError on absurd nesting
+  try { parsed = JSON.parse(s); } catch { return null; }
   if (typeof parsed !== "object" || parsed === null) return null;
   const remaining = MAX_DEPTH - depth;
   if (remaining < 1 || jsonDepth(parsed, remaining) > remaining) return null;
@@ -379,7 +437,7 @@ function redactArray(arr: unknown[], depth: number, seen: WeakSet<object>, decod
     }
     redactNext = 0;
     if (typeof x === "string") {
-      if (/^--?[^\s=:]+$/.test(x) && nameHasKeyword(x)) redactNext = 1;       // ["--password", "hunter2"]
+      if (x.startsWith("-")) { if (flagIsSensitive(x)) redactNext = 1; }      // ["--password", "-x"]; `--token=abc` carries its own value
       else if (isSecretKey(x)) redactNext = 1;                                 // ["Authorization", "..."], ["password", "..."]
     }
     out.push(redactValue(x, depth + 1, seen, decoded));
@@ -390,7 +448,7 @@ function redactArray(arr: unknown[], depth: number, seen: WeakSet<object>, decod
 function redactObject(o: Record<string, unknown>, depth: number, seen: WeakSet<object>, decoded: boolean): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   const keys = Object.keys(o);
-  const taken = new Set(keys);                                                 // Set, not Array#includes: renaming stays linear
+  const taken = new Set(keys);
   let pairValueKey: string | null = null;                                      // header objects: { name: "Authorization", value: "..." }
   if (Object.hasOwn(o, "value")) {
     for (const nk of PAIR_NAME_KEYS) {
@@ -402,7 +460,7 @@ function redactObject(o: Record<string, unknown>, depth: number, seen: WeakSet<o
   for (const key of keys) {
     const kw = secretKeyword(key);
     let outKey = key;
-    if (scanString(key, depth, decoded) !== key) {                             // the key itself carries a secret or PII shape
+    if (scanString(key, depth, decoded) !== key) {
       do { outKey = `[REDACTED:key#${++renamed}]`; } while (taken.has(outKey));
       taken.add(outKey);
     }
@@ -410,14 +468,13 @@ function redactObject(o: Record<string, unknown>, depth: number, seen: WeakSet<o
     if (kw !== null) value = PLACEHOLDER(`key:${kw}`);
     else if (key === pairValueKey) value = typeof o[key] === "string" && PLACEHOLDER_FULL.test(o[key] as string) ? o[key] : PLACEHOLDER("pair");
     else value = redactValue(o[key], depth + 1, seen, decoded);
-    // defineProperty, not assignment: a JSON key named `__proto__` must become data, never the prototype.
     Object.defineProperty(out, outKey, { value, enumerable: true, writable: true, configurable: true });
   }
   return out;
 }
 
 function redactValue(v: unknown, depth: number, seen: WeakSet<object>, decoded: boolean): unknown {
-  if (depth > MAX_DEPTH) throw new Error(`ledger.redact: nesting deeper than ${MAX_DEPTH}`);   // unreachable after snapshot + jsonDepth checks
+  if (depth > MAX_DEPTH) throw new Error(`ledger.redact: nesting deeper than ${MAX_DEPTH}`);
   if (typeof v === "string") return scanString(v, depth, decoded);
   if (v === null || typeof v !== "object") return v;
   if (seen.has(v)) throw new Error("ledger.redact: circular reference in args");

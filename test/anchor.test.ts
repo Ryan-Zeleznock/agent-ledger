@@ -93,6 +93,19 @@ describe("createAnchor('file')", () => {
     expect(existsSync(path)).toBe(true);
   });
 
+  it("round 3: the anchor applies the ledger's timestamp rule: seconds <= 59 and <= 3 fractional digits, on write and on read", async () => {
+    const anchor = createAnchor("file", path);
+    for (const at of ["2026-09-30T12:34:60Z", "2026-12-31T23:59:60Z", "2026-09-30T00:00:00.0001Z", "2026-09-30T00:00:00.000000001Z"]) {
+      await expect(anchor.write({ hash: h("a"), at })).rejects.toThrow(/at must be/);
+    }
+    expect(existsSync(path)).toBe(false);
+    await anchor.write({ hash: h("a"), at: "2026-09-30T00:00:00.123Z" });
+    expect(await anchor.latest()).toEqual({ hash: h("a"), at: "2026-09-30T00:00:00.123Z" });
+    appendFileSync(path, `{"at":"2026-09-30T12:34:60Z","hash":"${h("b")}"}\n`);
+    await expect(createAnchor("file", path).latest()).rejects.toThrow(/not a valid entry/);
+    await expect(createAnchor("file", path).write({ hash: h("c"), at: "2026-10-01T00:00:00Z" })).rejects.toThrow(/not a valid entry/);
+  });
+
   it("takes the shared lock file and fails closed, in bounded time, when someone else holds it", async () => {
     const anchor = createAnchor("file", path);
     const { mkdirSync, writeFileSync } = await import("node:fs");

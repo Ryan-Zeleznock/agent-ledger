@@ -306,6 +306,42 @@ describe("createLedger('jsonl'): re-review P1/P2 (integrity, size, duplicate ids
     expect(await ledger.verify()).toEqual({ ok: false, checked: 2, brokenAt: "rec-2" });
   });
 
+  it("round 3: a stored line must be the exact JCS serialisation of its record: duplicate members, whitespace and reordering all break verify/head/append", async () => {
+    const { ledger } = await appendN(2);
+    const raw = lines();
+    const variants: [string, string][] = [
+      ["duplicate member before policy.reason", raw[1]!.replace('"reason":', '"reason":"UNHASHED-SECRET","reason":')],
+      ["duplicate top-level id", raw[1]!.replace('{"call":', '{"id":"rec-x","call":')],
+      ["whitespace", raw[1]!.replace('"phase":', ' "phase":')],
+      ["reordered members", (() => { const o = JSON.parse(raw[1]!) as Record<string, unknown>; const { id, ...rest } = o; return JSON.stringify({ ...rest, id }); })()],
+      ["unicode escape instead of literal", raw[1]!.replace('"Read"', '"\\u0052ead"')],
+    ];
+    for (const [name, line] of variants) {
+      expect(line, name).not.toBe(raw[1]);
+      writeFileSync(path, `${raw[0]}\n${line}\n`);
+      expect(await ledger.verify(), name).toEqual({ ok: false, checked: 2, brokenAt: "rec-2" });
+      await expect(ledger.head(), name).rejects.toThrow(/canonical|unknown field|invalid/);
+      await expect(ledger.append(unsealed(3)), name).rejects.toThrow(/canonical|unknown field|invalid/);
+    }
+    writeFileSync(path, `${raw[0]}\n${raw[1]}\n`);
+    expect(await ledger.verify()).toEqual({ ok: true, checked: 2 });
+  });
+
+  it("round 3: an accessor anywhere in a contract object is rejected before writing (outcome.durationMs getter that changes its answer)", async () => {
+    const { ledger } = await appendN(1);
+    const before = readFileSync(path);
+    let reads = 0;
+    const outcome = Object.defineProperty({ status: "ok" }, "durationMs", { get() { reads++; return reads <= 4 ? 1 : -1; }, enumerable: true });
+    await expect(ledger.append({ ...unsealed(2), phase: "outcome", outcome: outcome as never })).rejects.toThrow(/outcome\.durationMs is an accessor/);
+    expect(reads).toBe(0);
+    const policy = new Proxy({ verdict: "allow", ruleId: "r", reason: "", risk: "read" }, {});
+    await expect(ledger.append({ ...unsealed(3), policy: policy as never })).rejects.toThrow(/policy is a Proxy/);
+    const call = Object.defineProperty({ ...unsealed(4).call }, "tool", { get: () => "Read", enumerable: true });
+    await expect(ledger.append({ ...unsealed(4), call: call as never })).rejects.toThrow(/call\.tool is an accessor/);
+    expect(readFileSync(path).equals(before)).toBe(true);
+    expect(await ledger.verify()).toEqual({ ok: true, checked: 1 });
+  });
+
   it("P1 size: a record whose REDACTED args exceed the storage limits is rejected before writing; the file is untouched and stays usable", async () => {
     const { ledger } = await appendN(1);
     const before = readFileSync(path);
