@@ -14,6 +14,21 @@ Identity rules (spec §8): server keys are exact, case-sensitive, own-property l
 
 Invariant: nothing downgrades. `escalateWhen` may raise a row's class for matching arguments; the loader refuses an escalation whose `to` is not above the base class, and `evaluate()` takes the max anyway.
 
+ADR-009 adds optional `storeArgs: string[]` to each reviewed tool: argument field names permitted
+to be stored in cleartext. Names are exact and case-sensitive, must match `[A-Za-z0-9_-]{1,64}`,
+and must be unique. Reserved keys (`__proto__`, `constructor`, `prototype`, and names on
+`Object.prototype`) are refused. Only top-level names are supported: dots, including
+`options.branch`, are refused rather than interpreted as nested paths. Allowlist scalar fields
+only: allowing an object-valued field exposes its whole subtree. Since dotted paths are refused,
+allowing `options` to retain `options.branch` also exposes `options.token`. Absent `storeArgs`
+and `storeArgs: []` both permit no clear args. `clearArgFields(registry, server, tool)` returns
+`readonly string[]` using own-property server/tool/allowlist lookups; unreviewed tools return
+`[]` regardless of server trust. Loaded allowlist arrays are frozen to prevent callers from
+widening them at runtime; hand-built non-array allowlists return `[]`.
+This registry metadata does not change tool classification.
+ADR-009 assigns hashing of other argument fields and defense-in-depth redaction of clear fields
+to the ledger; this module only declares and validates the allowlist.
+
 Loaders validate every field before returning typed records. YAML maps stay `Map`s until
 schema validation; dictionaries are projected with `Object.fromEntries`. Duplicate keys,
 non-string keys, parse warnings/errors, invalid regexes, and invalid review dates are refused.

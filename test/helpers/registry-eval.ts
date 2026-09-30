@@ -60,12 +60,19 @@ export function validate(reg: ToolRegistry): string[] {
       const tl = tool.normalize("NFKC").toLowerCase();
       if (seenTools.has(tl)) problems.push(`${at}: differs only by case from ${seenTools.get(tl)}`);
       seenTools.set(tl, tool);
-      if (!fields(t, at, ["class", "reviewedBy", "reviewedAt", "note", "escalateWhen"])) continue;
+      if (!fields(t, at, ["class", "reviewedBy", "reviewedAt", "note", "storeArgs", "escalateWhen"])) continue;
       if (!isClass(t.class)) problems.push(`${at}: class`);
       const date = t.reviewedAt;
       if (typeof t.reviewedBy !== "string" || !t.reviewedBy.trim() || typeof date !== "string" ||
           !/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(date)) || new Date(date).toISOString().slice(0, 10) !== date) problems.push(`${at}: review`);
       if (Object.hasOwn(t, "note") && typeof t.note !== "string") problems.push(`${at}: note`);
+      if (Object.hasOwn(t, "storeArgs")) {
+        const names = t.storeArgs;
+        if (!Array.isArray(names) || names.some(name => typeof name !== "string" || name.length < 1 || name.length > 64 ||
+          /[^A-Za-z0-9_-]/.test(name) || isReservedKey(name)) || new Set(names).size !== names.length) {
+          problems.push(`${at}: storeArgs must contain unique, non-reserved top-level ASCII names (1-64 characters; no dots)`);
+        }
+      }
       if (Object.hasOwn(t, "escalateWhen") && !Array.isArray(t.escalateWhen)) { problems.push(`${at}: escalateWhen`); continue; }
       for (const [i, e] of (t.escalateWhen ?? []).entries()) {
         if (!fields(e, `${at}#escalate:${i}`, ["to", "argPattern"])) continue;
@@ -142,6 +149,12 @@ function lookup(reg: ToolRegistry, server: string, tool: string): ToolEntry | un
   if (!Object.hasOwn(reg.servers, server)) return undefined;
   const s = reg.servers[server]!;
   return Object.hasOwn(s.tools, tool) ? s.tools[tool] : undefined;
+}
+
+export function clearArgFields(reg: ToolRegistry, server: string, tool: string): readonly string[] {
+  const row = lookup(reg, server, tool);
+  if (!row || !isClass(row.class) || !Object.hasOwn(row, "storeArgs")) return [];
+  return Array.isArray(row.storeArgs) ? row.storeArgs : [];
 }
 
 export function decide(reg: ToolRegistry, server: string, tool: string, args: Args = {}): PolicyDecision {
