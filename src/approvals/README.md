@@ -1,7 +1,13 @@
 # approvals
-**Job:** Ask a human in Slack and return an `ApprovalResult`; timeout and unavailable both count as deny
-**Depends on:** types
-**Does NOT:** decide what is risky, or handle `hook-ask` (that channel never reaches this module: the pipeline answers `ask` and Claude Code prompts the human in the terminal)
-**Spec:** docs/spec.md §4, 6, 7
+**Job:** Ask a human in Slack (Socket Mode, Block Kit buttons) and return the FINAL `ApprovalResult`; timeout and unavailable both count as deny
+**Depends on:** types (and, at init, `secrets` to resolve the two token references)
+**Does NOT:** decide what is risky, or handle `hook-ask` (that channel never reaches this module: the pipeline resolves it, to `ask` under Claude Code and to a recorded `no-channel` deny under Codex)
+**Spec:** docs/spec.md §4, 6, 7 · ADR-006
 
-`ApprovalChannel` is a union in `src/types/`: `{ kind: "slack", channelId, timeoutMs }` or `{ kind: "hook-ask" }`. It is required in `PipelineDeps`, so "no channel" is an explicit choice, never a missing field. Results: `approved` / `denied` from a human, `timeout` (no answer in `timeoutMs`), `unavailable` (configured but unreachable or erroring), `delegated` (hook-ask only, written by the pipeline). Only `approved` can turn into an allow, and only after the intent record carrying it has persisted.
+`ApprovalChannel` is a union in `src/types/`: `{ kind: "slack", channelId, timeoutMs, transport: "socket-mode", botToken, appToken, approvers }` or `{ kind: "hook-ask" }`. It is required in `PipelineDeps`, so "no channel" is an explicit choice, never a missing field. Results: `approved` / `denied` from a human (with `approver` = Slack user id and a `reason`), `timeout` (no answer in `timeoutMs`), `unavailable` (configured but unreachable or erroring), `no-channel` (Codex + hook-ask: cannot ask, nothing configured), `delegated` (Claude Code hook-ask only). Only `approved` can turn into an allow, and only after the intent record carrying it has persisted.
+
+**Why Socket Mode.** Verified 2026-09-29 (docs.slack.dev): Socket Mode delivers events and interactive payloads over a WebSocket the app opens with `apps.connections.open` (app-level `xapp-` token, scope `connections:write`), so no public Request URL is needed: it fits a homelab or a customer's private network. Limits: 10 concurrent connections per app; not listable in the Slack Marketplace (irrelevant for a private app). Each envelope is acknowledged by `envelope_id`. Messages use `chat.postMessage` (bot `xoxb-` token, `chat:write`) with an `actions` block of two buttons whose `value` and `block_id` carry the callId; the click arrives as `block_actions` with `user.id`; the message is closed out with `chat.update`.
+
+**Anti-replay and identity.** A click counts only if `actions[0].value === call.callId`, `channel.id` matches, and `user.id` is in `approvers`. The approver stored in the ledger is the Slack user id, not a display name. The first valid click wins; later clicks are ignored and the message already shows the outcome.
+
+**Timing.** A human needs minutes, not seconds, so under Codex + Slack the hook `timeout`, the watchdog deadline and `timeoutMs` are configured together and validated at init: `timeoutMs + APPROVAL_MIN_MARGIN_MS ≤ deadlineMs` and `deadlineMs + WATCHDOG_MIN_MARGIN_MS ≤ hookTimeoutS × 1000` (`hooks.validateHookTiming`; violation → init failure → watchdog deny + exit 2). Defaults: `SLACK_HOOK_TIMING` in `src/hooks/`.

@@ -68,6 +68,32 @@ export const RESERVED_SERVER_NAMES = ["claudecode", "builtinclaudecode", "codex"
  */
 export const RESERVED_KEYS = ["__proto__", "constructor", "prototype"] as const;
 
+// ---------- Codex MCP identity: the Agent Ledger proxy is Codex's ONE MCP server (ADR-006) ----------
+
+/**
+ * Codex hook names are NOT unique MCP identities (Astra, 2026-09-29; verified in openai/codex
+ * codex-rs/core/src/tools/handlers/mcp.rs `join_tool_name`: `namespace.trim_end_matches('_')` and
+ * `name.trim_start_matches('_')` run AFTER sanitising and collision hashing, so servers `github_` and `github` with
+ * tools `list_repos` and `_list_repos` both fire the hook as `mcp__github__list_repos`). So under Codex the hook never
+ * allows an `mcp__*` call on the name's say-so. Instead every MCP server Codex uses is configured to go THROUGH the
+ * Agent Ledger proxy, which appears to Codex as exactly one MCP server named `registry.proxy.codex.serverName`, sees
+ * raw upstream identity, decides, and records. The hook's job for that server is to say `allow` with
+ * `kind: "governed-by-proxy"` and write NO record (the proxy already did). Any other `mcp__*` server → deny.
+ *
+ * What the configured name must look like: Codex's hook-visible form, `[A-Za-z0-9_]` only (its sanitiser turns
+ * everything else into `_`), no leading or trailing `_` (Codex trims those before the `__`, so a name ending in `_`
+ * would never match itself), at least CODEX_PROXY_SERVER_NAME_MIN_LENGTH characters with a random suffix so it is not
+ * guessable, and not a reserved builtin name. The RESIDUAL: a locally added server named e.g. `<name>_` (or `<name>-`)
+ * produces identical hook names and would inherit the allow. The closer is Codex's managed `requirements.toml`
+ * `mcp_servers` allowlist, which enables a server only when BOTH its name AND its identity (stdio `command`, or the
+ * structured `executable` + `args` matcher; HTTP `url`) match, and disables everything else (spec §7, §8).
+ */
+export const CODEX_PROXY_SERVER_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_]*[A-Za-z0-9]$/;
+export const CODEX_PROXY_SERVER_NAME_MIN_LENGTH = 16;
+/** What the Codex hook answers for an `mcp__*` server that is not the proxy. Approval cannot fix it; configuration can. */
+export const CODEX_MCP_NOT_PROXIED_REASON =
+  "agent-ledger: route this MCP server through the Agent Ledger proxy. Under Codex, hook tool names are not unique MCP identities, so only calls that reach the proxy (configured as Codex's single MCP server) are governed; add the server as an upstream of the proxy." as const;
+
 export const VERDICTS = ["allow", "deny", "require_approval"] as const;
 export type Verdict = (typeof VERDICTS)[number];
 /** The three reviewed classes, plus `unreviewed` for a tool the registry does not know (ADR-004). */
@@ -76,23 +102,55 @@ export type Risk = (typeof RISKS)[number];
 export interface PolicyDecision { verdict: Verdict; ruleId: string; reason: string; risk: Risk; }
 
 /**
- * How a `require_approval` verdict reaches a human (spec §6, §7).
- * - `slack`: a channel exists; the pipeline waits up to `timeoutMs` for an answer. No answer → `timeout` → deny.
- *   Configured but unreachable (auth failure, network error, non-2xx) → `unavailable` → deny.
- * - `hook-ask`: local mode with no channel. The pipeline writes the intent record with `decision: "delegated"`
- *   and answers `ask`; Claude Code prompts the human in the terminal. The human's answer shows up as the
- *   outcome record (PostToolUse → ok, PostToolUseFailure → error, nothing → no outcome), never as `approved`.
+ * Where a secret VALUE lives. Config, records and logs carry only this reference; `secrets` resolves it at init
+ * (env var name, or a file path) and hands the value to exactly one consumer. Never store or hash the value.
+ */
+export type SecretRef = { kind: "env"; name: string } | { kind: "file"; path: string };
+
+/**
+ * How a `require_approval` verdict reaches a human (spec §6, §7; ADR-006).
+ * - `slack`: a Slack app in **Socket Mode** (verified 2026-09-29, https://docs.slack.dev/apis/events-api/using-socket-mode/:
+ *   "use the Events API and interactive features — without exposing a public HTTP Request URL"; interactive payloads
+ *   arrive over the WebSocket; each envelope is acknowledged by `envelope_id`). `botToken` is the `xoxb-` token
+ *   (scope `chat:write`, plus `chat:write.public` when the bot is not a channel member) used for `chat.postMessage` and
+ *   `chat.update`; `appToken` is the `xapp-` app-level token (scope `connections:write`) used for
+ *   `apps.connections.open`. `approvers` is the allowlist of Slack user ids (`block_actions.user.id`) whose clicks
+ *   count; anyone else's click is ignored and answered in-thread. The pipeline waits up to `timeoutMs`: no answer →
+ *   `timeout` → deny. Configured but unreachable (auth failure, WebSocket never opens, non-ok API reply) →
+ *   `unavailable` → deny. Required under Codex for any `require_approval` to ever become an allow.
+ * - `hook-ask`: local mode with no channel. Claude Code: the pipeline writes the intent record with
+ *   `decision: "delegated"` and answers `ask`; Claude Code prompts the human in the terminal, and the answer shows up
+ *   as the outcome record (PostToolUse → ok, PostToolUseFailure → error, nothing → no outcome), never as `approved`.
+ *   Codex cannot ask, so under Codex `hook-ask` resolves to `decision: "no-channel"` → deny, RECORDED as the final
+ *   decision before anything is persisted (nothing is left as a dangling `delegated`).
  * Absent is not a state: `PipelineDeps.approvals` is required, so "no channel" must be said out loud.
  */
 export type ApprovalChannel =
-  | { kind: "slack"; channelId: string; timeoutMs: number }
+  | {
+      kind: "slack";
+      channelId: string;            // Slack channel id (C…), never a name
+      timeoutMs: number;            // how long a human has; must sit below the watchdog deadline (hooks: APPROVAL_MIN_MARGIN_MS)
+      transport: "socket-mode";     // the only transport we specify: the homelab has no public Request URL
+      botToken: SecretRef;          // xoxb-…  chat:write (+ chat:write.public)
+      appToken: SecretRef;          // xapp-…  connections:write
+      approvers: readonly string[]; // Slack user ids allowed to approve or deny; must be non-empty
+    }
   | { kind: "hook-ask" };
-export const APPROVAL_DECISIONS = ["approved", "denied", "timeout", "unavailable", "delegated"] as const;
+/**
+ * The FINAL decision on a require_approval verdict, as the intent record stores it. approved | denied come from a
+ * human (with `approver`); timeout | unavailable mean deny; `no-channel` means deny because the agent cannot ask and
+ * no Slack channel is configured (Codex + hook-ask); `delegated` exists only under Claude Code hook-ask, where the
+ * terminal prompt decides after us. Only `approved` can become an allow.
+ */
+export const APPROVAL_DECISIONS = ["approved", "denied", "timeout", "unavailable", "no-channel", "delegated"] as const;
 export interface ApprovalResult {
   callId: string;               // ties the approval to one call, so replay on another call is detectable
-  /** approved | denied come from a human; timeout | unavailable mean deny; delegated only with channel hook-ask. */
   decision: (typeof APPROVAL_DECISIONS)[number];
-  approver?: string; decidedAt: string; channel: ApprovalChannel["kind"];
+  /** Slack user id of the human who clicked (approved | denied only). Never a display name. */
+  approver?: string;
+  /** Why this decision: the approver's note, "no approver answered within N ms", "Slack unreachable: …", "Codex cannot ask and no Slack channel is configured". Stored. */
+  reason?: string;
+  decidedAt: string; channel: ApprovalChannel["kind"];
 }
 
 /** Maps to draft-sharif-agent-audit-trail `record_phase`: intent = pre_execution, outcome = post_execution (spec §5). */
@@ -134,4 +192,12 @@ export type CallHandler = (incoming: IncomingCall) => Promise<ToolResult>;
  * because an undecided call must fall to a human (`ask`), not to the agent's own permission flow.
  */
 export const HOOK_DECISIONS = ["allow", "deny", "ask"] as const;
-export interface HookDecision { decision: (typeof HOOK_DECISIONS)[number]; reason: string; callId: string; }
+/**
+ * `decided`: the pipeline classified the call against the registry and wrote (or tried to write) the intent record.
+ * `governed-by-proxy` (Codex only, ADR-006): the call is a tool of the Agent Ledger proxy, Codex's one MCP server; the
+ * proxy makes the real decision with raw upstream identity and records it, so the hook answers `allow` and writes NO
+ * record (no double-recording). Never used for a built-in tool and never under Claude Code.
+ */
+export const HOOK_DECISION_KINDS = ["decided", "governed-by-proxy"] as const;
+export type HookDecisionKind = (typeof HOOK_DECISION_KINDS)[number];
+export interface HookDecision { decision: (typeof HOOK_DECISIONS)[number]; reason: string; callId: string; kind: HookDecisionKind; }

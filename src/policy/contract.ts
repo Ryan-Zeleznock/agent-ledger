@@ -32,7 +32,15 @@ export interface ServerEntry {
  * A key is either exactly one of BUILTIN_SERVER_KEYS (`builtin:claude-code`, `builtin:codex`: the only legal keys with
  * a `:`) or an MCP server name matching MCP_SERVER_NAME_RE. See loadRegistry for what is refused.
  */
-export interface ToolRegistry { version: 1; servers: Record<string, ServerEntry>; }
+/**
+ * How the Agent Ledger proxy is known to each agent's hook (ADR-006). `codex.serverName` is the name the proxy is
+ * registered under in Codex's `mcp_servers` (hook-visible form: `[A-Za-z0-9_]`, no leading/trailing `_`, ≥
+ * CODEX_PROXY_SERVER_NAME_MIN_LENGTH chars, unguessable suffix). A Codex hook call named `mcp__<serverName>__<tool>`
+ * is `governed-by-proxy`; any other Codex `mcp__*` call is denied (CODEX_MCP_NOT_PROXIED_REASON). Absent → every
+ * Codex MCP call is denied, which is the safe default for a registry that has not been set up for Codex.
+ */
+export interface ProxyIdentity { codex?: { serverName: string } }
+export interface ToolRegistry { version: 1; servers: Record<string, ServerEntry>; proxy?: ProxyIdentity; }
 
 /** Key normalisation used only for collision checks: lowercase, then drop every character outside [a-z0-9]. */
 export const NORMALISE_FOR_COLLISION = "lowercase; strip /[^a-z0-9]/g" as const;

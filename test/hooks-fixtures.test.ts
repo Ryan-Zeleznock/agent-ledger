@@ -85,7 +85,7 @@ describe("Claude Code hook fixtures", () => {
     expect((pre["tool_name"] as string).startsWith(MCP_TOOL_PREFIX)).toBe(false); // Bash is built-in
   });
   it("the PreToolUse output shape is the documented hookSpecificOutput block", () => {
-    const d: HookDecision = { decision: "deny", reason: "Destructive command blocked by hook", callId: "toolu_01ABC123..." };
+    const d: HookDecision = { decision: "deny", reason: "Destructive command blocked by hook", callId: "toolu_01ABC123...", kind: "decided" };
     const out: PreToolUseOutput = { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: d.decision, permissionDecisionReason: d.reason } };
     expect(JSON.parse(JSON.stringify(out))).toEqual({
       hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "Destructive command blocked by hook" },
@@ -158,7 +158,7 @@ describe("Codex hook fixtures (ADR-005)", () => {
     expect(direct).toBe("npm test");
   });
   it("shares the PreToolUse output shape with Claude Code, but ask is rewritten to deny for Codex", () => {
-    const ask: HookDecision = { decision: "ask", reason: "unreviewed tool", callId: "call_01ABC123" };
+    const ask: HookDecision = { decision: "ask", reason: "unreviewed tool", callId: "call_01ABC123", kind: "decided" };
     const codexOut: PreToolUseOutput = { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: CODEX_ASK_UNSUPPORTED_REASON } };
     expect(ask.decision).toBe("ask");
     expect(codexOut.hookSpecificOutput.permissionDecision).toBe("deny");
