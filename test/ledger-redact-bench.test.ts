@@ -25,7 +25,7 @@ describe("redact() performance under supervision", () => {
       c.once("exit", (code) => { clearTimeout(timer); rej(new Error(`benchmark child exited with ${code} before reporting`)); });
     });
     const shapes = [...new Set(rows.map((r) => r.shape))];
-    expect(shapes.length).toBeGreaterThanOrEqual(8);
+    expect(shapes.length).toBeGreaterThanOrEqual(14);
     const report: string[] = [];
     for (const shape of shapes) {
       const series = rows.filter((r) => r.shape === shape).sort((a, b) => a.bytes - b.bytes);

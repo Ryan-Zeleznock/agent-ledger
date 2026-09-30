@@ -135,6 +135,68 @@ describe("ledger.redact: free text (Astra #2)", () => {
   });
 });
 
+describe("ledger.redact: re-review cases (Astra 2026-09-30, round 2)", () => {
+  it("P1: a scheme inside an assignment value, with or without a space, loses its credential", () => {
+    const out = redact({ a: "authorization:bearer opaqueCredential", b: "Authorization:Basic dXNlcjpwYXNz", c: "x-auth-token: Bearer tok123 tail" });
+    gone(out, "opaqueCredential", "dXNlcjpwYXNz", "tok123");
+    expect(out.a).toBe("authorization:bearer [REDACTED:bearer]");
+    expect(out.c).toBe("x-auth-token: Bearer [REDACTED:bearer] tail");
+  });
+  it("P1: words over 1 KiB are replaced whole, wherever they are (value, key, URL userinfo), never left unscanned", () => {
+    const long = "x".repeat(1024) + "/ghp_" + "A".repeat(36);
+    const longUrl = "https://" + "u".repeat(600) + ":" + "p".repeat(600) + "@host.example/path";
+    const out = redact({ v: `see ${long} end`, [long]: "present", url: longUrl, ok: "y".repeat(1024) });
+    gone(out, "ghp_", "p".repeat(600), long);
+    expect(out.v).toBe("see [REDACTED:long-word] end");
+    expect(out.url).toBe("[REDACTED:long-word]");
+    expect(out.ok).toBe("y".repeat(1024)); // exactly WORD_MAX is still scanned normally
+    expect(Object.keys(out)).toContain("[REDACTED:key#1]");
+  });
+  it("P2: short base64/hex assignments are decoded (one level only: double-encoding is a documented residual)", () => {
+    const out = redact({ b64: "dG9rZW49eA==", hex: "746f6b656e3d78", b64url: Buffer.from("password=hunter2").toString("base64url"), once: "password%3Dhunter2", twice: "password%253Dhunter2", plain: "deadbeef", sha: "3f2a9c1b4d5e6f708192a3b4c5d6e7f8" });
+    gone(out, "dG9rZW49eA==", "746f6b656e3d78", "password%3Dhunter2");
+    expect(out.b64).toBe("[REDACTED:encoded]");
+    expect(out.b64url).toBe("[REDACTED:encoded]");
+    expect(out.twice).toBe("password%253Dhunter2"); // exactly one decode level
+    expect(out.plain).toBe("deadbeef");
+    expect(out.sha).toBe("3f2a9c1b4d5e6f708192a3b4c5d6e7f8");
+  });
+  it("P2: absurdly nested JSON or quotes inside a string neither throws nor bypasses the depth budget", () => {
+    const deep = "[".repeat(10_000) + "]".repeat(10_000);
+    expect(() => redact({ deep })).not.toThrow();
+    const deepSecret = "[".repeat(100) + JSON.stringify({ password: "hunter2" }) + "]".repeat(100);
+    gone(redact({ deepSecret }), "hunter2"); // over budget → tokeniser fallback still catches the assignment
+    const alt = "\"'".repeat(50_000) + " password=hunter2";
+    gone(redact({ alt }), "hunter2");
+    const inBudget = JSON.stringify({ a: [{ b: { password: "hunter2" } }] });
+    expect(JSON.parse(redact({ inBudget }).inBudget as string)).toEqual({ a: [{ b: { password: "[REDACTED:key:password]" } }] });
+  });
+  it("P1: renaming many leaking keys is linear (Set-based) and PEM heads never rescan", () => {
+    const big: Record<string, unknown> = {};
+    for (let i = 0; i < 20_000; i++) big[`u${i}@example.com`] = 0;
+    const t0 = performance.now(); const out = redact(big); const ms = performance.now() - t0;
+    expect(Object.keys(out).length).toBe(20_000);
+    expect(Object.keys(out).every((k) => /^\[REDACTED:key#\d+\]$/.test(k))).toBe(true);
+    expect(ms).toBeLessThan(1500);
+    const heads = "-----BEGIN ".repeat(20_000);
+    const t1 = performance.now(); redact({ heads }); expect(performance.now() - t1).toBeLessThan(300);
+    const keys = `${"-----BEGIN RSA PRIVATE KEY-----\nAAAA\n".repeat(3000)}-----END RSA PRIVATE KEY-----`;
+    gone(redact({ keys }), "AAAA");
+  });
+  it("still handles the round-1 forms after the tokeniser change: quoted names, escapes, unterminated values, apostrophes in prose", () => {
+    const out = redact({
+      a: '{"password":"two words","user":"u"} trailing text token=abc',
+      b: "it's fine, don't panic; the Bearer abc123 must go",
+      c: 'password="a \\"b\\" c" x',
+      d: "password='unterminated",
+      e: "note: nothing secret here",
+    });
+    gone(out, "two words", "abc123", '"b\\"', "unterminated");
+    expect(out.b).toBe("it's fine, don't panic; the Bearer [REDACTED:bearer] must go");
+    expect(out.e).toBe("note: nothing secret here");
+  });
+});
+
 describe("ledger.redact: invariants", () => {
   it("is idempotent and does not mutate its input", () => {
     const args = { password: "pw", nested: [{ token: "t" }], text: 'x password="a b" Bearer zz ryan@example.com --secret s', argv: ["--password", "p"], j: JSON.stringify({ token: "t" }) };
