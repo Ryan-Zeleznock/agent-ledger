@@ -1,5 +1,6 @@
 // Test-only independent decision oracle and schema checks; product policy is implemented.
 // Retained for generated policy parity and unfinished hook contracts (ADR-008).
+import { compileRegex } from "../../src/policy/schema.js";
 import { CLASS_DECISION, CLASS_RANK, TOOL_CLASSES, type ToolClass, type ToolEntry, type ToolRegistry } from "../../src/policy/contract.js";
 import { APPROVAL_MIN_MARGIN_MS, MCP_TOOL_PREFIX, WATCHDOG_MIN_MARGIN_MS, type HookTiming } from "../../src/hooks/contract.js";
 import {
@@ -30,6 +31,13 @@ export const isReservedKey = (key: string) => (RESERVED_KEYS as readonly string[
 /** Schema check: returns the problems a loader would refuse on (nothing downgrades, no reserved or ambiguous keys). */
 export function validate(reg: ToolRegistry): string[] {
   const problems: string[] = [];
+  const fields = (value: unknown, at: string, allowed?: string[]): boolean => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) { problems.push(`${at}: mapping`); return false; }
+    if (allowed && Object.keys(value).some(k => !allowed.includes(k))) problems.push(`${at}: unknown field`);
+    return true;
+  };
+  if (!fields(reg, "registry", ["version", "servers", "proxy"])) return problems;
+  if (!fields(reg.servers, "servers")) return problems;
   if (reg.version !== 1) problems.push("version");
   const seenServers = new Map<string, string>();
   for (const [server, s] of Object.entries(reg.servers)) {
@@ -38,25 +46,43 @@ export function validate(reg: ToolRegistry): string[] {
       if (!MCP_SERVER_NAME_RE.test(server)) problems.push(`${server}: not an MCP server name`);
       if (isReservedServerName(server)) problems.push(`${server}: collides with the builtin namespace`);
     }
-    const lower = server.toLowerCase();
+    const lower = server.normalize("NFKC").toLowerCase();
     if (seenServers.has(lower)) problems.push(`${server}: differs only by case from ${seenServers.get(lower)}`);
     seenServers.set(lower, server);
+    if (!fields(s, server, ["trusted", "tools"])) continue;
     if (typeof s.trusted !== "boolean") problems.push(`${server}: trusted`);
+    if (!fields(s.tools, `${server}.tools`)) continue;
     const seenTools = new Map<string, string>();
     for (const [tool, t] of Object.entries(s.tools)) {
       const at = `${server}/${tool}`;
       if (isReservedKey(tool)) problems.push(`${at}: reserved key`);
-      const tl = tool.toLowerCase();
+      if (!/^[A-Za-z0-9_.-]{1,128}$/.test(tool)) problems.push(`${at}: invalid ASCII tool key`);
+      const tl = tool.normalize("NFKC").toLowerCase();
       if (seenTools.has(tl)) problems.push(`${at}: differs only by case from ${seenTools.get(tl)}`);
       seenTools.set(tl, tool);
+      if (!fields(t, at, ["class", "reviewedBy", "reviewedAt", "note", "escalateWhen"])) continue;
       if (!isClass(t.class)) problems.push(`${at}: class`);
-      if (!t.reviewedBy || !t.reviewedAt) problems.push(`${at}: review`);
+      const date = t.reviewedAt;
+      if (typeof t.reviewedBy !== "string" || !t.reviewedBy.trim() || typeof date !== "string" ||
+          !/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(date)) || new Date(date).toISOString().slice(0, 10) !== date) problems.push(`${at}: review`);
+      if (Object.hasOwn(t, "note") && typeof t.note !== "string") problems.push(`${at}: note`);
+      if (Object.hasOwn(t, "escalateWhen") && !Array.isArray(t.escalateWhen)) { problems.push(`${at}: escalateWhen`); continue; }
       for (const [i, e] of (t.escalateWhen ?? []).entries()) {
+        if (!fields(e, `${at}#escalate:${i}`, ["to", "argPattern"])) continue;
+        if (fields(e.argPattern, `${at}#escalate:${i}.argPattern`)) {
+          for (const pattern of Object.values(e.argPattern)) {
+            try { compileRegex(pattern, at); } catch { problems.push(`${at}#escalate:${i}: regex`); }
+          }
+        }
         if (!isClass(e.to) || !isClass(t.class) || CLASS_RANK[e.to] <= CLASS_RANK[t.class]) problems.push(`${at}#escalate:${i}: to must rank above ${t.class}`);
       }
     }
   }
   // ADR-006: the proxy's Codex server name, in Codex's hook-visible form, unguessable, and not an upstream key
+  if (Object.hasOwn(reg, "proxy")) {
+    if (!fields(reg.proxy, "proxy", ["codex"])) return problems;
+    if (Object.hasOwn(reg.proxy!, "codex") && !fields(reg.proxy!.codex, "proxy.codex", ["serverName"])) return problems;
+  }
   if (reg.proxy?.codex !== undefined) {
     const name = reg.proxy.codex.serverName;
     if (typeof name !== "string" || name.length === 0) problems.push("proxy.codex.serverName: missing");
@@ -64,7 +90,7 @@ export function validate(reg: ToolRegistry): string[] {
       if (!CODEX_PROXY_SERVER_NAME_RE.test(name)) problems.push("proxy.codex.serverName: must be [A-Za-z0-9_] with no leading, trailing or internal __ (Codex trims the ends; the hook name splits at the first __)");
       if (name.length < CODEX_PROXY_SERVER_NAME_MIN_LENGTH) problems.push(`proxy.codex.serverName: shorter than ${CODEX_PROXY_SERVER_NAME_MIN_LENGTH}`);
       if (isReservedServerName(name)) problems.push("proxy.codex.serverName: collides with the builtin namespace");
-      if (Object.keys(reg.servers).some((k) => k.toLowerCase() === name.toLowerCase())) problems.push("proxy.codex.serverName: equals a servers key (the proxy is not an upstream)");
+      if (Object.keys(reg.servers).some((k) => codexSanitize(k).replace(/_+$/, "").toLowerCase() === name.toLowerCase())) problems.push("proxy.codex.serverName: equals a servers key (the proxy is not an upstream)");
     }
   }
   return problems;

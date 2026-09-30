@@ -1,7 +1,7 @@
 # policy
 Status: implemented
 **Job:** Classify a ToolCall from the reviewed tool registry (`policies/tools.yaml`) and return a PolicyDecision; propose classes for unreviewed tools during setup
-**Depends on:** types
+**Depends on:** types, shared configuration I/O (`src/config-file.ts`)
 **Does NOT:** ask humans, call tools, or let a name pattern or an MCP annotation decide a call
 **Spec:** docs/spec.md §4, 8 · **Decision:** ADR-004
 
@@ -9,7 +9,8 @@ Two inputs, one authority:
 - `tools.yaml` (see `policies/tools.example.yaml`): per server, per tool, `class: read|write|risky` with `reviewedBy`/`reviewedAt`. `evaluate()` reads only this. Unknown server or tool → `require_approval`, risk `unreviewed`.
 - `suggestions.yaml`: name regexes read only by `suggestClass()`, together with MCP annotations from servers marked `trusted`. Output is a proposal for the reviewer, nothing more.
 
-Identity rules (spec §8): server keys are exact, case-sensitive, own-property lookups (`Object.hasOwn`); `github/constructor` and server `__proto__` are unreviewed, and the loader refuses those keys outright. Built-in tools live under the exact keys `builtin:claude-code` and `builtin:codex`, which MCP hook names cannot produce (Claude Code allows only `[A-Za-z0-9_-]` in MCP server names); the loader refuses any other key with a `:`, any non-builtin key that normalises to `claudecode`, `builtinclaudecode`, `codex`, or `builtincodex`, and any two keys that differ only by case.
+Identity rules (spec §8): server keys are exact, case-sensitive, own-property lookups (`Object.hasOwn`); `github/constructor` and server `__proto__` are unreviewed, and the loader refuses those keys outright. Built-in tools live under the exact keys `builtin:claude-code` and `builtin:codex`, which MCP hook names cannot produce (Claude Code allows only `[A-Za-z0-9_-]` in MCP server names); the loader refuses any other key with a `:`, any non-builtin key that normalises to `claudecode`, `builtinclaudecode`, `codex`, or `builtincodex`, and any two keys that become equal under NFKC plus lowercase. Tool keys must match
+`^[A-Za-z0-9_.-]{1,128}$`; lookups remain exact and case-sensitive.
 
 Invariant: nothing downgrades. `escalateWhen` may raise a row's class for matching arguments; the loader refuses an escalation whose `to` is not above the base class, and `evaluate()` takes the max anyway.
 
@@ -18,13 +19,25 @@ schema validation; dictionaries are projected with `Object.fromEntries`. Duplica
 non-string keys, parse warnings/errors, invalid regexes, and invalid review dates are refused.
 YAML merge processing is disabled. Ordinary aliases use the parser's default expansion limit.
 Prototype-named argument patterns remain legal; only own arguments match them.
-Proxy names follow the frozen regex, minimum length, reserved-name and upstream collision checks.
+Proxy names follow the frozen regex, minimum length and reserved-name checks. Upstream collision
+checks apply Codex sanitisation (non-ASCII-alphanumeric/underscore → underscore, trim trailing
+underscores, lowercase) before comparing against the proxy name.
+
+All configuration loaders require the literal integer spelling `version: 1` (also JSON `1`);
+quoted strings, aliases, floats, hexadecimal, padded integers and exponent spellings are refused.
+On POSIX, configuration files must belong to the process real uid (`process.getuid()`)
+and must not be group/world-writable (`mode & 0o022`); `0600` and `0644` are supported.
+The shared reader checks and reads the same open descriptor, then closes it even on error.
+Owner/mode checks are skipped on Windows, where these POSIX semantics do not apply.
 
 Suggestions use the first name match and any present trusted annotations. Conflicting hints
 select risky over read; absent annotations contribute nothing. The default applies only when
 neither source contributes. No function writes registry files or supplies reviewer metadata.
 The existing registry decision table exercises the real loader/evaluator and compares every row
-with the retained test helper (also still needed by unfinished hook tests).
+with the retained test helper (also still needed by unfinished hook tests). Generated cases cover
+argument shapes, all escalation ranks, AND predicates, ties and malformed schemas. The oracle
+checks parsed objects independently; it shares only the regex-subset validator. Source spelling,
+YAML duplicate keys and file permissions are checked by loader tests before parsing loses them.
 
 Due diligence, checked 2026-09-30 against installed `yaml` 2.9.1:
 - [V] [Official YAML docs](https://eemeli.org/yaml/#parse-options) specify `uniqueKeys: true`;

@@ -1,13 +1,8 @@
-import { readFile } from "node:fs/promises";
-import { parseDocument } from "yaml";
+import { parseConfigDocument, readConfigFile } from "../config-file.js";
 
 /** Keep YAML mappings as Maps until validated; never coerce non-string keys. */
 export async function readYaml(path: string): Promise<unknown> {
-  const doc = parseDocument(await readFile(path, "utf8"), {
-    uniqueKeys: true, schema: "core", merge: false, prettyErrors: false,
-  });
-  if (doc.errors.length || doc.warnings.length) throw new Error("Invalid YAML configuration");
-  return doc.toJS({ mapAsMap: true });
+  return parseConfigDocument(readConfigFile(path)).toJS({ mapAsMap: true });
 }
 export function mapping(value: unknown, at: string, fields?: readonly string[]): Map<string, unknown> {
   if (!(value instanceof Map)) throw new Error(`${at}: expected a mapping`);

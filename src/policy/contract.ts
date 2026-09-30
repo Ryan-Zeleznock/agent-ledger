@@ -84,6 +84,9 @@ export async function loadRegistry(path: string): Promise<ToolRegistry> {
     if (typeof trusted !== "boolean") throw new Error(`${name}: trusted must be boolean`);
     const toolsMap = mapping(s.get("tools"), `${name}.tools`);
     checkKeys(toolsMap, `${name}.tools`);
+    for (const tool of toolsMap.keys()) {
+      if (!/^[A-Za-z0-9_.-]{1,128}$/.test(tool)) throw new Error(`${name}: invalid ASCII tool key`);
+    }
     const tools = Object.fromEntries([...toolsMap].map(([tool, entry]) => [tool, toolEntry(entry, `${name}/${tool}`)]));
     return [name, { trusted, tools }];
   }));
@@ -97,7 +100,7 @@ export async function loadRegistry(path: string): Promise<ToolRegistry> {
       if (!CODEX_PROXY_SERVER_NAME_RE.test(name) || name.length < CODEX_PROXY_SERVER_NAME_MIN_LENGTH || reservedServer(name)) {
         throw new Error("proxy.codex.serverName: invalid or reserved name (minimum 16 characters; no leading/trailing underscore or internal __)");
       }
-      if (Object.keys(servers).some(k => k.toLowerCase() === name.toLowerCase())) {
+      if (Object.keys(servers).some(k => k.replace(/[^A-Za-z0-9_]/g, "_").replace(/_+$/, "").toLowerCase() === name.toLowerCase())) {
         throw new Error("proxy.codex.serverName: proxy cannot also be an upstream");
       }
       result.proxy.codex = { serverName: name };
@@ -114,8 +117,8 @@ function checkKeys(entries: Map<string, unknown>, at: string): void {
   for (const key of entries.keys()) {
     if ((RESERVED_KEYS as readonly string[]).includes(key) || key in Object.prototype) throw new Error(`${at}: reserved key ${key}`);
     string(key, at);
-    if (seen.has(key.toLowerCase())) throw new Error(`${at}: keys differ only by case`);
-    seen.add(key.toLowerCase());
+    if (seen.has(key.normalize("NFKC").toLowerCase())) throw new Error(`${at}: keys are NFKC/case twins`);
+    seen.add(key.normalize("NFKC").toLowerCase());
   }
 }
 function toolClass(value: unknown, at: string): ToolClass {
