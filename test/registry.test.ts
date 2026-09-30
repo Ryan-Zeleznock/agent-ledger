@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { parse } from "yaml";
-import { evaluate, loadRegistry, CLASS_DECISION, CLASS_RANK, type Escalation, type ToolClass, type ToolRegistry } from "../src/policy/contract.js";
+import { clearArgFields, evaluate, loadRegistry, CLASS_DECISION, CLASS_RANK, type Escalation, type ToolClass, type ToolRegistry } from "../src/policy/contract.js";
 import { BUILTIN_CODEX_SERVER, BUILTIN_SERVER, BUILTIN_SERVER_KEYS, MCP_SERVER_NAME_RE, RESERVED_KEYS, RESERVED_SERVER_NAMES } from "../src/types/index.js";
 import { decide as helperDecide, isReservedKey, isReservedServerName, normalise, splitToolName, validate, type Args } from "./helpers/registry-eval.js";
 
@@ -55,6 +55,16 @@ describe("policies/tools.example.yaml (ADR-004 registry)", () => {
     });
     expect(CLASS_RANK.read).toBeLessThan(CLASS_RANK.write);
     expect(CLASS_RANK.write).toBeLessThan(CLASS_RANK.risky);
+  });
+  it.each([
+    ["github", "list_repos", ["owner"]],
+    ["github", "create_issue", ["owner", "repo", "title"]],
+    [BUILTIN_SERVER, "Read", ["file_path"]],
+    [BUILTIN_SERVER, "Bash", []],
+    [BUILTIN_CODEX_SERVER, "Bash", []],
+  ] as const)("declares clear argument fields for %s/%s (ADR-009)", (server, tool, fields) => {
+    expect(registry.servers[server]!.tools[tool]!.storeArgs).toEqual(fields);
+    expect(clearArgFields(registry, server, tool)).toEqual(fields);
   });
 
   describe("schema rejects downgrades (the loader refuses these registries)", () => {
