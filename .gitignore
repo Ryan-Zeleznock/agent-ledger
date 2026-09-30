@@ -3,3 +3,4 @@ dist/
 *.jsonl
 .env
 .context/
+.test-build/
