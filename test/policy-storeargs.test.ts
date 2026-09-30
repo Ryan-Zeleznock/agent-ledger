@@ -19,6 +19,13 @@ async function file(value: unknown) {
 }
 
 describe("storeArgs loader (ADR-009)", () => {
+  it.each([{ original: [] }, { original: ["owner", "0", "1e3"] }])("freezes the loaded allowlist %# against widening", async ({ original }) => {
+    const loaded = await loadRegistry(await file(registry({ storeArgs: original })));
+    const fields = clearArgFields(loaded, "github", "t");
+    expect(() => (fields as string[]).push("x")).toThrow(TypeError);
+    expect(clearArgFields(loaded, "github", "t")).toEqual(original);
+    expect(Object.isFrozen(fields)).toBe(true);
+  });
   it("keeps an absent allowlist absent and allows no clear args", async () => {
     const loaded = await loadRegistry(await file(registry()));
     expect(Object.hasOwn(loaded.servers.github!.tools.t!, "storeArgs")).toBe(false);
@@ -52,6 +59,9 @@ describe("storeArgs loader (ADR-009)", () => {
 });
 
 describe.each([clearArgFields, helperClearArgFields])("clearArgFields %s", fields => {
+  it.each([null, "owner", 1, true, {}, { 0: "owner", length: 1 }])("ignores non-array hand-built allowlists %#", storeArgs => {
+    expect(fields(registry({ storeArgs }), "github", "t")).toEqual([]);
+  });
   it("returns declared fields regardless of reviewed class or server trust", () => {
     for (const cls of ["read", "write", "risky"] as const) for (const trusted of [true, false]) {
       const value = registry({ class: cls, storeArgs: ["owner", "repo"] });

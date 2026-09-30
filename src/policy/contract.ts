@@ -153,6 +153,7 @@ function toolEntry(value: unknown, at: string): ToolEntry {
       seen.add(field);
       return field;
     });
+    Object.freeze(row.storeArgs);
   }
   if (m.has("escalateWhen")) row.escalateWhen = sequence(m.get("escalateWhen"), `${at}.escalateWhen`).map((value, i) => {
     const where = `${at}#escalate:${i}`;
@@ -174,7 +175,7 @@ export function clearArgFields(registry: ToolRegistry, server: string, tool: str
   const s = Object.hasOwn(registry.servers, server) ? registry.servers[server] : undefined;
   const row = s && Object.hasOwn(s.tools, tool) ? s.tools[tool] : undefined;
   if (!row || !Object.hasOwn(CLASS_DECISION, row.class) || !Object.hasOwn(row, "storeArgs")) return [];
-  return row.storeArgs ?? [];
+  return Array.isArray(row.storeArgs) ? row.storeArgs : [];
 }
 
 // Keep compiled state out of the frozen public shapes. A changed row invalidates its cache.

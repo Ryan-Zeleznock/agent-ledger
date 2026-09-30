@@ -154,7 +154,7 @@ function lookup(reg: ToolRegistry, server: string, tool: string): ToolEntry | un
 export function clearArgFields(reg: ToolRegistry, server: string, tool: string): readonly string[] {
   const row = lookup(reg, server, tool);
   if (!row || !isClass(row.class) || !Object.hasOwn(row, "storeArgs")) return [];
-  return row.storeArgs ?? [];
+  return Array.isArray(row.storeArgs) ? row.storeArgs : [];
 }
 
 export function decide(reg: ToolRegistry, server: string, tool: string, args: Args = {}): PolicyDecision {

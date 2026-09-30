@@ -38,6 +38,7 @@ servers:
         class: write
         reviewedBy: ryan
         reviewedAt: 2026-09-29
+        # Judgment call: keep title clear so auditors can read the issue title; redaction still runs on it.
         storeArgs: [owner, repo, title] # Keep identifying context; the free-form issue body is hashed.
         note: Creates content; nothing is destroyed. Approval-free but always logged.
       merge_pull_request:
