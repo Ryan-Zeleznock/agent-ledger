@@ -100,7 +100,8 @@ export async function loadRegistry(path: string): Promise<ToolRegistry> {
       if (!CODEX_PROXY_SERVER_NAME_RE.test(name) || name.length < CODEX_PROXY_SERVER_NAME_MIN_LENGTH || reservedServer(name)) {
         throw new Error("proxy.codex.serverName: invalid or reserved name (minimum 16 characters; no leading/trailing underscore or internal __)");
       }
-      if (Object.keys(servers).some(k => k.replace(/[^A-Za-z0-9_]/g, "_").replace(/_+$/, "").toLowerCase() === name.toLowerCase())) {
+      // Hooks split at the first __, including separators introduced by sanitisation.
+      if (Object.keys(servers).some(k => k.replace(/[^A-Za-z0-9_]/g, "_").split("__")[0]!.replace(/_+$/, "").toLowerCase() === name.toLowerCase())) {
         throw new Error("proxy.codex.serverName: proxy cannot also be an upstream");
       }
       result.proxy.codex = { serverName: name };

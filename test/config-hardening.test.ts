@@ -29,10 +29,19 @@ it.each([["café", "cafe\u0301"], ["Read", "Ｒｅａｄ"]])("detects NFKC twins
 it.each(["a.b-c_d", "a".repeat(128)])("accepts ASCII tool key %s", async key => {
   await expect(loadRegistry(file(registry({ [key]: row() })))).resolves.toBeDefined();
 });
-it.each(["agentledger-proxy-7f3a9c2e1b04", "agentledger_proxy_7f3a9c2e1b04_", "AgentLedger_Proxy_7f3a9c2e1b04--"])("refuses sanitized proxy/upstream twin %s", async upstream => {
+it.each([
+  "agentledger-proxy-7f3a9c2e1b04", "agentledger_proxy_7f3a9c2e1b04_", "AgentLedger_Proxy_7f3a9c2e1b04--",
+  "agentledger_proxy_7f3a9c2e1b04--foo", "agentledger_proxy_7f3a9c2e1b04-_foo", "agentledger_proxy_7f3a9c2e1b04_-foo",
+  "AgentLedger-Proxy-7f3a9c2e1b04--foo",
+])("refuses sanitized proxy/upstream twin %s", async upstream => {
   const value = { version: 1, servers: { [upstream]: { trusted: true, tools: {} } }, proxy: { codex: { serverName: "agentledger_proxy_7f3a9c2e1b04" } } };
   await expect(loadRegistry(file(value))).rejects.toThrow(/upstream/);
-  expect(validate(value as ToolRegistry).length).toBeGreaterThan(0);
+  expect(validate(value as ToolRegistry)).toEqual(expect.arrayContaining([expect.stringMatching(/upstream/)]));
+});
+it.each(["agentledger_proxy_7f3a9c2e1b04-foo", "other--agentledger_proxy_7f3a9c2e1b04"])("accepts a distinct hook-visible upstream %s", async upstream => {
+  const value = { version: 1, servers: { [upstream]: { trusted: true, tools: {} } }, proxy: { codex: { serverName: "agentledger_proxy_7f3a9c2e1b04" } } };
+  await expect(loadRegistry(file(value))).resolves.toBeDefined();
+  expect(validate(value as ToolRegistry)).toEqual([]);
 });
 it.each(["0x1", "1.0", "+1", "01", "1e0", '"1"', "true"])("requires literal version 1 in both files: %s", async version => {
   await expect(loadRegistry(file(`version: ${version}\nservers: {}`, true))).rejects.toThrow(/version/);

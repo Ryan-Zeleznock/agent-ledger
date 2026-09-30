@@ -90,7 +90,7 @@ export function validate(reg: ToolRegistry): string[] {
       if (!CODEX_PROXY_SERVER_NAME_RE.test(name)) problems.push("proxy.codex.serverName: must be [A-Za-z0-9_] with no leading, trailing or internal __ (Codex trims the ends; the hook name splits at the first __)");
       if (name.length < CODEX_PROXY_SERVER_NAME_MIN_LENGTH) problems.push(`proxy.codex.serverName: shorter than ${CODEX_PROXY_SERVER_NAME_MIN_LENGTH}`);
       if (isReservedServerName(name)) problems.push("proxy.codex.serverName: collides with the builtin namespace");
-      if (Object.keys(reg.servers).some((k) => codexSanitize(k).replace(/_+$/, "").toLowerCase() === name.toLowerCase())) problems.push("proxy.codex.serverName: equals a servers key (the proxy is not an upstream)");
+      if (Object.keys(reg.servers).some((k) => codexSanitize(k).split("__")[0]!.replace(/_+$/, "").toLowerCase() === codexSanitize(name).toLowerCase())) problems.push("proxy.codex.serverName: equals a servers key (the proxy is not an upstream)");
     }
   }
   return problems;

@@ -77,5 +77,7 @@ export function compileRegex(value: unknown, at: string): RegExp {
       atom = true;
     }
   }
+  // Check after the whole pattern: a quantifier can follow all the alternatives.
+  if (quantifiers > 0 && groups[0]!.paths + groups[0]!.alternatives > 16) unsafe();
   try { return new RegExp(value, "i"); } catch { throw new Error(`${at}: invalid regex`); }
 }

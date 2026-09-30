@@ -20,8 +20,9 @@ non-string keys, parse warnings/errors, invalid regexes, and invalid review date
 YAML merge processing is disabled. Ordinary aliases use the parser's default expansion limit.
 Prototype-named argument patterns remain legal; only own arguments match them.
 Proxy names follow the frozen regex, minimum length and reserved-name checks. Upstream collision
-checks apply Codex sanitisation (non-ASCII-alphanumeric/underscore → underscore, trim trailing
-underscores, lowercase) before comparing against the proxy name.
+checks apply Codex sanitisation (non-ASCII-alphanumeric/underscore → underscore), take the first
+`__` segment visible to hooks, trim trailing underscores and lowercase before comparing against
+the proxy name. This also refuses upstream suffixes such as `--foo`, `-_foo` and `_-foo`.
 
 All configuration loaders require the literal integer spelling `version: 1` (also JSON `1`);
 quoted strings, aliases, floats, hexadecimal, padded integers and exponent spellings are refused.
@@ -61,7 +62,7 @@ Due diligence, checked 2026-09-30 against installed `yaml` 2.9.1:
 Regexes use a conservative subset, including in suggestions: at most 512 UTF-16 code units,
 one quantifier total (`*`, `+`, `?`, `{n}`, `{n,m}`, `{n,}`), on a single character/class only;
 finite counts must be ≤1024. Groups and alternatives are allowed but groups cannot be quantified; expanding alternatives
-across concatenated groups may produce at most 256 paths.
+across concatenated groups may produce at most 256 paths, or 16 when any quantifier is present.
 Lookaround, backreferences, named groups, lazy quantifiers, and numeric/hex/Unicode escapes
 are refused. Character classes and escaped punctuation are supported. This intentionally rejects
 some safe regexes to exclude nested repetition, ambiguous repeated alternatives and overlapping

@@ -22,6 +22,19 @@ describe("policies/suggestions.yaml (suggestions only, never authority)", () => 
     expect(raw).not.toMatch(/verdict|defaultDecision|unless|argPattern/);
     for (const r of rules.rules) expect(Object.keys(r).sort()).toEqual(["class", "id", "reason", "tool"]);
   });
+  it("preserves IAM suggestions across every verb/noun pair when patterns are split", async () => {
+    const rules = await rulesPromise;
+    const iam = rules.rules.filter(r => r.id.startsWith("risky-iam-change"));
+    for (const verb of ["grant", "revoke", "attach", "detach", "assign", "put", "create", "update", "delete", "add", "remove", "set", "invite", "rotate"]) {
+      for (const noun of ["role", "policy", "permission", "iam", "user", "group", "member", "access", "token", "key"]) {
+        for (const bridge of ["", "_all_", "123", "-"]) {
+          const name = `prefix_${verb}${bridge}${noun}s`.toUpperCase();
+          expect(iam.some(r => new RegExp(r.tool, "i").test(name)), name).toBe(bridge !== "-");
+        }
+      }
+    }
+    expect(iam.every(r => r.class === "risky" && r.reason === "Permission or credential change")).toBe(true);
+  });
 
   const cases: [string, ToolClass, string][] = [
     // the names Astra used to break the old regex authority now at least SUGGEST risky

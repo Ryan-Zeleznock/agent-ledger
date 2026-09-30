@@ -43,6 +43,27 @@ it.each(["(a+)+$", "(a|aa)+$", "a+a+$", "(a?){30}a{30}", "(?=a)a", "(a)\\1", "a{
 it.each(["^(main|master|release/.*)$", "^[a-z]{1,32}$", "^\\w+$", "^a\\+b$", "[()?+*]", "(?:main|master)"])("accepts supported regex %s", async pattern => {
   await expect(loadRegistry(file(config(pattern)))).resolves.toBeDefined();
 });
+it("refuses Fable's quantified 256-path alternation at load", async () => {
+  await expect(loadRegistry(file(config("[\\s\\S]*" + "(a|a)".repeat(8) + "$")))).rejects.toThrow(/unsafe regex/);
+});
+it.each([".*", "\\w+", "a?", "[\\s\\S]{0,1024}", "a{1}", "a{2,}"])("caps alternation paths at 16 with quantifier %s", async quantified => {
+  for (const paths of [16, 17, 32]) {
+    const alternatives = Array(paths).fill("a").join("|");
+    // Count top-level alternatives too, even when the quantifier comes last.
+    for (const pattern of [`${quantified}(${alternatives})$`, `${alternatives}${quantified}$`]) {
+      const loaded = loadRegistry(file(config(pattern)));
+      if (paths === 16) await expect(loaded).resolves.toBeDefined();
+      else await expect(loaded).rejects.toThrow(/unsafe regex/);
+    }
+  }
+});
+it("multiplies concatenated paths and sums nested alternatives before applying the quantified cap", async () => {
+  for (const pattern of ["(a|a)".repeat(4), "((a|a)(a|a)|(a|a)(a|a))" + "(a|a)"]) {
+    await expect(loadRegistry(file(config(pattern + ".*$")))).resolves.toBeDefined();
+    await expect(loadRegistry(file(config(`(${pattern}|b).*$`)))).rejects.toThrow(/unsafe regex/);
+  }
+  await expect(loadRegistry(file(config("(a|a)".repeat(8) + "$")))).resolves.toBeDefined();
+});
 it("matches structured values without coercion; treats absent/non-object args as empty", async () => {
   const registry = await loadRegistry(file(config("^main$")));
   for (const env of [{ x: "main" }, ["feature", "main"], { toString: 1 }, Object.create(null)]) {
