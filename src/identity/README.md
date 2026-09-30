@@ -9,6 +9,8 @@ Status: implemented
 `createIdentity("file", path)` synchronously validates and snapshots a static YAML or JSON
 registry. Initialization throws on unreadable files, malformed schemas, unknown fields,
 duplicate YAML keys, NFKC/case-twin agent ids, or duplicate `(kind, sha256)` credentials.
+Agent ids must contain 1–64 ASCII letters, digits, dots, underscores or hyphens; whitespace,
+NUL and zero-width characters are refused.
 The version must be the literal integer `1`, not a string, alias, hex, float or exponent spelling.
 On POSIX, the file must belong to `process.getuid()` and have no group/world-write bits
 (`mode & 0o022`); use `0600` or `0644`. The shared reader checks the open descriptor it reads,

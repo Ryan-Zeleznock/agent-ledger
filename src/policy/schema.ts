@@ -31,7 +31,7 @@ export function version(value: unknown): void {
 
 /** Deliberately small regex subset: see README. Never run a pattern to validate its cost. */
 export function compileRegex(value: unknown, at: string): RegExp {
-  if (typeof value !== "string") throw new Error(`${at}: expected a regex string`);
+  if (typeof value !== "string" || value.length === 0) throw new Error(`${at}: expected a non-empty regex string`);
   const unsafe = () => { throw new Error(`${at}: unsafe regex (outside the bounded subset)`); };
   if (value.length > 512) unsafe();
   let inClass = false, atom = false, quantifiers = 0;

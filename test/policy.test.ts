@@ -63,10 +63,10 @@ describe("registry loader", () => {
     }
   });
   it.each([["write", "write"], ["risky", "write"], ["risky", "risky"], ["read", "read"], ["read", "bogus"]])("refuses escalation %s to %s", async (base, to) => {
-    await expect(loadRegistry(await file(withRow({ class: base, escalateWhen: [{ argPattern: {}, to }] })))).rejects.toThrow();
+    await expect(loadRegistry(await file(withRow({ class: base, escalateWhen: [{ argPattern: { branch: "main" }, to }] })))).rejects.toThrow();
   });
   it.each([["read", "write"], ["read", "risky"], ["write", "risky"]])("accepts escalation %s to %s", async (base, to) => {
-    await expect(loadRegistry(await file(withRow({ class: base, escalateWhen: [{ argPattern: {}, to }] })))).resolves.toBeDefined();
+    await expect(loadRegistry(await file(withRow({ class: base, escalateWhen: [{ argPattern: { branch: "main" }, to }] })))).resolves.toBeDefined();
   });
   it.each([
     'version: 1\nversion: 1\nservers: {}',

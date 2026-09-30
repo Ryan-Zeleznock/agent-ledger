@@ -19,6 +19,7 @@ schema validation; dictionaries are projected with `Object.fromEntries`. Duplica
 non-string keys, parse warnings/errors, invalid regexes, and invalid review dates are refused.
 YAML merge processing is disabled. Ordinary aliases use the parser's default expansion limit.
 Prototype-named argument patterns remain legal; only own arguments match them.
+Empty `argPattern` mappings and empty-string regexes are refused at load.
 Proxy names follow the frozen regex, minimum length and reserved-name checks. Upstream collision
 checks apply Codex sanitisation (non-ASCII-alphanumeric/underscore → underscore), take the first
 `__` segment visible to hooks, trim trailing underscores and lowercase before comparing against

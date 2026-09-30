@@ -70,6 +70,7 @@ export function validate(reg: ToolRegistry): string[] {
       for (const [i, e] of (t.escalateWhen ?? []).entries()) {
         if (!fields(e, `${at}#escalate:${i}`, ["to", "argPattern"])) continue;
         if (fields(e.argPattern, `${at}#escalate:${i}.argPattern`)) {
+          if (Object.keys(e.argPattern).length === 0) problems.push(`${at}#escalate:${i}.argPattern: expected a non-empty mapping`);
           for (const pattern of Object.values(e.argPattern)) {
             try { compileRegex(pattern, at); } catch { problems.push(`${at}#escalate:${i}: regex`); }
           }

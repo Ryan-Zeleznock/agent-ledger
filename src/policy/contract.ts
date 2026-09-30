@@ -145,6 +145,7 @@ function toolEntry(value: unknown, at: string): ToolEntry {
     const to = toolClass(e.get("to"), where);
     if (to === "read" || CLASS_RANK[to] <= CLASS_RANK[cls]) throw new Error(`${where}: to must rank above ${cls}`);
     const patterns = mapping(e.get("argPattern"), `${where}.argPattern`);
+    if (patterns.size === 0) throw new Error(`${where}.argPattern: expected a non-empty mapping`);
     // Prototype names are legal argument names; fromEntries defines own data properties, even __proto__.
     const argPattern = Object.fromEntries(patterns) as Record<string, string>;
     return { to, argPattern };

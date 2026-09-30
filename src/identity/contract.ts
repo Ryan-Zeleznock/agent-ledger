@@ -51,7 +51,7 @@ function loadAgents(target: string): { agents: Set<AgentId>; credentials: Map<st
     for (const value of root.get("agents") as unknown[]) {
       const row = fields(value, ["id", "credential"]);
       const id = row.get("id");
-      if (typeof id !== "string" || !id.trim() || names.has(id.normalize("NFKC").toLowerCase())) throw new Error();
+      if (typeof id !== "string" || id.length < 1 || id.length > 64 || /[^A-Za-z0-9._-]/.test(id) || names.has(id.normalize("NFKC").toLowerCase())) throw new Error();
       const cred = fields(row.get("credential"), ["kind", "sha256"]);
       const kind = cred.get("kind"), hash = cred.get("sha256");
       if ((kind !== "local" && kind !== "api_key") || typeof hash !== "string" || !/^[a-f0-9]{64}$/.test(hash)) throw new Error();

@@ -69,6 +69,18 @@ it.each([0o600, 0o644])("accepts owner-writable configuration %s", async mode =>
 it("refuses case-twin agent ids", () => {
   expect(() => createIdentity("file", file({ version: 1, agents: [agent("astra"), agent("Astra", "b")] }))).toThrow();
 });
+it.each(["", "аstra", "astra\u200b", "astra\u200d", "astra\ufeff", "astra ", "astra\n", "as\tra", "ast\0ra", "a/b", "a".repeat(65)])("refuses invalid agent id %j", id => {
+  expect(() => createIdentity("file", file({ version: 1, agents: [agent(id)] }))).toThrow(/Invalid identity registry/);
+});
+it.each(["a", "Astra_9.prod-worker", "a".repeat(64)])("accepts ASCII agent id %s", async id => {
+  const identity = createIdentity("file", file({ version: 1, agents: [agent(id)] }));
+  await expect(identity.startSession(id)).resolves.toEqual(expect.any(String));
+});
+it.each([{}, { branch: "" }])("refuses empty escalation patterns %j in loader and oracle", async argPattern => {
+  const value = registry({ t: row({ escalateWhen: [{ to: "risky", argPattern }] }) });
+  expect.soft(validate(value as ToolRegistry).length).toBeGreaterThan(0);
+  await expect(loadRegistry(file(value))).rejects.toThrow(/non-empty/);
+});
 it("caps attribution at 256 code units", async () => {
   const identity = createIdentity("file", file(agents));
   await expect(identity.startSession("astra", "a".repeat(256))).resolves.toEqual(expect.any(String));
