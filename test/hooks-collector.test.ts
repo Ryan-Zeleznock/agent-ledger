@@ -229,6 +229,22 @@ describe("validateHandlerOutput (spec §7 exact schema)", () => {
   ])("%j → %s", (raw, expected) => {
     expect(reason(raw)).toBe(expected);
   });
+  it.each([
+    ['{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecision":"allow","permissionDecisionReason":"r"}}', "permissionDecision"],
+    ['{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecision":"deny","permissionDecisionReason":"r"}}', "permissionDecision"],
+    ['{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"r"},"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"r"}}', "hookSpecificOutput"],
+    ['{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permission\\u0044ecision":"allow","permissionDecisionReason":"r"}}', "permissionDecision"],
+    ['{"hookSpecificOutput":{"hookEventName":"PreToolUse","hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"r"}}', "hookEventName"],
+    ['{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"r","permissionDecisionReason":"r"}}', "permissionDecisionReason"],
+  ])("Astra P2 #7: duplicate members are refused before JSON.parse can collapse them: %s", (raw, key) => {
+    expect(reason(raw)).toBe(`watchdog:output:extra-key:${key}`);
+    expect(reason(raw, "codex")).toBe(`watchdog:output:extra-key:${key}`);
+  });
+  it("an escaped key that decodes to a schema key is accepted once (legal JSON), and arbitrary whitespace/order still pass", () => {
+    expect(reason('{"hookSpecificOutput":{"hookEvent\\u004eame":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"r"}}')).toBe("ok");
+    expect(reason('{ "hookSpecificOutput" : { "permissionDecisionReason" : "r" , "permissionDecision" : "deny" , "hookEventName" : "PreToolUse" } }')).toBe("ok");
+    expect(reason('{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"tab\\there \\"quoted\\" \\u00e9"}}')).toBe("ok");
+  });
   it("ask is valid for claude-code only", () => {
     const ask = JSON.stringify({ hookSpecificOutput: { ...allow.hookSpecificOutput, permissionDecision: "ask" } });
     expect(reason(ask, "claude-code")).toBe("ok");
@@ -289,8 +305,8 @@ describe("writeAllSync is looped and TIME-bounded (Astra P1, 2026-09-30)", () =>
     const now = clock(100);
     const started = Date.now();
     expect(() => writeAllSync(2, Buffer.from("x"), 1000, now)).toThrow(/no progress within 1000 ms/);
-    expect(spy.mock.calls.length).toBe(10); // start reads t=0; attempts at t=100..1000 (the check after the 10th sees 1000 >= budget)
-    expect(Date.now() - started).toBeGreaterThanOrEqual(9 * WATCHDOG_WRITE_RETRY_SLEEP_MS - 5); // real sleeps happened between attempts
+    expect(spy.mock.calls.length).toBe(9); // start reads t=0; the budget is checked BEFORE each attempt: attempts at t=100..900, the check at t=1000 throws
+    expect(Date.now() - started).toBeGreaterThanOrEqual(8 * WATCHDOG_WRITE_RETRY_SLEEP_MS - 5); // real sleeps happened between attempts
   });
   it("zero progress (0 bytes accepted, no error) for the whole budget throws too", () => {
     vi.spyOn(fs, "writeSync").mockImplementation((() => 0) as typeof fs.writeSync);
@@ -302,6 +318,10 @@ describe("writeAllSync is looped and TIME-bounded (Astra P1, 2026-09-30)", () =>
     expect(() => writeAllSync(1, Buffer.from("abcd"), 50, clock(10))).toThrow(/incomplete after 50 ms \(2\/4 bytes\)/);
     vi.spyOn(fs, "writeSync").mockImplementation((() => { throw Object.assign(new Error("EPIPE"), { code: "EPIPE" }); }) as typeof fs.writeSync);
     expect(() => writeAllSync(1, Buffer.from("abcd"), 1000, clock(0))).toThrow(/EPIPE/);
+  });
+  it("Astra P2 #4: slow but positive progress is ALSO bounded: 1 byte per call at 600 ms each under a 1000 ms budget throws", () => {
+    vi.spyOn(fs, "writeSync").mockImplementation((() => 1) as typeof fs.writeSync);
+    expect(() => writeAllSync(1, Buffer.from("abc"), 1000, clock(600))).toThrow(/incomplete after 1000 ms/);
   });
   it("uses the default budget when none is given", () => {
     vi.spyOn(fs, "writeSync").mockImplementation((() => { throw eagain(); }) as typeof fs.writeSync);

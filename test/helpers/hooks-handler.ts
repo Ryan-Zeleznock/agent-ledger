@@ -82,6 +82,7 @@ switch (mode) {
   case "group": { // two children in our group (not detached), then the failure path named by param
     const a = sleeper(60_000, "ignore"); const b = sleeper(60_000, "ignore");
     err(`pid:${process.pid}\npid:${a.pid}\npid:${b.pid}\n`);
+    if (process.env["HOOKS_TEST_PID_FILE"]) appendFileSync(process.env["HOOKS_TEST_PID_FILE"], `${a.pid}\n${b.pid}\n`);
     a.unref(); b.unref();
     setTimeout(() => {
       if (param === "loop") spin();

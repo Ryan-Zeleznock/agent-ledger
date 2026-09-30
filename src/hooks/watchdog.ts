@@ -78,6 +78,71 @@ const OUTPUT_KEYS = ["hookEventName", "permissionDecision", "permissionDecisionR
 /** How many `}` positions the multiple-value detector tries before giving up on classification (both outcomes deny). */
 const MULTIPLE_SCAN_LIMIT = 64;
 
+/** Thrown by parseJsonNoDuplicates: an object with the same (decoded) member name twice. */
+class DuplicateKeyError extends Error {
+  readonly key: string;
+  constructor(key: string) { super(`duplicate member ${key}`); this.key = key; } // no parameter property: Node's strip-only TS loader (tests) rejects it
+}
+const JSON_MAX_DEPTH = 32;
+/**
+ * JSON.parse keeps the LAST of two equal member names, so `{"permissionDecision":"deny","permissionDecision":"allow"}`
+ * would read as an allow (Astra P2, 2026-09-30). This bounded recursive-descent parser accepts exactly the JSON grammar
+ * (escapes decoded through JSON.parse on the string token, so `permission\u0044ecision` is the same key), keeps legal
+ * whitespace and member order, and throws DuplicateKeyError on the first repeated name in any object.
+ */
+export function parseJsonNoDuplicates(text: string): unknown {
+  let i = 0; const n = text.length;
+  const ws = () => { while (i < n && (text[i] === " " || text[i] === "\t" || text[i] === "\n" || text[i] === "\r")) i++; };
+  const fail = (): never => { throw new SyntaxError(`invalid JSON at offset ${i}`); };
+  const str = (): string => {
+    let j = i + 1;
+    while (j < n && text[j] !== '"') { if (text.charCodeAt(j) < 0x20) fail(); j += text[j] === "\\" ? 2 : 1; }
+    if (j >= n) fail();
+    const raw = text.slice(i, j + 1); i = j + 1;
+    return JSON.parse(raw) as string;
+  };
+  const value = (depth: number): unknown => {
+    if (depth > JSON_MAX_DEPTH) fail();
+    ws();
+    const c = text[i];
+    if (c === "{") {
+      i++; const out: Record<string, unknown> = {}; const seen = new Set<string>();
+      ws(); if (text[i] === "}") { i++; return out; }
+      for (;;) {
+        ws(); if (text[i] !== '"') fail();
+        const k = str();
+        if (seen.has(k)) throw new DuplicateKeyError(k);
+        seen.add(k);
+        ws(); if (text[i] !== ":") fail(); i++;
+        const v = value(depth + 1);
+        Object.defineProperty(out, k, { value: v, enumerable: true, writable: true, configurable: true });
+        ws();
+        if (text[i] === ",") { i++; continue; }
+        if (text[i] === "}") { i++; return out; }
+        fail();
+      }
+    }
+    if (c === "[") {
+      i++; const out: unknown[] = [];
+      ws(); if (text[i] === "]") { i++; return out; }
+      for (;;) {
+        out.push(value(depth + 1));
+        ws();
+        if (text[i] === ",") { i++; continue; }
+        if (text[i] === "]") { i++; return out; }
+        fail();
+      }
+    }
+    if (c === '"') return str();
+    let j = i; while (j < n && !",}] \t\n\r".includes(text[j]!)) j++;
+    if (j === i) fail();
+    const tok = text.slice(i, j); i = j;
+    return JSON.parse(tok);
+  };
+  const v = value(0); ws(); if (i !== n) fail();
+  return v;
+}
+
 export function serialiseOutput(p: PreToolUseOutput): string {
   return JSON.stringify({ hookSpecificOutput: {
     hookEventName: "PreToolUse",
@@ -98,8 +163,9 @@ export function validateHandlerOutput(raw: string, agent: HookAgent): ValidatedH
   const trimmed = raw.trim();
   if (trimmed.length === 0) return bad("empty");
   let parsed: unknown;
-  try { parsed = JSON.parse(trimmed); }
-  catch {
+  try { parsed = parseJsonNoDuplicates(trimmed); }
+  catch (e) {
+    if (e instanceof DuplicateKeyError) return bad(`extra-key:${safeKey(e.key)}`); // a repeated member is an extra, conflicting key
     // A first complete value followed by more text (a stray console.log) is "multiple"; anything else is "not-json".
     if (trimmed.startsWith("{")) {
       let tries = 0;
@@ -151,11 +217,18 @@ export function validateHookTiming(t: HookTiming): string[] {
 const sleepSync = (ms: number) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
 const errCode = (e: unknown) => (typeof e === "object" && e !== null ? (e as { code?: unknown }).code : undefined);
 
-export function writeAllSync(fd: 1 | 2, data: Uint8Array, budgetMs: number = WATCHDOG_WRITE_BUDGET_MS, now: () => number = Date.now): void {
+/** Monotonic by default (`performance.now`, a Node global); tests inject their own clock. */
+const monotonicNow = () => performance.now();
+
+export function writeAllSync(fd: 1 | 2, data: Uint8Array, budgetMs: number = WATCHDOG_WRITE_BUDGET_MS, now: () => number = monotonicNow): void {
   const start = now();
   let off = 0;
   let progressed = false;
   while (off < data.length) {
+    // The budget is checked before EVERY attempt, so slow-but-positive progress is bounded too (Astra P2 #4, 2026-09-30).
+    if (now() - start >= budgetMs) {
+      throw new Error(progressed ? `write to fd ${fd} incomplete after ${budgetMs} ms (${off}/${data.length} bytes)` : `write to fd ${fd} made no progress within ${budgetMs} ms`);
+    }
     let n = 0;
     try {
       n = fs.writeSync(fd, data, off, data.length - off);
@@ -163,9 +236,6 @@ export function writeAllSync(fd: 1 | 2, data: Uint8Array, budgetMs: number = WAT
       if (errCode(e) !== "EAGAIN" && errCode(e) !== "EWOULDBLOCK") throw e;
     }
     if (n > 0) { off += n; progressed = true; continue; }
-    if (now() - start >= budgetMs) {
-      throw new Error(progressed ? `write to fd ${fd} incomplete after ${budgetMs} ms (${off}/${data.length} bytes)` : `write to fd ${fd} made no progress within ${budgetMs} ms`);
-    }
     sleepSync(WATCHDOG_WRITE_RETRY_SLEEP_MS);
   }
 }
@@ -191,6 +261,13 @@ export function setNonBlocking(fd: 1 | 2): void {
 }
 
 // ---------- the watchdog ----------
+
+/**
+ * The one-shot group kill of the running watchdog, registered by runWatchdog so that a failure INSIDE the emitter (EPIPE,
+ * a failed mode switch, a spent write budget) after a validated allow still kills the handler's group before exit 2
+ * (Astra P2 #3, 2026-09-30). One watchdog per process; the function is idempotent (one kill attempt per PGID, ever).
+ */
+let pendingGroupKill: (() => void) | null = null;
 
 const deny = (reason: string, handlerStderr = ""): WatchdogResult => ({
   stdout: denyOutput(reason),
@@ -231,6 +308,7 @@ export function runWatchdog(opts: WatchdogOptions): Promise<WatchdogResult> {
       try { process.kill(-child.pid, WATCHDOG_KILL_SIGNAL); }
       catch { /* ESRCH: the group is already gone; any other error leaves nothing more to do */ }
     };
+    pendingGroupKill = killGroupOnce;
     const finish = (r: WatchdogResult) => {
       if (settled) return;
       settled = true;
@@ -351,8 +429,8 @@ export function runWatchdog(opts: WatchdogOptions): Promise<WatchdogResult> {
  * ONE write budget window so a stalled reader cannot hold the process past WATCHDOG_WRITE_BUDGET_MS by much.
  */
 export function emitAndExit(result: WatchdogResult): never {
-  const start = Date.now();
-  const remaining = () => Math.max(1, WATCHDOG_WRITE_BUDGET_MS - (Date.now() - start));
+  const start = monotonicNow();
+  const remaining = () => Math.max(1, WATCHDOG_WRITE_BUDGET_MS - (monotonicNow() - start));
   let code: 0 | 2 = result.exitCode;
   try {
     setNonBlocking(1);
@@ -361,6 +439,8 @@ export function emitAndExit(result: WatchdogResult): never {
     if (result.stderr.length > 0) writeAllSync(2, Buffer.from(result.stderr.endsWith("\n") ? result.stderr : `${result.stderr}\n`, "utf8"), remaining());
   } catch (e) {
     code = 2;
+    // A failed emission is a failure path after the spawn: no descendant in the handler's group survives it.
+    try { pendingGroupKill?.(); } catch { /* nothing more to do */ }
     const reason = `${WATCHDOG_REASON_PREFIX}write:${e instanceof Error ? e.message : String(e)}`;
     try { writeAllSync(2, Buffer.from(`${reason}\n`, "utf8"), remaining()); } catch { /* stderr is gone too */ }
     if (result.exitCode !== 2) { try { writeAllSync(1, Buffer.from(`${denyOutput(reason)}\n`, "utf8"), remaining()); } catch { /* nothing left to try */ } }

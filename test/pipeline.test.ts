@@ -214,6 +214,22 @@ describe("decide(): ADR-006 Codex rules", () => {
     expect(outcomes()[0]!.outcome).toEqual({ status: "blocked" });
     expect(outcomes()[0]!.call.callId).toBe("cx3");
   });
+  it("Astra P1 #2: a Codex mcp__ hook name never borrows a registry row's clear fields: not-proxied denials and handoffs store hashes only", async () => {
+    const p = createPipeline(deps({ hookAgent: "codex", ledger: ledger as never }));
+    // github_/list_repos and github/_list_repos both arrive as mcp__github__list_repos → server github (a reviewed row with storeArgs [owner])
+    await p.decide(call("github", "list_repos", { owner: "synthetic-private-value-48293" }, "cx4"));
+    await p.decide(call(PROXY, "list_repos", { owner: "synthetic-private-value-48293" }, "cx5"));
+    for (const r of ledger.records) {
+      expect(r.call.args["owner"], `${r.phase} ${r.call.callId}`).toMatch(/^hmac-sha256:[0-9a-f]{64}$/);
+    }
+    expect(JSON.stringify(ledger.records)).not.toContain("synthetic-private-value");
+    // built-in rows keep their allowlists under Codex; Claude Code MCP rows keep theirs
+    await p.decide(call("builtin:codex", "update_plan", { plan: "x" }));
+    expect(intents().at(-1)!.call.args["plan"]).toMatch(/^hmac-sha256:/);
+    const cc = createPipeline(deps({ hookAgent: "claude-code", ledger: ledger as never }));
+    await cc.decide(call("github", "list_repos", { owner: "acme" }));
+    expect(intents().at(-1)!.call.args["owner"]).toBe("acme");
+  });
   it("with no proxy.codex configured every Codex MCP call is that deny; the same github/list_repos under Claude Code is an allow via the registry", async () => {
     const noProxy: ToolRegistry = { version: 1, servers: registry.servers };
     const cx = createPipeline(deps({ hookAgent: "codex", registry: noProxy, ledger: ledger as never }));
@@ -318,6 +334,30 @@ describe("recordOutcome()", () => {
     expect(outcomes()[0]!.policy.ruleId).toBe(`handoff-to-proxy:${PROXY}`);
     expect(outcomes()[0]!.handoff).toBeUndefined();
   });
+  it("Astra P2 #5: full interleaving on ONE real ledger: hook handoff, proxy intent+outcome, then a fresh Codex post handler → the hook outcome chains to the HANDOFF; the proxy's stays its own; an orphan stays an orphan", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-ledger-pipeline-"));
+    try {
+      const real = createLedger("jsonl", join(dir, "ledger.jsonl"));
+      await createPipeline(deps({ hookAgent: "codex", ledger: real })).decide(call(PROXY, "list_repos", { owner: "acme" }, "C"));
+      const proxyPipe = createPipeline(deps({ hookAgent: undefined, approvals: slack, ledger: real }));
+      await proxyPipe.decide(call("github", "list_repos", { owner: "acme", page: 1 }, "C"));
+      await createPipeline(deps({ hookAgent: undefined, approvals: slack, ledger: real })).recordOutcome("C", { status: "ok", durationMs: 12 });
+      await createPipeline(deps({ hookAgent: "codex", ledger: real })).recordOutcome("C", { status: "ok" });
+      await createPipeline(deps({ hookAgent: "codex", ledger: real })).recordOutcome("nobody", { status: "ok" });
+      const recs: LedgerRecord[] = [];
+      for await (const r of real.read({ from: "2020-01-01T00:00:00Z", to: "2100-01-01T00:00:00Z" })) recs.push(r);
+      expect(recs.map((r) => [r.phase, r.policy.ruleId, r.call.server])).toEqual([
+        ["intent", `handoff-to-proxy:${PROXY}`, PROXY],
+        ["intent", "registry:github/list_repos", "github"],
+        ["outcome", "registry:github/list_repos", "github"],
+        ["outcome", `handoff-to-proxy:${PROXY}`, PROXY],
+        ["outcome", `${ORPHAN_OUTCOME_RULE_PREFIX}nobody`, "unknown"],
+      ]);
+      expect(recs[3]!.handoff).toBeUndefined();
+      expect(recs[3]!.call.args).toEqual(recs[0]!.call.args);
+      expect(await real.verify()).toEqual({ ok: true, checked: 5 });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it("refuses a missing callId or an invalid status", async () => {
     const p = createPipeline(deps({ ledger: ledger as never }));
     await expect(p.recordOutcome("", { status: "ok" })).rejects.toThrow(/callId/);
@@ -339,6 +379,28 @@ describe("handle(): proxy mode", () => {
     expect("credential" in executed).toBe(false);
     expect(outcomes()[0]!.outcome).toMatchObject({ status: "ok" });
     expect(typeof outcomes()[0]!.outcome!.durationMs).toBe("number");
+  });
+  it("Astra P1 #1: upstream executes the RAW args (scalars, objects, bodies) while the ledger stores the projection; read and approved-write", async () => {
+    requestApproval.mockImplementation(async (c) => approval("approved", { approver: "U0123456789" })(c.callId));
+    const p = proxy();
+    const readArgs = { owner: "acme", page: 2, filter: { a: [1, 2], b: "x" }, body: "line1\nline2" };
+    await p.handle(call("github", "list_repos", readArgs, "h3"));
+    expect(upstream.execute.mock.calls[0]![0].args).toEqual(readArgs);
+    expect(upstream.execute.mock.calls[0]![0].args).not.toBe(readArgs);
+    expect(intents()[0]!.call.args).toEqual({ owner: "acme", page: expect.stringMatching(/^hmac-sha256:/), filter: expect.stringMatching(/^hmac-sha256:/), body: expect.stringMatching(/^hmac-sha256:/) });
+    expect(outcomes()[0]!.call.args).toEqual(intents()[0]!.call.args);
+    const writeArgs = { repo: "r", confirm: true, reason: "cleanup" };
+    await p.handle(call("github", "delete_repo", writeArgs, "h4"));
+    expect(upstream.execute.mock.calls[1]![0].args).toEqual(writeArgs);
+    expect(Object.values(intents()[1]!.call.args).every((v) => String(v).startsWith("hmac-sha256:"))).toBe(true);
+    expect(requestApproval.mock.calls[0]![0].args).toEqual(intents()[1]!.call.args); // Slack previews see the storage projection, never raw values
+    expect(JSON.stringify(ledger.records)).not.toContain("cleanup");
+  });
+  it("Astra P1 #1: no execution while the intent append fails, and the executed call carries no credential and no hash", async () => {
+    ledger.failNext = 1;
+    const res = await proxy().handle(call("github", "list_repos", { owner: "acme", page: 2 }));
+    expect(res.isError).toBe(true);
+    expect(upstream.execute).not.toHaveBeenCalled();
   });
   it("denied (Slack denied) → one blocked outcome record, isError result, upstream never called", async () => {
     requestApproval.mockImplementation(async (c) => approval("denied", { approver: "U0123456789" })(c.callId));
@@ -422,8 +484,8 @@ describe("ADR-009 + pin 1: argument projection (clear fields kept, everything el
       expect(lines[0]!.call.args["title"]).toBe("rotate token=[REDACTED:assignment]");
       expect(lines[0]!.call.args["body"]).toBe(hmac("secret body"));
       expect(lines[1]!.call.args["file_path"]).toBe("/etc/passwd");
-      // a field whose NAME is sensitive is hashed by the projection and then replaced by the ledger's key layer: safe, stated in the README
-      expect(lines[1]!.call.args["password"]).toBe("[REDACTED:key:password]");
+      // Astra P2 #6: a field whose NAME is sensitive keeps its HMAC evidence through the ledger's key-layer redaction (ADR-009: every non-clear field is stored as its digest)
+      expect(lines[1]!.call.args["password"]).toBe(hmac("p"));
       expect(lines[2]!.phase).toBe("outcome");
       expect(lines[2]!.call.args).toEqual(lines[0]!.call.args);
       const text = readFileSync(join(dir, "ledger.jsonl"), "utf8");
@@ -432,6 +494,26 @@ describe("ADR-009 + pin 1: argument projection (clear fields kept, everything el
       expect(text).not.toContain("secret body");
       expect(await real.verify()).toEqual({ ok: true, checked: 3 });
       writeFileSync(join(dir, "ok"), "");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it("Astra P2 #6: sensitive NAMES on an unreviewed tool keep distinct, key-verifiable digests in the REAL ledger; clear sensitive-looking VALUES are still redacted", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-ledger-pipeline-"));
+    try {
+      const real = createLedger("jsonl", join(dir, "ledger.jsonl"));
+      const p = createPipeline(deps({ ledger: real }));
+      const other = randomBytes(32);
+      const p2 = createPipeline(deps({ ledger: real, argsHmacKey: other }));
+      await p.decide(call("github", "unknown_tool", { password: "hunter2", token: "t-1", api_key: "k", Authorization: "Bearer abc", nested_secret: { pin: "1234" } }, "k1"));
+      await p.decide(call("github", "unknown_tool", { password: "hunter3" }, "k2"));
+      await p2.decide(call("github", "unknown_tool", { password: "hunter2" }, "k3"));
+      const lines = readFileSync(join(dir, "ledger.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l) as LedgerRecord);
+      expect(lines[0]!.call.args).toEqual({ password: hmac("hunter2"), token: hmac("t-1"), api_key: hmac("k"), Authorization: hmac("Bearer abc"), nested_secret: hmac({ pin: "1234" }) });
+      expect(lines[1]!.call.args["password"]).toBe(hmac("hunter3"));
+      expect(lines[1]!.call.args["password"]).not.toBe(lines[0]!.call.args["password"]);
+      const otherMac = `${ARGS_HMAC_PREFIX}${createHmac("sha256", other).update('"hunter2"', "utf8").digest("hex")}`;
+      expect(lines[2]!.call.args["password"]).toBe(otherMac);
+      expect(readFileSync(join(dir, "ledger.jsonl"), "utf8")).not.toMatch(/hunter|t-1|1234|Bearer/);
+      expect(await real.verify()).toEqual({ ok: true, checked: 3 });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it("the pipeline reads no suggestions file: deps.registry is the only policy input", () => {
