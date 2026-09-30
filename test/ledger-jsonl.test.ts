@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync, appendFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync, appendFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import canonicalize from "canonicalize";
@@ -183,11 +183,107 @@ describe("createLedger('jsonl'): concurrency and restart", () => {
     expect(await createLedger("jsonl", path).verify()).toEqual({ ok: true, checked: 4 });
   });
 
-  it("removes its lock file after each append and breaks a lock left by a dead process", async () => {
-    writeFileSync(`${path}.lock`, "999999 2020-01-01T00:00:00.000Z\n"); // pid that (almost surely) does not exist
+  it("Astra #7: never reclaims a lock automatically: a leftover lock makes append fail closed, in bounded time, with instructions, and the lock stays", async () => {
+    writeFileSync(`${path}.lock`, "999999 2020-01-01T00:00:00.000Z\n"); // a dead pid: still not ours to delete
     const ledger = createLedger("jsonl", path);
+    const prev = process.env.AGENT_LEDGER_LOCK_TIMEOUT_MS;
+    process.env.AGENT_LEDGER_LOCK_TIMEOUT_MS = "150";
+    try {
+      const t0 = performance.now();
+      await expect(ledger.append(unsealed(1))).rejects.toThrow(/stale lock.*remove the lock file manually/s);
+      expect(performance.now() - t0).toBeLessThan(2000);
+      expect(existsSync(`${path}.lock`)).toBe(true);
+      expect(existsSync(path)).toBe(false);
+      process.env.AGENT_LEDGER_LOCK_TIMEOUT_MS = "x";
+      await expect(ledger.append(unsealed(1))).rejects.toThrow(/AGENT_LEDGER_LOCK_TIMEOUT_MS/);
+    } finally {
+      if (prev === undefined) delete process.env.AGENT_LEDGER_LOCK_TIMEOUT_MS; else process.env.AGENT_LEDGER_LOCK_TIMEOUT_MS = prev;
+    }
+    rmSync(`${path}.lock`); // the operator's manual recovery step
     await ledger.append(unsealed(1));
-    expect(existsSync(`${path}.lock`)).toBe(false);
+    expect(existsSync(`${path}.lock`)).toBe(false); // our own lock is released after each append
+  });
+
+  it("Astra #8: a lock path that is a symlink or a FIFO is reported, not followed or blocked on", async () => {
+    const { symlinkSync } = await import("node:fs");
+    const { execFileSync } = await import("node:child_process");
+    const prev = process.env.AGENT_LEDGER_LOCK_TIMEOUT_MS;
+    process.env.AGENT_LEDGER_LOCK_TIMEOUT_MS = "100";
+    try {
+      const ledger = createLedger("jsonl", path);
+      writeFileSync(join(dir, "target.txt"), "12345 2020-01-01T00:00:00.000Z");
+      symlinkSync(join(dir, "target.txt"), `${path}.lock`);
+      await expect(ledger.append(unsealed(1))).rejects.toThrow(/lock .*is held by/);
+      rmSync(`${path}.lock`);
+      execFileSync("mkfifo", [`${path}.lock`]);
+      const t0 = performance.now();
+      await expect(ledger.append(unsealed(1))).rejects.toThrow(/not a regular file|unreadable/);
+      expect(performance.now() - t0).toBeLessThan(2000);
+    } finally {
+      if (prev === undefined) delete process.env.AGENT_LEDGER_LOCK_TIMEOUT_MS; else process.env.AGENT_LEDGER_LOCK_TIMEOUT_MS = prev;
+    }
+  });
+});
+
+describe("createLedger('jsonl'): strict evidence validation (Astra #9, #10)", () => {
+  it("refuses to append on a tail that is not a complete, self-consistent record", async () => {
+    writeFileSync(path, '{"id":"bad","hash":"x"}\n');
+    await expect(createLedger("jsonl", path).append(unsealed(1))).rejects.toThrow(/invalid.*refusing to append/s);
+    rmSync(path);
+    await appendN(1);
+    const recs = parsed();
+    recs[0]!.hash = "0".repeat(64);
+    rewrite(recs);
+    await expect(createLedger("jsonl", path).append(unsealed(2))).rejects.toThrow(/fails its own hash/);
+    expect(lines().length).toBe(1);
+  });
+
+  it("verify() rejects a correctly hashed record that is missing required fields, duplicate ids, blank lines and non-finite numbers", async () => {
+    await appendN(2);
+    const recs = parsed();
+    const partial: Record<string, unknown> = { id: "rec-3", prevHash: recs[1]!.hash, parentRecordId: "rec-2" };
+    partial.hash = hashRecord(partial as never);
+    rewrite([...recs, partial as unknown as LedgerRecord]);
+    expect(await createLedger("jsonl", path).verify()).toEqual({ ok: false, checked: 3, brokenAt: "rec-3" });
+    const dup = { ...recs[1]!, id: "rec-1" } as LedgerRecord;
+    rewrite(rechain([recs[0]!, dup], 1));
+    expect(await createLedger("jsonl", path).verify()).toEqual({ ok: false, checked: 2, brokenAt: "rec-1" });
+    rewrite(recs);
+    writeFileSync(path, readFileSync(path, "utf8").replace("\n", "\n\n"));
+    expect(await createLedger("jsonl", path).verify()).toEqual({ ok: false, checked: 2, brokenAt: "line:2" });
+    const big = { ...recs[1]! };
+    rewrite([recs[0]!, big]);
+    writeFileSync(path, readFileSync(path, "utf8").replace(`"count":`, `"count":`).replace(lines()[1]!, lines()[1]!.replace('"path":"/tmp/file-2.txt"', '"n":1e400')));
+    expect(await createLedger("jsonl", path).verify()).toEqual({ ok: false, checked: 2, brokenAt: "rec-2" });
+  });
+
+  it("re-reads the tail under the lock: a same-size replacement of the last record is seen, not served from a cache", async () => {
+    const ledger = createLedger("jsonl", path);
+    await ledger.append(unsealed(1)); await ledger.append(unsealed(2));
+    const recs = parsed();
+    const swapped = { ...recs[1]!, id: "rec-9" } as LedgerRecord; // same length id, re-hashed: same file size
+    rewrite(rechain([recs[0]!, swapped], 1));
+    expect(statSync(path).size).toBe(Buffer.byteLength(lines().join("\n") + "\n"));
+    const r3 = await ledger.append(unsealed(3));
+    expect(r3.parentRecordId).toBe("rec-9");
+    expect(r3.prevHash).toBe(swapped.hash);
+  });
+
+  it("read() rejects an unframed file and a record with a garbage or offset-free timestamp instead of dropping it", async () => {
+    await appendN(2);
+    const range = { from: "2020-01-01T00:00:00Z", to: "2030-01-01T00:00:00Z" };
+    const drain = async (it: AsyncIterable<LedgerRecord>) => { const out: LedgerRecord[] = []; for await (const r of it) out.push(r); return out; };
+    const good = readFileSync(path, "utf8");
+    writeFileSync(path, good.slice(0, -1));
+    await expect(drain(createLedger("jsonl", path).read(range))).rejects.toThrow(/incomplete line/);
+    const recs = parsed(good.slice(0, -1).split("\n").length === 2 ? undefined : undefined);
+    recs[1]!.writtenAt = "garbage";
+    rewrite(rechain(recs, 1));
+    await expect(drain(createLedger("jsonl", path).read(range))).rejects.toThrow(/writtenAt/);
+    recs[1]!.writtenAt = "2026-09-30T12:00:00";
+    rewrite(rechain(recs, 1));
+    await expect(drain(createLedger("jsonl", path).read(range))).rejects.toThrow(/writtenAt/);
+    await expect(drain(createLedger("jsonl", path).read({ from: "2026-09-30T00:00:00", to: "2026-10-01T00:00:00Z" }))).rejects.toThrow(/range\.from/);
   });
 });
 

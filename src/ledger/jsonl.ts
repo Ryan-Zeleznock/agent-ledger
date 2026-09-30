@@ -1,77 +1,107 @@
-import { closeSync, createReadStream, fsyncSync, mkdirSync, openSync, readFileSync, readSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, constants, createReadStream, fstatSync, fsyncSync, mkdirSync, openSync, readSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
+import { performance } from "node:perf_hooks";
 import { createInterface } from "node:readline";
 import canonicalize from "canonicalize";
 import type { DateRange, LedgerRecord, UnsealedRecord, VerifyResult } from "../types/index.js";
 import type { LedgerStore } from "./contract.js";
 import { sha256Jcs } from "./hash.js";
 import { redactArgs } from "./redact.js";
+import { parseInstant, projectStored, projectUnsealed } from "./validate.js";
 
 /**
  * Append-only JSONL ledger (local mode, spec §3, §5, §9). One record per line, stored in its RFC 8785 form, so the
  * line is byte-for-byte the hash preimage plus the `hash` member.
  *
- * CONCURRENCY (see README "Concurrency"): every append runs (1) behind an in-process promise queue, (2) under an
+ * CONCURRENCY (README "Concurrency design"): every append runs (1) behind an in-process promise queue, (2) under an
  * exclusive lock FILE `<path>.lock` created with the `wx` flag (O_CREAT|O_EXCL, atomic per POSIX open()), and (3) as
- * one write(2) on a descriptor opened with `a` (O_APPEND), followed by fsync. Inside the lock the store re-reads the
- * tail of the file whenever its size changed, so a record written by ANOTHER process becomes the parent of ours.
+ * one write(2) on a descriptor opened with `a` (O_APPEND), followed by fsync. Inside the lock the store ALWAYS
+ * re-reads and re-validates the file's last record, so a record written by another process becomes our parent and a
+ * same-size replacement of the tail is noticed (Astra #9). A lock is never reclaimed automatically (Astra #7): a lock
+ * that outlives its holder makes append() fail closed with instructions, because every unlink-by-pathname
+ * reclamation races with a fresh holder and can produce a fork.
  */
 
 const GENESIS_HASH = "0";
-const LOCK_TIMEOUT_MS = 5_000;   // how long append() waits for another holder before failing (fail-closed for the caller)
-const LOCK_STALE_MS = 30_000;    // a lock older than this whose pid is gone or unknown is broken
+/** How long append() waits for another holder before failing closed. Env override exists for tests and operators. */
+export const LOCK_TIMEOUT_ENV = "AGENT_LEDGER_LOCK_TIMEOUT_MS";
+const LOCK_TIMEOUT_DEFAULT_MS = 5_000;
 const LOCK_RETRY_MS = 5;
 const TAIL_CHUNK = 64 * 1024;
-const PHASES = new Set(["intent", "outcome"]);
+const LOCK_DESCRIBE_BYTES = 256;
 
-interface Tail { size: number; id: string | null; hash: string }
+interface Tail { id: string | null; hash: string }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const isErrno = (e: unknown, code: string) => typeof e === "object" && e !== null && (e as { code?: string }).code === code;
+const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+function lockTimeoutMs(): number {
+  const raw = process.env[LOCK_TIMEOUT_ENV];
+  if (raw === undefined || raw === "") return LOCK_TIMEOUT_DEFAULT_MS;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 600_000) throw new Error(`ledger: ${LOCK_TIMEOUT_ENV} must be an integer between 1 and 600000, got ${JSON.stringify(raw)}`);
+  return n;
+}
 
 // ---------- lock file ----------
 
-function lockIsStale(lockPath: string): boolean {
+/**
+ * Best-effort description of who holds the lock, for the error message only. Opens without following symlinks and
+ * without blocking (a FIFO planted at the lock path must not hang us), reads at most LOCK_DESCRIBE_BYTES from a
+ * regular file, and never decides anything from the content (Astra #8).
+ */
+function describeLock(lockPath: string): string {
+  let fd: number | undefined;
   try {
-    const st = statSync(lockPath);
-    const [pidText] = readFileSync(lockPath, "utf8").split(" ");
-    const pid = Number(pidText);
-    if (Number.isInteger(pid) && pid > 0) {
-      try { process.kill(pid, 0); return false; }            // holder is alive (EPERM also means alive)
-      catch (e) { if (isErrno(e, "ESRCH")) return true; return false; }
-    }
-    return Date.now() - st.mtimeMs > LOCK_STALE_MS;
+    fd = openSync(lockPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+    const st = fstatSync(fd);
+    if (!st.isFile()) return "lock path is not a regular file";
+    const buf = Buffer.alloc(LOCK_DESCRIBE_BYTES);
+    const n = readSync(fd, buf, 0, LOCK_DESCRIBE_BYTES, 0);
+    const text = buf.subarray(0, n).toString("utf8").replace(/[^\x20-\x7e]/g, " ").trim();
+    return text.length > 0 ? `"${text}"` : "empty lock file";
   } catch (e) {
-    return isErrno(e, "ENOENT"); // vanished: not stale, just gone; the caller retries
+    return `unreadable lock file (${isErrno(e, "ELOOP") ? "symlink" : message(e)})`;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
 }
 
-async function acquireLock(lockPath: string): Promise<() => void> {
-  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+async function acquireLock(lockPath: string, timeoutMs: number): Promise<() => void> {
+  const started = performance.now();
   for (;;) {
     try {
       const fd = openSync(lockPath, "wx");
       try { writeSync(fd, `${process.pid} ${new Date().toISOString()}\n`); } finally { closeSync(fd); }
-      return () => { try { unlinkSync(lockPath); } catch { /* already gone */ } };
+      return () => { try { unlinkSync(lockPath); } catch { /* removed by an operator; nothing safe to do */ } };
     } catch (e) {
       if (!isErrno(e, "EEXIST")) throw e;
     }
-    if (lockIsStale(lockPath)) { try { unlinkSync(lockPath); } catch { /* raced */ } continue; }
-    if (Date.now() >= deadline) throw new Error(`ledger: could not acquire ${lockPath} within ${LOCK_TIMEOUT_MS} ms; another process holds the ledger`);
+    if (performance.now() - started >= timeoutMs) {
+      throw new Error(
+        `ledger: lock ${lockPath} is held by ${describeLock(lockPath)}; waited ${timeoutMs} ms. ` +
+        "If that process is gone this is a stale lock: verify the ledger, then remove the lock file manually. " +
+        "Automatic stale-lock reclaim is disabled because it can delete a live holder's lock and fork the chain.",
+      );
+    }
     await sleep(LOCK_RETRY_MS + Math.random() * LOCK_RETRY_MS);
   }
 }
 
 // ---------- file primitives ----------
 
-/** One O_APPEND write of the whole line, then fsync. A short write is completed in a loop (documented limit). */
+/** One O_APPEND write of the whole line, then fsync. A short write is continued; a zero-progress write is an error. */
 function appendLine(path: string, line: string): void {
-  mkdirSync(dirname(path), { recursive: true });
   const buf = Buffer.from(line, "utf8");
   const fd = openSync(path, "a");
   try {
     let off = 0;
-    while (off < buf.length) off += writeSync(fd, buf, off, buf.length - off);
+    while (off < buf.length) {
+      const n = writeSync(fd, buf, off, buf.length - off);
+      if (n <= 0) throw new Error(`ledger: write to ${path} made no progress after ${off} of ${buf.length} bytes`);
+      off += n;
+    }
     fsyncSync(fd);
   } finally {
     closeSync(fd);
@@ -106,30 +136,25 @@ function fileSize(path: string): number {
   try { return statSync(path).size; } catch (e) { if (isErrno(e, "ENOENT")) return 0; throw e; }
 }
 
+const endsWithNewline = (path: string, size: number) => size === 0 || readLastLine(path, size).complete;
+
+/** Parses and strictly validates one stored line; returns the record or the reason it is not one. */
+function parseStored(raw: string): { rec: LedgerRecord; err?: undefined } | { rec?: undefined; err: string; id?: string } {
+  if (raw.length === 0) return { err: "blank line" };
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { return { err: "not JSON" }; }
+  const id = typeof parsed === "object" && parsed !== null && typeof (parsed as { id?: unknown }).id === "string" ? (parsed as { id: string }).id : undefined;
+  try { return { rec: projectStored(parsed) }; } catch (e) { return { err: message(e), ...(id !== undefined && { id }) }; }
+}
+
 // ---------- sealing ----------
 
-const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
-
-/** Explicit field projection (spec §5/§9): nothing that is not a named UnsealedRecord field can reach the file. */
+/** Validate + project (nothing unnamed survives), redact args, then seal. */
 function seal(record: UnsealedRecord, tail: Tail): LedgerRecord {
-  if (typeof record.id !== "string" || record.id.length === 0) throw new Error("ledger.append: record.id must be a non-empty string");
-  if (!PHASES.has(record.phase)) throw new Error(`ledger.append: unknown phase ${JSON.stringify(record.phase)}`);
-  const c = record.call;
-  if (!isPlainObject(c) || !isPlainObject(c.args)) throw new Error("ledger.append: record.call.args must be an object");
-  if (!isPlainObject(record.policy)) throw new Error("ledger.append: record.policy is required");
+  const u = projectUnsealed(record);
   const preimage: Omit<LedgerRecord, "hash"> = {
-    id: record.id,
-    phase: record.phase,
-    call: {
-      callId: c.callId, sessionId: c.sessionId, agentId: c.agentId,
-      ...(c.onBehalfOf !== undefined && { onBehalfOf: c.onBehalfOf }),
-      ...(c.declaredPlan !== undefined && { declaredPlan: c.declaredPlan }),
-      server: c.server, tool: c.tool, args: redactArgs(c.args), receivedAt: c.receivedAt,
-    },
-    policy: record.policy,
-    ...(record.approval !== undefined && { approval: record.approval }),
-    ...(record.outcome !== undefined && { outcome: record.outcome }),
-    ...(record.handoff !== undefined && { handoff: record.handoff }),
+    ...u,
+    call: { ...u.call, args: redactArgs(u.call.args) },
     parentRecordId: tail.id,
     prevHash: tail.hash,
     writtenAt: new Date().toISOString(),
@@ -141,7 +166,6 @@ function seal(record: UnsealedRecord, tail: Tail): LedgerRecord {
 
 export class JsonlLedger implements LedgerStore {
   private queue: Promise<unknown> = Promise.resolve();
-  private tail: Tail | null = null;
 
   constructor(private readonly path: string) {
     if (typeof path !== "string" || path.length === 0) throw new Error("ledger: jsonl target must be a file path");
@@ -154,29 +178,27 @@ export class JsonlLedger implements LedgerStore {
     return run;
   }
 
-  /** The chain tail as the FILE has it, re-read whenever the size changed since we last looked (another process wrote). */
-  private refreshTail(): Tail {
+  /** The chain tail as the FILE has it right now: last line read, framed, validated and self-hash-checked. */
+  private readTail(): Tail {
     const size = fileSize(this.path);
-    if (size === 0) return (this.tail = { size: 0, id: null, hash: GENESIS_HASH });
-    if (this.tail && this.tail.size === size) return this.tail;
+    if (size === 0) return { id: null, hash: GENESIS_HASH };
     const { line, complete } = readLastLine(this.path, size);
-    if (!complete) throw new Error(`ledger: ${this.path} ends with an incomplete line (interrupted write or tampering); refusing to append. Run verify().`);
-    let last: unknown;
-    try { last = JSON.parse(line); } catch { throw new Error(`ledger: last line of ${this.path} is not JSON; refusing to append. Run verify().`); }
-    if (!isPlainObject(last) || typeof last.id !== "string" || typeof last.hash !== "string") {
-      throw new Error(`ledger: last record of ${this.path} has no id/hash; refusing to append. Run verify().`);
-    }
-    return (this.tail = { size, id: last.id, hash: last.hash });
+    if (!complete) throw new Error(`ledger: ${this.path} ends with an incomplete line (interrupted write or tampering); refusing to append. Run verify() and recover manually; never auto-truncate.`);
+    const p = parseStored(line);
+    if (p.err !== undefined) throw new Error(`ledger: last record of ${this.path} is invalid (${p.err}); refusing to append. Run verify().`);
+    const { hash, ...preimage } = p.rec;
+    if (sha256Jcs(preimage) !== hash) throw new Error(`ledger: last record of ${this.path} fails its own hash; refusing to append. Run verify().`);
+    return { id: p.rec.id, hash };
   }
 
   append(record: UnsealedRecord): Promise<LedgerRecord> {
     return this.serialize(async () => {
+      const timeoutMs = lockTimeoutMs();
       mkdirSync(dirname(this.path), { recursive: true }); // the lock file lives next to the ledger
-      const release = await acquireLock(`${this.path}.lock`);
+      const release = await acquireLock(`${this.path}.lock`, timeoutMs);
       try {
-        const sealed = seal(record, this.refreshTail());
+        const sealed = seal(record, this.readTail());
         appendLine(this.path, `${canonicalize(sealed)!}\n`);
-        this.tail = { size: fileSize(this.path), id: sealed.id, hash: sealed.hash };
         return sealed;
       } finally {
         release();
@@ -185,53 +207,63 @@ export class JsonlLedger implements LedgerStore {
   }
 
   head(): Promise<string> {
-    return this.serialize(() => this.refreshTail().hash);
+    return this.serialize(() => this.readTail().hash);
   }
 
-  /** Every stored line, parsed, with its 1-based line number. Throws on a malformed line unless `onBad` handles it. */
-  private async *records(): AsyncGenerator<{ n: number; rec: LedgerRecord | null; raw: string }> {
+  /** Every physical line with its 1-based number. Blank lines are yielded too (they are evidence of damage). */
+  private async *lines(): AsyncGenerator<{ n: number; raw: string }> {
     if (fileSize(this.path) === 0) return;
     const rl = createInterface({ input: createReadStream(this.path, { encoding: "utf8" }), crlfDelay: Infinity });
     let n = 0;
-    for await (const raw of rl) {
-      n++;
-      if (raw.length === 0) continue; // only the trailing newline produces this
-      try {
-        const rec = JSON.parse(raw) as unknown;
-        yield { n, rec: isPlainObject(rec) && typeof rec.hash === "string" ? (rec as unknown as LedgerRecord) : null, raw };
-      } catch {
-        yield { n, rec: null, raw };
-      }
-    }
+    for await (const raw of rl) yield { n: ++n, raw };
   }
 
+  /**
+   * Walks the chain and stops at the first record that fails: not JSON, invalid shape, duplicate id, parent pointer or
+   * prevHash mismatch, recomputed hash mismatch, or (last) a file that does not end with "\n". Internal consistency
+   * only: a full re-chain by whoever can write the file passes this check (README "What verify() cannot see").
+   */
   async verify(): Promise<VerifyResult> {
     let checked = 0;
     let prevId: string | null = null;
     let prevHash = GENESIS_HASH;
     let lastN = 0;
-    for await (const { n, rec } of this.records()) {
-      checked++; lastN = n;
-      if (rec === null) return { ok: false, checked, brokenAt: `line:${n}` };
-      const at = typeof rec.id === "string" ? rec.id : `line:${n}`;
-      const { hash, ...preimage } = rec;
-      if (rec.prevHash !== prevHash || rec.parentRecordId !== prevId) return { ok: false, checked, brokenAt: at };
-      if (sha256Jcs(preimage) !== hash) return { ok: false, checked, brokenAt: at };
-      prevId = rec.id; prevHash = hash;
-    }
+    const ids = new Set<string>();
     const size = fileSize(this.path);
-    if (size > 0 && !readLastLine(this.path, size).complete) return { ok: false, checked, brokenAt: `line:${lastN}` };
+    if (size === 0) return { ok: true, checked: 0 };
+    for await (const { n, raw } of this.lines()) {
+      checked++; lastN = n;
+      const broken = (id?: string): VerifyResult => ({ ok: false, checked, brokenAt: id ?? `line:${n}` });
+      const p = parseStored(raw);
+      if (p.err !== undefined) return broken(p.id);
+      const rec = p.rec;
+      if (ids.has(rec.id)) return broken(rec.id);
+      if (rec.prevHash !== prevHash || rec.parentRecordId !== prevId) return broken(rec.id);
+      const { hash, ...preimage } = rec;
+      let computed: string;
+      try { computed = sha256Jcs(preimage); } catch { return broken(rec.id); }
+      if (computed !== hash) return broken(rec.id);
+      ids.add(rec.id); prevId = rec.id; prevHash = hash;
+    }
+    if (!endsWithNewline(this.path, size)) return { ok: false, checked, brokenAt: `line:${lastN}` };
     return { ok: true, checked };
   }
 
-  /** Records whose `writtenAt` (the ledger's own clock) lies in [from, to], inclusive, in file order. */
+  /**
+   * Records whose `writtenAt` (the ledger's clock) lies in [from, to], both inclusive, compared as instants. Throws on
+   * a range without explicit offsets, an unframed file, or any invalid line: a report must fail, not silently skip.
+   */
   async *read(range: DateRange): AsyncIterable<LedgerRecord> {
-    const from = Date.parse(range.from); const to = Date.parse(range.to);
-    if (Number.isNaN(from) || Number.isNaN(to) || from > to) throw new Error(`ledger.read: invalid range ${JSON.stringify(range)}`);
-    for await (const { n, rec } of this.records()) {
-      if (rec === null) throw new Error(`ledger.read: malformed record at line ${n} of ${this.path}; run verify()`);
-      const t = Date.parse(rec.writtenAt);
-      if (t >= from && t <= to) yield rec;
+    const from = parseInstant(range.from, "range.from"); const to = parseInstant(range.to, "range.to");
+    if (from > to) throw new Error(`ledger.read: invalid range, from is after to: ${JSON.stringify(range)}`);
+    const size = fileSize(this.path);
+    if (size === 0) return;
+    if (!endsWithNewline(this.path, size)) throw new Error(`ledger.read: ${this.path} ends with an incomplete line; run verify()`);
+    for await (const { n, raw } of this.lines()) {
+      const p = parseStored(raw);
+      if (p.err !== undefined) throw new Error(`ledger.read: invalid record at line ${n} of ${this.path} (${p.err}); run verify()`);
+      const t = parseInstant(p.rec.writtenAt, "writtenAt");
+      if (t >= from && t <= to) yield p.rec;
     }
   }
 }
