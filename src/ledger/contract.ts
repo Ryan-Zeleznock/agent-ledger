@@ -1,5 +1,6 @@
 import type { DateRange, LedgerRecord, UnsealedRecord, VerifyResult } from "../types/index.js";
 import { notImplemented } from "../types/not-implemented.js";
+import { sha256Jcs } from "./hash.js";
 export interface LedgerStore {
   append(record: UnsealedRecord): Promise<LedgerRecord>;
   verify(): Promise<VerifyResult>;
@@ -13,4 +14,4 @@ export function redact(args: Record<string, unknown>): Record<string, unknown> {
  * This is OUR chain rule. It is not byte-compatible with draft-sharif-agent-audit-trail §6.1 (which hashes the complete
  * stored previous record); a re-hashed export in the draft's schema is future work, not this function.
  */
-export function hashRecord(record: Omit<LedgerRecord, "hash">): string { throw notImplemented("ledger.hashRecord"); }
+export function hashRecord(record: Omit<LedgerRecord, "hash">): string { return sha256Jcs(record); }

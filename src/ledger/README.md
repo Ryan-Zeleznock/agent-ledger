@@ -4,3 +4,5 @@
 **Hash:** `hash = SHA-256(JCS(record without hash))`, lowercase hex; `prevHash` = previous record's `hash`, `parentRecordId` = its `id` (genesis: `"0"` / `null`). Same construction as draft-sharif-agent-audit-trail §6.1, which also mandates JCS. Never hand-roll canonical JSON.
 **Does NOT:** allow editing or deleting records
 **Spec:** docs/spec.md §4, 5, 9
+
+Status: implemented
