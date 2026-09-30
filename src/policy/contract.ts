@@ -24,6 +24,8 @@ export interface ToolEntry {
   reviewedBy: string;
   reviewedAt: string;          // YYYY-MM-DD
   note?: string;
+  /** ADR-009: exact top-level argument names permitted in cleartext; absent means none. No dotted paths. */
+  storeArgs?: string[];
   escalateWhen?: Escalation[];
 }
 export interface ServerEntry {
@@ -61,6 +63,7 @@ export const CLASS_DECISION: Record<ToolClass, Pick<PolicyDecision, "verdict" | 
  * object prototype; duplicate YAML keys are already a parse error). Refuses to load (throws) on:
  * - unknown version, an unknown field, a class outside TOOL_CLASSES, a missing reviewedBy/reviewedAt;
  * - an escalation whose `to` does not rank above the row's class;
+ * - storeArgs that is not a sequence of unique, non-reserved names matching [A-Za-z0-9_-]{1,64}; dots are refused;
  * - a server or tool key in RESERVED_KEYS (`__proto__`, `constructor`, `prototype`) or `in Object.prototype`;
  * - a server key that is neither in BUILTIN_SERVER_KEYS nor a match for MCP_SERVER_NAME_RE (so any other `:` is refused);
  * - a server key that is not in BUILTIN_SERVER_KEYS but normalises (lowercase, strip non-[a-z0-9]) to a name in
@@ -127,7 +130,7 @@ function toolClass(value: unknown, at: string): ToolClass {
   return value as ToolClass;
 }
 function toolEntry(value: unknown, at: string): ToolEntry {
-  const m = mapping(value, at, ["class", "reviewedBy", "reviewedAt", "note", "escalateWhen"]);
+  const m = mapping(value, at, ["class", "reviewedBy", "reviewedAt", "note", "storeArgs", "escalateWhen"]);
   const cls = toolClass(m.get("class"), at);
   const reviewedAt = string(m.get("reviewedAt"), `${at}.reviewedAt`);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(reviewedAt) || !Number.isFinite(Date.parse(reviewedAt)) || new Date(reviewedAt).toISOString().slice(0, 10) !== reviewedAt) {
@@ -138,6 +141,18 @@ function toolEntry(value: unknown, at: string): ToolEntry {
     const note = m.get("note");
     if (typeof note !== "string") throw new Error(`${at}: note must be a string`);
     row.note = note;
+  }
+  if (m.has("storeArgs")) {
+    const seen = new Set<string>();
+    row.storeArgs = sequence(m.get("storeArgs"), `${at}.storeArgs`).map((value, i) => {
+      const where = `${at}.storeArgs[${i}]`;
+      const field = string(value, where);
+      if (field.length > 64 || /[^A-Za-z0-9_-]/.test(field)) throw new Error(`${where}: expected a top-level ASCII argument name (1-64 characters; no dots)`);
+      if ((RESERVED_KEYS as readonly string[]).includes(field) || field in Object.prototype) throw new Error(`${where}: reserved key ${field}`);
+      if (seen.has(field)) throw new Error(`${where}: duplicate argument name ${field}`);
+      seen.add(field);
+      return field;
+    });
   }
   if (m.has("escalateWhen")) row.escalateWhen = sequence(m.get("escalateWhen"), `${at}.escalateWhen`).map((value, i) => {
     const where = `${at}#escalate:${i}`;
@@ -152,6 +167,14 @@ function toolEntry(value: unknown, at: string): ToolEntry {
   });
   compiledPatterns(row);
   return row;
+}
+
+/** ADR-009: case-sensitive, own-property lookup; unreviewed tools or absent allowlists permit no clear args. */
+export function clearArgFields(registry: ToolRegistry, server: string, tool: string): readonly string[] {
+  const s = Object.hasOwn(registry.servers, server) ? registry.servers[server] : undefined;
+  const row = s && Object.hasOwn(s.tools, tool) ? s.tools[tool] : undefined;
+  if (!row || !Object.hasOwn(CLASS_DECISION, row.class) || !Object.hasOwn(row, "storeArgs")) return [];
+  return row.storeArgs ?? [];
 }
 
 // Keep compiled state out of the frozen public shapes. A changed row invalidates its cache.
