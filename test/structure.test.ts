@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+
+// ADR-008: a module is exempt from the stub check once its README contains the line
+// "Status: implemented". Each builder flips only its own module README.
+const implemented = (m: string) => /^Status: implemented$/m.test(readFileSync(`src/${m}/README.md`, "utf8"));
 
 const LOADERS = {
   identity: () => import("../src/identity/contract.js"),
@@ -22,7 +26,7 @@ describe.each(MODULES)("module %s", (m) => {
       expect(existsSync(p), p).toBe(true);
     }
   });
-  it("every exported function throws not implemented", async () => {
+  it.skipIf(implemented(m))("every exported function throws not implemented (until implemented)", async () => {
     const mod: Record<string, unknown> = await LOADERS[m]();
     const fns = Object.entries(mod).filter(([, v]) => typeof v === "function");
     expect(fns.length).toBeGreaterThan(0);
