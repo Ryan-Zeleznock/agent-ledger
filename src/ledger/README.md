@@ -19,7 +19,7 @@ Spec §9's "raw args are never persisted" holds for the args AFTER redaction; wh
 "Residual") is stored, hashed and visible in the report like any other argument.
 `createLedger("postgres", …)` still throws `not implemented` (Slice 2). Files: `hash.ts`, `validate.ts`, `redact.ts`,
 `jsonl.ts`, `contract.ts`. Tests: `test/ledger-hash.test.ts`, `test/ledger-validate.test.ts`, `test/ledger-redact.test.ts`,
-`test/ledger-jsonl.test.ts`, `test/ledger-multiprocess.test.ts` (4 real processes), `test/ledger-redact-bench.test.ts`
+`test/ledger-jsonl.test.ts`, `test/ledger-multiprocess.test.ts` (4 real processes), `test/timing/ledger-redact-bench.test.ts`
 (supervised child); fixtures in `test/helpers/`.
 
 ## Behaviour
@@ -123,7 +123,7 @@ Performance (Astra #6, re-review P1): no unanchored keyword regex over the whole
 renamed key, no PEM rescans, no recursion on quotes. Measured on the compiled build, 2026-09-30, Apple silicon:
 benign 80 KB **1.6 ms** (Astra's baseline for round 0: 2,429 ms); 160 KB of words 17 ms, alternating quotes 6 ms,
 `-----BEGIN ` runs 14 ms, 2 KiB words 1.6 ms, `password="a b"` runs 4 ms; an object with **80,000 e-mail keys 137 ms**
-(Astra's round-1 measurement: 4,331 ms; 10k/20k/40k/80k = 21/31/63/137 ms, linear). `test/ledger-redact-bench.test.ts`
+(Astra's round-1 measurement: 4,331 ms; 10k/20k/40k/80k = 21/31/63/137 ms, linear). `test/timing/ledger-redact-bench.test.ts`
 runs 16 shapes × 10–160 KB in a forked child under a 20 s hard deadline and enforces < 1 s at 160 KB and < 8× growth
 from 40 KB to 160 KB.
 
