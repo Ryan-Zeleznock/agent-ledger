@@ -12,3 +12,17 @@ The frozen API has no deployment-mode or collector provenance field. Exports con
 local visibility/best-effort gating and explain conditional server enforcement; they never infer it
 from tool names. Handoff correlation uses non-handoff MCP intents; provenance attestation is a
 future coordinated contract change, not a claim made by this implementation.
+
+
+Slice 1c Package B (pin-7 fixtures, `test/report-slice-1c.test.ts`):
+- [x] ADR-010 optional report context and all five anchor statuses plus omitted context
+- [x] Six ordered sections in HTML/PDF; CC6.1 and CC8.1 tool tables; CC7.2 heartbeat table
+- [x] Session-without-heartbeat findings use all history; pre-1c records excluded; launch warnings and orphan intent gaps
+- [x] Heartbeats excluded from tool/no-outcome counts and map only to CC7.2
+- [x] Every pinned evidence class, exact manual-denial caveat, appended CSV columns
+- [x] New-table HTML/CSV/PDF escaping, withheld-digest labels, repeated PDF table headers and fitting record blocks kept together
+- [ ] Ryan independently spot-checks the AICPA page citations ([V] scope, [H] mapping remain distinct)
+- [ ] Coordinator runs merged Slice 1c e2e steps 8–10 on a real CLI-generated sandbox pack after cross-review
+
+Test-first evidence: pre-implementation focused run had 27 failing / 53 passing tests across the
+new report and redaction cases; after implementation the report + redaction suite passed 101/101.

@@ -62,8 +62,10 @@ The cover states **local = visibility + tamper-evident logging + best-effort gat
 Only governed paths are observed. Server enforcement needs isolated upstream credentials; the frozen
 record/API has no deployment mode field, so no report infers server enforcement from MCP names or
 absence of builtin calls. Mode attestation is future contract work; the conservative local statement
-is also present for empty ranges. The report API receives no anchor; CLI `verify` separately checks
-`anchor.latest()`. A local file anchor remains editable by the machine owner.
+is also present for empty ranges. ADR-010 adds the optional fourth argument `ReportContext`, with the CLI verify vocabulary
+`head | ancestor | missing | mismatch | untrusted` and latest anchor hash/time. The caller computes
+that status; the report never reads the anchor store. Omitted context says "not supplied to this report".
+Every status carries the local-file editability warning. An ancestor protects only through its saved head.
 
 HMAC values render as **HMAC-SHA256 digest (argument withheld)**, never as a clear argument.
 The HMAC key/credential are not read by this module. Stored allowlisted arguments remain readable.
@@ -73,10 +75,52 @@ of the original value. Exported text is evidence presentation, not a byte-for-by
 
 PDF is a dependency-free, paginated PDF 1.4 text document using Courier. Non-ASCII characters are
 shown as reversible `\uXXXX` UTF-16 escapes; HTML/CSV retain Unicode. It wraps long text without
-truncating records. No PDF/A, embedded fonts or signatures are claimed. Output files use exclusive
+truncating records, uses larger section headings and landscape aligned tables with repeated headers,
+and keeps each record block together when it fits on a page. Each page footer includes the chain result. No PDF/A, embedded fonts or signatures are claimed. Output files use exclusive
 creation with mode 0600; use a fresh output directory for each pack. HTML is written last. I/O errors
 can leave an incomplete pack; a failed invocation must not be distributed as a completed export.
-All history/outputs are held in memory; handoff and finding lookups can be quadratic. Indexed
-joins and large-ledger streaming remain future work (review residual #8).
+All history/outputs are held in memory. Session and outcome lookups use maps/sets; the unchanged
+handoff reconciliation can be quadratic. Large-ledger streaming remains future work (review residual #8).
 
 Tests: `test/report.test.ts`, plus the real-ledger/process export in `test/cli-process.test.ts`.
+
+## Slice 1c evidence pack (pins 6–8)
+
+The six ordered sections are Executive summary, CC6.1 logical access, CC7.2 monitoring,
+CC8.1 change management, Record evidence and Vocabulary. Tables are semantic HTML with column
+headers and grayscale print styles; PDF has the same titles/order. Existing record blocks retain
+all their fields. CSV retains its original 25 columns, then appends `agent_session_id`,
+`evidence_class`, `anchor_status` in that order. Missing session ids display as
+"pre-1c, no agent session id"; missing anchor context displays "not supplied" in CSV.
+
+Pin-7 fixtures are the integration boundary: heartbeat discrimination is exactly
+`policy.ruleId === "heartbeat:session-start"`; auto-mode denial is outcome `blocked` with
+`errorClass === "permission-denied:auto-mode"`. The additive session id is read structurally
+until Package A's type amendment is integrated; no other module is imported at runtime.
+Heartbeats map only to CC7.2, never to access/change decisions or missing-outcome counts.
+Session findings count tool intents in range, name the first in-range tool record, and look
+for a heartbeat with that id **anywhere in available ledger history**, including outside the
+grace window. Pre-1c records are never counted as sessions without heartbeat.
+
+Outcome joins still stop at range end plus 60 seconds; future outcomes beyond grace do not
+turn an unobserved action into observed execution. Orphans require a preceding tool intent;
+an orphan in a heartbeated session is labelled "intent gap". No collector provenance or
+transactional snapshot is implied. The report uses the latest observed outcome for an intent;
+a reused callId remains ambiguous. Handoff placeholders are excluded from tool decision counts.
+
+`delegated` and `require_approval` indicate an ask, not a named terminal approval. Recorded
+approvals count only `approved`; denial counts group policy, no-channel, Slack decisions and
+auto-mode evidence, counting each tool intent once plus explicit orphan auto-mode denials.
+A Slack approval followed by a blocked outcome remains `denied: Slack approved`, preserving
+both facts. A generic orphan or unexplained blocked outcome has an empty evidence class rather
+than an invented denial cause; the raw outcome remains visible. Launch warnings are informational.
+
+[V] Claude Code's hooks reference (read 2026-10-01; binding slice due diligence):
+https://code.claude.com/docs/en/hooks — manual prompt denial is unobservable; PermissionDenied
+fires for auto mode only. The exact caveat appears under CC8.1 and in Vocabulary. Heartbeats
+show that SessionStart reached the ledger, not that later calls were all hooked. [H] AICPA
+mapping and auditor acceptance remain hypotheses; Ryan's page-citation spot-check stays open.
+
+Tests: `test/report-slice-1c.test.ts` exercises the pin-7 fixtures, all anchor statuses,
+section order, evidence classes, history boundaries, escaping and PDF pagination. Package A's
+CLI and merged e2e seams require coordinator integration and independent review.
