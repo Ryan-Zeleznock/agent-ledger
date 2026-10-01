@@ -113,6 +113,9 @@ still a secret). Layers, at every nesting level:
      than leave a long word unscanned.
    - On the whole string only linear scans run: PEM private-key blocks (indexOf-based, every search starts where the
      last stopped, a missing footer is remembered) and bounded-quantifier regexes for US SSNs and Luhn-valid card numbers.
+   **ADR-009 digests pass through the key layer** (2026-09-30): a value that is exactly `hmac-sha256:<64 hex>` is what
+   the pipeline stores for a non-allowlisted argument; the key layer keeps it even under a sensitive field name so the
+   evidence stays verifiable with the key. Nothing else is exempt (a partial or padded token is redacted as before).
    `test/ledger-redact.test.ts` holds one parameterised table with all of Astra's round-3 shapes (headers, cookies, env
    lines, JSON keys, URLs, CLI flags), each checked in a string, an array and a nested object, and for idempotency.
 

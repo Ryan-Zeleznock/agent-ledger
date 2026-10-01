@@ -1,8 +1,8 @@
 import type { DateRange } from "../types/index.js";
 import type { LedgerStore } from "../ledger/contract.js";
-import { notImplemented } from "../types/not-implemented.js";
+import { checkedRange, findHandoffs, renderReport, HANDOFF_RECONCILE_GRACE_MS } from "./render.js";
 export interface ReportFiles { pdfPath: string; csvPath: string; }
-export function generateReport(ledger: LedgerStore, range: DateRange, outDir: string): Promise<ReportFiles> { throw notImplemented("report.generateReport"); }
+export function generateReport(ledger: LedgerStore, range: DateRange, outDir: string): Promise<ReportFiles> { return renderReport(ledger, range, outDir); }
 
 /**
  * Reconciliation of `handoff-to-proxy` records (Codex local mode, ADR-006, spec v2.1 §6/§7). Every hook intent record
@@ -13,5 +13,10 @@ export function generateReport(ledger: LedgerStore, range: DateRange, outDir: st
  * its end, so a handoff at the boundary is not flagged for a proxy record written a moment later.
  */
 export interface UnreconciledHandoff { callId: string; proxyServerName: string; hookRecordId: string; handedOffAt: string; }
-export const HANDOFF_RECONCILE_GRACE_MS = 60_000;
-export function reconcileHandoffs(ledger: LedgerStore, range: DateRange, graceMs?: number): Promise<UnreconciledHandoff[]> { throw notImplemented("report.reconcileHandoffs"); }
+export { HANDOFF_RECONCILE_GRACE_MS } from "./render.js";
+export async function reconcileHandoffs(ledger: LedgerStore, range: DateRange, graceMs = HANDOFF_RECONCILE_GRACE_MS): Promise<UnreconciledHandoff[]> {
+  const { extended } = checkedRange(range, graceMs);
+  const records = [];
+  for await (const record of ledger.read({ from: range.from, to: extended })) records.push(record);
+  return findHandoffs(records, range);
+}

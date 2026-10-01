@@ -1,8 +1,24 @@
 import type { AgentCredential, HookAgent, HookDecision, IncomingCall, Outcome } from "../types/index.js";
 import { BUILTIN_CODEX_SERVER, BUILTIN_NAMESPACE, BUILTIN_SERVER, BUILTIN_SERVERS, HOOK_AGENTS, RESERVED_SERVER_NAMES } from "../types/index.js";
-import { notImplemented } from "../types/not-implemented.js";
+import {
+  APPROVAL_MIN_MARGIN_MS, CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_S, CODEX_DEFAULT_HOOK_TIMEOUT_S, DEFAULT_DEADLINE_MS, DEFAULT_HOOK_TIMING,
+  DEFAULT_MAX_OUTPUT_BYTES, HOOK_TIMEOUT_S, MAX_HANDLER_STDERR_BYTES, MAX_MAX_OUTPUT_BYTES, MAX_REASON_CHARS, MAX_STDIN_BYTES,
+  MIN_MAX_OUTPUT_BYTES, SLACK_HOOK_TIMING, WATCHDOG_DEADLINE_AT_ENV, WATCHDOG_DEADLINE_DETAILS, WATCHDOG_DEADLINE_ENV,
+  WATCHDOG_KILL_SIGNAL, WATCHDOG_MIN_MARGIN_MS, WATCHDOG_REASONS, WATCHDOG_REASON_PREFIX, WATCHDOG_WRITE_BUDGET_MS,
+  WATCHDOG_WRITE_RETRY_SLEEP_MS, runWatchdog, setNonBlocking, validateHandlerOutput, validateHookTiming, writeAllSync,
+  type HookTiming, type PreToolUseOutput, type ValidatedHandlerOutput, type WatchdogOptions, type WatchdogResult,
+} from "./watchdog.js";
 
 export { BUILTIN_CODEX_SERVER, BUILTIN_NAMESPACE, BUILTIN_SERVER, BUILTIN_SERVERS, HOOK_AGENTS, RESERVED_SERVER_NAMES };
+// The watchdog surface is implemented in ./watchdog.ts (node built-ins only, pin 3) and re-exported here unchanged.
+export {
+  APPROVAL_MIN_MARGIN_MS, CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_S, CODEX_DEFAULT_HOOK_TIMEOUT_S, DEFAULT_DEADLINE_MS, DEFAULT_HOOK_TIMING,
+  DEFAULT_MAX_OUTPUT_BYTES, HOOK_TIMEOUT_S, MAX_HANDLER_STDERR_BYTES, MAX_MAX_OUTPUT_BYTES, MAX_REASON_CHARS, MAX_STDIN_BYTES,
+  MIN_MAX_OUTPUT_BYTES, SLACK_HOOK_TIMING, WATCHDOG_DEADLINE_AT_ENV, WATCHDOG_DEADLINE_DETAILS, WATCHDOG_DEADLINE_ENV,
+  WATCHDOG_KILL_SIGNAL, WATCHDOG_MIN_MARGIN_MS, WATCHDOG_REASONS, WATCHDOG_REASON_PREFIX, WATCHDOG_WRITE_BUDGET_MS,
+  WATCHDOG_WRITE_RETRY_SLEEP_MS, runWatchdog, setNonBlocking, validateHandlerOutput, validateHookTiming, writeAllSync,
+  type HookTiming, type PreToolUseOutput, type ValidatedHandlerOutput, type WatchdogOptions, type WatchdogResult,
+};
 
 // One module, two agents, one `agent` discriminator. Both agents send one JSON object on stdin with the same core
 // fields (`session_id`, `cwd`, `hook_event_name`, `tool_name`, `tool_input`, `tool_use_id`) and accept the same
@@ -133,13 +149,7 @@ export const MCP_TOOL_PREFIX = "mcp__";
  * documents `permissionDecision: "ask"` as "parsed but not supported yet. Codex marks the hook run as failed,
  * reports the error, and continues the tool call", i.e. an `ask` sent to Codex is an ALLOW. See formatPreToolUseOutput.
  */
-export interface PreToolUseOutput {
-  hookSpecificOutput: {
-    hookEventName: "PreToolUse";
-    permissionDecision: "allow" | "deny" | "ask";
-    permissionDecisionReason: string;
-  };
-}
+// (PreToolUseOutput is declared in ./watchdog.ts, which the watchdog validates against, and re-exported above.)
 
 /**
  * Parses stdin for the given agent. Throws (→ watchdog deny) on invalid JSON, a non-object, a missing required field
@@ -149,7 +159,43 @@ export interface PreToolUseOutput {
 export function parseHookInput(raw: string, agent: "claude-code"): HookEvent;
 export function parseHookInput(raw: string, agent: "codex"): CodexHookEvent;
 export function parseHookInput(raw: string, agent: HookAgent): AnyHookEvent;
-export function parseHookInput(raw: string, agent: HookAgent): AnyHookEvent { throw notImplemented("hooks.parseHookInput"); }
+export function parseHookInput(raw: string, agent: HookAgent): AnyHookEvent {
+  assertAgent(agent);
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { throw new Error("hooks: stdin is not JSON"); }
+  if (!isPlainObject(parsed)) throw new Error("hooks: hook event must be a JSON object");
+  const ev = parsed;
+  const str = (k: string) => { if (typeof ev[k] !== "string" || (ev[k] as string).length === 0) throw new Error(`hooks: ${k} must be a non-empty string`); };
+  for (const k of ["session_id", "cwd", "hook_event_name", "tool_name", "tool_use_id"]) str(k);
+  if (!Object.hasOwn(ev, "tool_input")) throw new Error("hooks: tool_input is required");
+  const name = ev["hook_event_name"] as string;
+  if (agent === "claude-code") {
+    // Never one agent's event for the other: the Codex-only required extensions are refused here.
+    for (const k of CODEX_ONLY_FIELDS) if (Object.hasOwn(ev, k)) throw new Error(`hooks: ${k} is a Codex field; not a Claude Code event`);
+    if (typeof ev["transcript_path"] !== "string") throw new Error("hooks: transcript_path must be a string");
+    if (!(HOOK_EVENT_NAMES as readonly string[]).includes(name)) throw new Error(`hooks: unsupported hook_event_name ${JSON.stringify(name)}`);
+    if (!isPlainObject(ev["tool_input"])) throw new Error("hooks: tool_input must be an object");
+    if (Object.hasOwn(ev, "permission_mode") && typeof ev["permission_mode"] !== "string") throw new Error("hooks: permission_mode must be a string");
+    if (Object.hasOwn(ev, "mcp_server")) {
+      const m = ev["mcp_server"];
+      if (!isPlainObject(m) || typeof m["name"] !== "string" || typeof m["source"] !== "string") throw new Error("hooks: mcp_server must be { name, source }");
+    }
+    if (name === "PostToolUse" && !Object.hasOwn(ev, "tool_response")) throw new Error("hooks: PostToolUse requires tool_response");
+    if (name === "PostToolUseFailure") {
+      if (typeof ev["error"] !== "string") throw new Error("hooks: PostToolUseFailure requires error (string)");
+      if (Object.hasOwn(ev, "is_interrupt") && typeof ev["is_interrupt"] !== "boolean") throw new Error("hooks: is_interrupt must be boolean");
+      if (Object.hasOwn(ev, "duration_ms") && typeof ev["duration_ms"] !== "number") throw new Error("hooks: duration_ms must be a number");
+    }
+    return ev as unknown as HookEvent;
+  }
+  for (const k of CLAUDE_CODE_ONLY_FIELDS) if (Object.hasOwn(ev, k)) throw new Error(`hooks: ${k} is a Claude Code field; not a Codex event`);
+  str("model"); str("turn_id");
+  if (!(CODEX_PERMISSION_MODES as readonly unknown[]).includes(ev["permission_mode"])) throw new Error("hooks: permission_mode must be one of Codex's five modes");
+  if (ev["transcript_path"] !== null && typeof ev["transcript_path"] !== "string") throw new Error("hooks: transcript_path must be a string or null");
+  if (!(CODEX_HOOK_EVENT_NAMES as readonly string[]).includes(name)) throw new Error(`hooks: unsupported Codex hook_event_name ${JSON.stringify(name)}`);
+  if (name === "PostToolUse" && !Object.hasOwn(ev, "tool_response")) throw new Error("hooks: PostToolUse requires tool_response");
+  return ev as unknown as CodexHookEvent;
+}
 
 /**
  * callId = tool_use_id (so the post events can find the intent record). args = tool_input (copied). receivedAt = now
@@ -170,7 +216,19 @@ export function parseHookInput(raw: string, agent: HookAgent): AnyHookEvent { th
  *   answers `allow` + `kind: "governed-by-proxy"` when `<server> === registry.proxy.codex.serverName` (the proxy
  *   decides and records with raw identity), and a RECORDED deny (CODEX_MCP_NOT_PROXIED_REASON) for any other server.
  */
-export function toIncomingCall(ev: AnyPreToolUseEvent, credential: AgentCredential, agent: HookAgent): IncomingCall { throw notImplemented("hooks.toIncomingCall"); }
+export function toIncomingCall(ev: AnyPreToolUseEvent, credential: AgentCredential, agent: HookAgent): IncomingCall {
+  assertAgent(agent);
+  if (!isPlainObject(ev) || ev.hook_event_name !== "PreToolUse") throw new Error("hooks: not a PreToolUse event");
+  if (typeof ev.tool_name !== "string" || ev.tool_name.length === 0) throw new Error("hooks: tool_name must be a non-empty string");
+  if (typeof ev.tool_use_id !== "string" || ev.tool_use_id.length === 0) throw new Error("hooks: tool_use_id must be a non-empty string");
+  if (!isPlainObject(credential) || typeof credential.value !== "string" || (credential.kind !== "local" && credential.kind !== "api_key")) throw new Error("hooks: invalid credential");
+  const input: unknown = (ev as { tool_input: unknown }).tool_input;
+  if (!isPlainObject(input)) throw new Error(`hooks: tool_input must be a plain object (${agent === "codex" ? "Codex sends any JSON value; anything but an object is refused" : "malformed event"})`);
+  const { server, tool } = splitToolName(ev.tool_name, agent, agent === "claude-code" && Object.hasOwn(ev, "mcp_server"));
+  // Reference-free copy: the event came from JSON.parse, so a JSON round trip is lossless and shares nothing.
+  const args = JSON.parse(JSON.stringify(input)) as Record<string, unknown>;
+  return { callId: ev.tool_use_id, credential: { kind: credential.kind, value: credential.value }, server, tool, args, receivedAt: new Date().toISOString() };
+}
 
 /**
  * Maps a post event onto the outcome the pipeline records for `tool_use_id` (spec §6).
@@ -181,7 +239,23 @@ export function toIncomingCall(ev: AnyPreToolUseEvent, credential: AgentCredenti
  * Codex has no failure event and `tool_response` has no stable shape to read an exit code from. Deriving an
  * errorClass from `tool_response` is future work and is recorded as such in spec §6.
  */
-export function toOutcome(ev: AnyPostEvent, agent: HookAgent): Outcome { throw notImplemented("hooks.toOutcome"); }
+export function toOutcome(ev: AnyPostEvent, agent: HookAgent): Outcome {
+  assertAgent(agent);
+  if (!isPlainObject(ev)) throw new Error("hooks: not a hook event");
+  const name = ev.hook_event_name;
+  if (agent === "codex") {
+    if (name !== "PostToolUse") throw new Error(`hooks: Codex has no ${String(name)} outcome event`);
+    return { status: "ok" };
+  }
+  if (name === "PostToolUse") return { status: "ok" };
+  if (name !== "PostToolUseFailure") throw new Error(`hooks: ${String(name)} is not an outcome event`);
+  const f = ev as PostToolUseFailureEvent;
+  const firstLine = typeof f.error === "string" ? f.error.split("\n")[0] ?? "" : "";
+  const errorClass = f.is_interrupt === true ? "interrupt" : /^Exit code \d+$/.test(firstLine) ? firstLine : "tool-error";
+  const out: Outcome = { status: "error", errorClass };
+  if (typeof f.duration_ms === "number" && Number.isFinite(f.duration_ms) && f.duration_ms >= 0) out.durationMs = f.duration_ms;
+  return out;
+}
 
 /** Reason text the Codex formatter substitutes when the pipeline answers `ask` (see formatPreToolUseOutput). */
 export const CODEX_ASK_UNSUPPORTED_REASON =
@@ -195,7 +269,44 @@ export const CODEX_ASK_UNSUPPORTED_REASON =
  * BEFORE persisting and records `approval.decision = "no-channel"` (a final, reasoned deny), so this rewrite is a
  * belt-and-braces guard, not the normal path. A Slack channel is the only way to get a real approval under Codex.
  */
-export function formatPreToolUseOutput(d: HookDecision, agent: HookAgent): string { throw notImplemented("hooks.formatPreToolUseOutput"); }
+export function formatPreToolUseOutput(d: HookDecision, agent: HookAgent): string {
+  assertAgent(agent);
+  if (!isPlainObject(d) || !["allow", "deny", "ask"].includes(d.decision as string)) throw new Error("hooks: invalid HookDecision");
+  let decision: PreToolUseOutput["hookSpecificOutput"]["permissionDecision"] = d.decision;
+  let reason = typeof d.reason === "string" ? d.reason : "";
+  if (agent === "codex" && decision === "ask") { decision = "deny"; reason = CODEX_ASK_UNSUPPORTED_REASON; }
+  // The watchdog denies a reason longer than MAX_REASON_CHARS; never let a long policy note turn an allow into a deny.
+  if (reason.length > MAX_REASON_CHARS) reason = reason.slice(0, MAX_REASON_CHARS - 1) + "\u2026";
+  const out: PreToolUseOutput = { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: decision, permissionDecisionReason: reason } };
+  return JSON.stringify(out);
+}
+
+// ---------- collector internals ----------
+
+const CODEX_ONLY_FIELDS = ["model", "turn_id"] as const;
+const CLAUDE_CODE_ONLY_FIELDS = ["prompt_id", "scratchpad_dir", "mcp_server", "is_interrupt", "duration_ms", "error"] as const;
+const CODEX_PERMISSION_MODES = ["default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"] as const;
+const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+function assertAgent(agent: unknown): asserts agent is HookAgent {
+  if (!(HOOK_AGENTS as readonly unknown[]).includes(agent)) throw new Error(`hooks: unknown agent ${JSON.stringify(agent)}`);
+}
+/** Collision normalisation (types: RESERVED_SERVER_NAMES): lowercase, then drop everything outside [a-z0-9]. */
+const normaliseServer = (name: string) => name.toLowerCase().replace(/[^a-z0-9]/g, "");
+/** `mcp__<server>__<tool>` → { server, tool } (split at the FIRST `__` after the prefix); anything else → the agent's builtin key. */
+function splitToolName(toolName: string, agent: HookAgent, hasMcpProvenance: boolean): { server: string; tool: string } {
+  if (toolName.startsWith(MCP_TOOL_PREFIX)) {
+    const rest = toolName.slice(MCP_TOOL_PREFIX.length);
+    const sep = rest.indexOf("__");
+    if (sep <= 0 || sep + 2 >= rest.length) throw new Error("hooks: malformed MCP tool name (expected mcp__<server>__<tool>)");
+    const server = rest.slice(0, sep);
+    const tool = rest.slice(sep + 2);
+    if (server.includes(":")) throw new Error("hooks: MCP server segment may not contain ':'");
+    if ((RESERVED_SERVER_NAMES as readonly string[]).includes(normaliseServer(server))) throw new Error(`hooks: MCP server ${JSON.stringify(server)} impersonates a builtin namespace`);
+    return { server, tool };
+  }
+  if (hasMcpProvenance) throw new Error("hooks: tool event carries mcp_server provenance but no mcp__ prefix (malformed)");
+  return { server: BUILTIN_SERVERS[agent], tool: toolName };
+}
 
 // ---------- Two-process fail-closed watchdog (spec §7) ----------
 //
@@ -217,115 +328,9 @@ export function formatPreToolUseOutput(d: HookDecision, agent: HookAgent): strin
 // So a crash, stall, or stray write inside our handler is an allow unless something outside the handler's event
 // loop catches it. That something is a second process.
 
-/** What our settings snippet sets as the hook `timeout` (seconds) for both agents. Their own default is 600 s, far too long to matter. */
-export const HOOK_TIMEOUT_S = 30;
-export const CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_S = 600;
-export const CODEX_DEFAULT_HOOK_TIMEOUT_S = 600;
-/** The watchdog must have emitted its verdict at least this long before the agent's timeout cancels it. */
-export const WATCHDOG_MIN_MARGIN_MS = 2_000;
-/** Internal deadline: the hook timeout minus a margin, so the deny is written before the agent cancels us. */
-export const DEFAULT_DEADLINE_MS = (HOOK_TIMEOUT_S - 5) * 1000;
-/** A Slack answer must be back, recorded and formatted at least this long before the watchdog's deadline kills the handler. */
-export const APPROVAL_MIN_MARGIN_MS = 5_000;
-/**
- * The three clocks of one hook call (ADR-006). Invariant, validated at init (`validateHookTiming`):
- *   approvalTimeoutMs + APPROVAL_MIN_MARGIN_MS ≤ deadlineMs   and   deadlineMs + WATCHDOG_MIN_MARGIN_MS ≤ hookTimeoutS × 1000.
- * The agents' `timeout` is in seconds for both (Claude Code: "Seconds before canceling", default 600 for command hooks;
- * Codex: "`timeout` is in seconds. If `timeout` is omitted, Codex uses `600` seconds for most hooks", and in source
- * `timeout_sec.unwrap_or(600).max(1)` with NO upper clamp for PreToolUse; only SessionEnd/Interrupt are clamped to 3 s.
- * Both verified 2026-09-29). So a 320 s PreToolUse hook is legal in both agents.
- */
-export interface HookTiming { approvalTimeoutMs?: number; deadlineMs: number; hookTimeoutS: number; }
-/** No Slack channel (Claude Code hook-ask, or Codex with every require_approval a recorded deny): fast. */
-export const DEFAULT_HOOK_TIMING: HookTiming = { deadlineMs: DEFAULT_DEADLINE_MS, hookTimeoutS: HOOK_TIMEOUT_S };
-/** Slack approvals (required under Codex): a human gets 5 minutes; the watchdog and the agent wait a little longer, in that order. */
-export const SLACK_HOOK_TIMING: HookTiming = { approvalTimeoutMs: 300_000, deadlineMs: 310_000, hookTimeoutS: 320 };
-/** The watchdog hands its configured deadline DURATION to the handler through this env var, for the static three-clock check at init (`validateHookTiming`). */
-export const WATCHDOG_DEADLINE_ENV = "AGENT_LEDGER_WATCHDOG_DEADLINE_MS" as const;
-/**
- * The watchdog also hands the handler its ABSOLUTE deadline: `Date.now() + deadlineMs`, taken when the watchdog's timer
- * starts (BEFORE stdin is read or the child spawned), as epoch milliseconds. The handler budgets everything, above all
- * the Slack wait, from `deadlineAt - Date.now()` at the moment it needs the budget, never from the duration: the
- * watchdog may have spent seconds of the duration on stdin and spawn before the handler ran, and a handler that waited
- * the full `approvalTimeoutMs` after a late start would be killed mid-wait with an unrecorded approval (Astra P2,
- * 2026-09-30). Missing, non-integer, or already-past value → handler init failure → watchdog deny, exit 2.
- */
-export const WATCHDOG_DEADLINE_AT_ENV = "AGENT_LEDGER_WATCHDOG_DEADLINE_AT_MS" as const;
-/** Always SIGKILL, always the whole process group (`process.kill(-pid)`): a stalled handler or its grandchild may ignore SIGTERM. */
-export const WATCHDOG_KILL_SIGNAL = "SIGKILL" as const;
-/**
- * Output writes are TIME-bounded, not only count-bounded (Astra P1, 2026-09-30): a blocking `fs.writeSync` to a pipe
- * whose reader has stopped draining (a full 64 KiB pipe buffer) never returns and would stall the watchdog past its
- * own deadline. So fds 1 and 2 are put into non-blocking mode before the first write, every `writeSync` can then return
- * EAGAIN instead of blocking, and `writeAllSync` retries within this budget. Zero progress (no byte accepted) for the
- * whole budget is a write failure → exit 2, whatever was flushed. The budget is small: the agent reads at most one line.
- */
-export const WATCHDOG_WRITE_BUDGET_MS = 1_000;
-/** Retry back-off inside the write budget; keeps the retry loop from spinning while the reader catches up. */
-export const WATCHDOG_WRITE_RETRY_SLEEP_MS = 5;
-/** Cap on the handler's stdout. Anything above it is a deny. Sits well below Claude Code's 10,000-character spill limit. */
-export const DEFAULT_MAX_OUTPUT_BYTES = 8_192;
-export const MIN_MAX_OUTPUT_BYTES = 512;
-export const MAX_MAX_OUTPUT_BYTES = 65_536;
-/** Cap on the handler's stderr the watchdog keeps (appended to its own stderr after the reason line; excess is dropped). */
-export const MAX_HANDLER_STDERR_BYTES = 16_384;
-/** Cap on the hook event the watchdog reads from its own stdin before forwarding it. Above it: deny `watchdog:stdin-too-large`. */
-export const MAX_STDIN_BYTES = 4 * 1024 * 1024;
-/** Cap on `permissionDecisionReason` in a validated payload; longer reasons are a deny, not a truncation. */
-export const MAX_REASON_CHARS = 1_000;
+// Constants, WatchdogOptions, WatchdogResult, WATCHDOG_REASONS, WATCHDOG_DEADLINE_DETAILS and ValidatedHandlerOutput are
+// declared in ./watchdog.ts (documented there and above) and re-exported at the top of this file.
 
-export interface WatchdogOptions {
-  /** argv of the handler, e.g. ["node", "/opt/agent-ledger/hook-handler.js"]. Spawned directly, no shell. */
-  handlerCommand: string[];
-  /**
-   * SIGKILL the handler's whole process group and deny when the handler has not exited AND closed its pipes by then.
-   * Finite integer, > 0, ≤ timeoutS*1000 − WATCHDOG_MIN_MARGIN_MS. Configurable per deployment (DEFAULT_HOOK_TIMING
-   * without Slack, SLACK_HOOK_TIMING with it); the same value is exported to the handler as WATCHDOG_DEADLINE_ENV.
-   */
-  deadlineMs: number;
-  /** Handler stdout above this many bytes is a deny. Finite integer in [MIN_MAX_OUTPUT_BYTES, MAX_MAX_OUTPUT_BYTES]. */
-  maxOutputBytes: number;
-  /** Selects the output validator (Codex: `ask` is invalid) and the deny text. */
-  agent: HookAgent;
-  /** The hook `timeout` configured in the agent's settings, in seconds. Defaults to HOOK_TIMEOUT_S. */
-  timeoutS?: number;
-}
-/** What the watchdog process writes and how it exits. The watchdog is the ONLY process whose stdout the agent reads. */
-export interface WatchdogResult {
-  /** Exactly one line of PreToolUseOutput JSON: the validated allow/ask, or a deny with reason `watchdog:<class>`. Never the handler's raw bytes. */
-  stdout: string;
-  /** Empty on allow/ask. On every deny: the reason line, then up to MAX_HANDLER_STDERR_BYTES of the handler's stderr. */
-  stderr: string;
-  /** 0 only for a validated allow or ask. 2 for EVERY deny and EVERY failure path. Never 1. */
-  exitCode: 0 | 2;
-}
-/**
- * Deny reasons the watchdog can emit, as `watchdog:<class>[:<detail>]`. Every one of them is exit 2.
- * config:<field> = bad options (non-finite/non-integer/≤0 deadline, deadline too close to the timeout, output cap out of
- * range, unknown agent, empty command); init = the handler's own startup failure reported on its stderr before any stdout;
- * spawn:<code> = the handler could not be started (ENOENT, EACCES); stdin-too-large; deadline; handler-exit:<code>;
- * handler-signal:<sig>; output:empty | output:too-large | output:not-json | output:not-object | output:multiple |
- * output:extra-key:<key> | output:missing-key:<key> | output:bad-value:<key>; handler-deny (a valid deny payload,
- * re-emitted with the handler's reason and exit 2); internal (uncaughtException/unhandledRejection in the watchdog itself).
- */
-export const WATCHDOG_REASON_PREFIX = "watchdog:" as const;
-export const WATCHDOG_REASONS = [
-  "config", "init", "spawn", "stdin-too-large", "deadline", "handler-exit", "handler-signal",
-  "output:empty", "output:too-large", "output:not-json", "output:not-object", "output:multiple",
-  "output:extra-key", "output:missing-key", "output:bad-value", "handler-deny", "write", "internal",
-] as const;
-/**
- * `deadline` carries a detail saying which wait the clock ran out on: `stdin` (the agent never closed our stdin: a
- * never-EOF regression), `handler` (the handler is still running), `pipes-open` (the handler exited 0 but its stdout/
- * stderr pipes are still held, usually by a grandchild). `write` = a write to fd 1 or 2 failed or could not be
- * completed; the exit code is still 2 (the reporter itself may fail; exit 2 is what the agent sees either way).
- */
-export const WATCHDOG_DEADLINE_DETAILS = ["stdin", "handler", "pipes-open"] as const;
-
-/** A handler payload the watchdog has accepted: exact key set, known decision, bounded reason. Nothing else passes. */
-export type ValidatedHandlerOutput =
-  | { ok: true; payload: PreToolUseOutput }
-  | { ok: false; reason: `${typeof WATCHDOG_REASON_PREFIX}output:${string}` };
 /**
  * Validates the handler's captured stdout before anything reaches the agent. Rules, in order:
  * byte length ≤ maxOutputBytes (else output:too-large); non-empty after trimming whitespace (else output:empty);
@@ -336,7 +341,7 @@ export type ValidatedHandlerOutput =
  * (a stray console.log) → output:multiple. No prototype-key trick applies: lookups are own-property only and the key
  * set is compared exactly. On ok the watchdog RE-SERIALISES the payload; the handler's raw bytes are never forwarded.
  */
-export function validateHandlerOutput(raw: string, agent: HookAgent): ValidatedHandlerOutput { throw notImplemented("hooks.validateHandlerOutput"); }
+// Implemented in ./watchdog.ts as `validateHandlerOutput`; re-exported above.
 
 /**
  * The watchdog. This is the only thing Claude Code or Codex executes (settings: `command: "node .../watchdog.js"`).
@@ -409,7 +414,7 @@ export function validateHandlerOutput(raw: string, agent: HookAgent): ValidatedH
  * Claude Code's process-tree behaviour at timeout is undocumented [H]. Hence the deadline must sit below the hook
  * timeout (validated, step 2), and the orphan is a documented residual, not a covered case.
  */
-export function runWatchdog(opts: WatchdogOptions): Promise<WatchdogResult> { throw notImplemented("hooks.runWatchdog"); }
+// Implemented in ./watchdog.ts as `runWatchdog`; re-exported above.
 
 /**
  * Writes every byte of `data` to `fd` with `fs.writeSync`, looping on the returned byte count and retrying EAGAIN
@@ -419,14 +424,14 @@ export function runWatchdog(opts: WatchdogOptions): Promise<WatchdogResult> { th
  * on any other error, when the budget runs out, or when no byte at all was accepted within the budget (zero
  * progress); the watchdog turns every throw into exit 2. `now` is injectable for the runtime tests.
  */
-export function writeAllSync(fd: 1 | 2, data: Uint8Array, budgetMs?: number, now?: () => number): void { throw notImplemented("hooks.writeAllSync"); }
+// Implemented in ./watchdog.ts as `writeAllSync`; re-exported above.
 
 /**
  * Puts fd 1 or 2 into O_NONBLOCK mode (a small native-free step: on POSIX Node exposes it through the stream's handle;
  * the implementation may fall back to `net.Socket`/`tty.WriteStream` with `setBlocking(false)`). Idempotent. A failure
  * to switch is itself a write failure → exit 2, because a blocking fd cannot be written within a time bound.
  */
-export function setNonBlocking(fd: 1 | 2): void { throw notImplemented("hooks.setNonBlocking"); }
+// Implemented in ./watchdog.ts as `setNonBlocking`; re-exported above.
 
 /**
  * Validates the three clocks (ADR-006) and returns the violations, one string each; empty = valid. Called by the
@@ -440,4 +445,4 @@ export function setNonBlocking(fd: 1 | 2): void { throw notImplemented("hooks.se
  * `deadlineMs + WATCHDOG_MIN_MARGIN_MS ≤ hookTimeoutS * 1000` (`deadline-not-below-hook-timeout`).
  * Claude Code's hook-ask path has no approvalTimeoutMs and keeps DEFAULT_HOOK_TIMING; Slack is optional there.
  */
-export function validateHookTiming(t: HookTiming): string[] { throw notImplemented("hooks.validateHookTiming"); }
+// Implemented in ./watchdog.ts as `validateHookTiming`; re-exported above.

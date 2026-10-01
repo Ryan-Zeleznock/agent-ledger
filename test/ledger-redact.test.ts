@@ -274,3 +274,21 @@ describe("ledger.redact: invariants", () => {
     expect(time(words(160_000))).toBeLessThan(400);
   });
 });
+
+describe("ledger.redact: ADR-009 digests pass through the key layer (Astra P2 #6, 2026-09-30)", () => {
+  const digest = `hmac-sha256:${"ab".repeat(32)}`;
+  it("keeps an exact hmac-sha256:<64 hex> value under a sensitive field name, at any depth and in header objects", () => {
+    expect(redact({ password: digest, token: digest, nested: { api_key: digest }, header: { name: "Cookie", value: digest } }))
+      .toEqual({ password: digest, token: digest, nested: { api_key: digest }, header: { name: "Cookie", value: digest } });
+  });
+  it("exempts nothing else: a real value, a padded, partial, uppercase or too-short token under a sensitive name is still redacted", () => {
+    expect(redact({ password: "hunter2" })).toEqual({ password: "[REDACTED:key:password]" });
+    for (const v of [`${digest} `, ` ${digest}`, digest.slice(0, -1), digest.toUpperCase(), "hmac-sha256:abc", `${digest}x`, `x${digest}`]) {
+      expect(redact({ password: v }), v).toEqual({ password: "[REDACTED:key:password]" });
+    }
+    expect(redact({ header: { name: "Authorization", value: "Bearer x" } })).toEqual({ header: { name: "Authorization", value: "[REDACTED:pair]" } });
+  });
+  it("a digest under a non-sensitive name is untouched by the value layer too", () => {
+    expect(redact({ body: digest, list: [digest] })).toEqual({ body: digest, list: [digest] });
+  });
+});

@@ -29,6 +29,14 @@ import { assertJsonData, MAX_DEPTH } from "./validate.js";
 
 const PLACEHOLDER = (kind: string) => `[REDACTED:${kind}]`;
 const PLACEHOLDER_FULL = /^\[REDACTED:[a-z0-9][a-z0-9:#_-]*\]$/;
+/**
+ * ADR-009 (2026-09-30): a value that is EXACTLY a keyed digest `hmac-sha256:<64 hex>` is already-protected evidence the
+ * pipeline stored in place of a non-allowlisted argument. The key layer keeps it even under a sensitive field NAME
+ * (`password: "hmac-sha256:…"`), otherwise two different passwords would persist as the same placeholder and the
+ * auditor holding the key could verify neither. Nothing else is exempt: the token shape carries no secret by itself.
+ */
+const HMAC_DIGEST_FULL = /^hmac-sha256:[0-9a-f]{64}$/;
+const isProtected = (v: unknown): boolean => typeof v === "string" && (PLACEHOLDER_FULL.test(v) || HMAC_DIGEST_FULL.test(v));
 const PLACEHOLDER_AT = /\[REDACTED:[a-z0-9][a-z0-9:#_-]*\]/y;
 
 export const WORD_MAX = 1024;         // longer words are replaced whole
@@ -465,8 +473,8 @@ function redactObject(o: Record<string, unknown>, depth: number, seen: WeakSet<o
       taken.add(outKey);
     }
     let value: unknown;
-    if (kw !== null) value = PLACEHOLDER(`key:${kw}`);
-    else if (key === pairValueKey) value = typeof o[key] === "string" && PLACEHOLDER_FULL.test(o[key] as string) ? o[key] : PLACEHOLDER("pair");
+    if (kw !== null) value = isProtected(o[key]) ? o[key] : PLACEHOLDER(`key:${kw}`);
+    else if (key === pairValueKey) value = isProtected(o[key]) ? o[key] : PLACEHOLDER("pair");
     else value = redactValue(o[key], depth + 1, seen, decoded);
     Object.defineProperty(out, outKey, { value, enumerable: true, writable: true, configurable: true });
   }
