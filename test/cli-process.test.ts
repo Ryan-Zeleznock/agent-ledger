@@ -23,7 +23,7 @@ describe("built CLI in real processes", () => {
     const bin = spawnSync(cli, ["verify"], { cwd, encoding: "utf8", timeout: 10_000 });
     expect(bin.status, String(bin.error)).toBe(3);
     const snippet = run(cwd, ["install-hooks", "--print"]);
-    expect(snippet.status).toBe(0); expect(Object.keys(JSON.parse(snippet.stdout).hooks)).toHaveLength(3);
+    expect(snippet.status).toBe(0); expect(Object.keys(JSON.parse(snippet.stdout).hooks)).toHaveLength(5);
     const empty = run(cwd, ["verify"]); expect(empty.status).toBe(3); expect(JSON.parse(empty.stdout).chain).toEqual({ ok: true, checked: 0 });
     const ledger = createLedger("jsonl", join(dir, "ledger/records.jsonl"));
     const intent = unsealed(1, { command: `hmac-sha256:${"f".repeat(64)}` });
@@ -51,11 +51,11 @@ describe("built CLI in real processes", () => {
     await writeFile(path, prefix);
     const r = run(cwd, ["verify"]); expect(r.status).toBe(1); expect(JSON.parse(r.stdout).anchor.status).toBe("mismatch");
   });
-  it("fails pre on unimplemented adapters and keeps direct post non-blocking", async () => {
+  it("fails pre on unparseable input and keeps the three direct record-only handlers non-blocking and silent on stdout", async () => {
     const cwd = await sandbox(); expect(run(cwd, ["init"]).status).toBe(0);
-    for (const event of ["pre", "post"]) {
+    for (const event of ["pre", "post", "session-start", "denied"]) {
       const r = run(cwd, ["hook", "--agent", "claude-code", "--event", event], "invalid fixture");
-      expect(r.status).toBe(event === "post" ? 0 : 1); expect(r.stdout).toBe(""); expect(r.stderr).not.toBe("");
+      expect(r.status).toBe(event === "pre" ? 1 : 0); expect(r.stdout).toBe(""); expect(r.stderr).not.toBe("");
     }
   });
   it("prints post commands that survive shell quoting of a hostile-looking sandbox path", async () => {
@@ -147,4 +147,105 @@ it("exports a diagnostic pack but signals a broken chain in stdout and exit stat
   expect(r.status, r.stderr).toBe(1); const output = JSON.parse(r.stdout);
   expect(output.chain.ok).toBe(false); expect(output.chain.brokenAt).toBeDefined();
   expect(await readFile(output.htmlPath, "utf8")).toContain("Chain verification: FAIL");
+});
+
+describe("Slice 1c handlers and anchor in real processes (ADR-010, ADR-011; pin 5)", () => {
+  const sessionStart = (session_id = "sess-proc-1") => JSON.stringify({ session_id, transcript_path: "/t/x.jsonl", cwd: "/tmp", hook_event_name: "SessionStart", source: "startup", permission_mode: "default" });
+  const quiet = { ...process.env } as Record<string, string | undefined>; delete quiet[WATCHDOG_DEADLINE_AT_ENV]; delete quiet[WATCHDOG_DEADLINE_ENV]; delete quiet["NODE_OPTIONS"];
+  const spawnCli = (bin: string, cwd: string, args: string[], input: string, env: NodeJS.ProcessEnv = quiet) =>
+    spawnSync(process.execPath, [bin, ...args], { cwd, input, env, encoding: "utf8", timeout: 20_000 });
+  const records = async (cwd: string) => { const out = []; for await (const r of createLedger("jsonl", join(cwd, ".agent-ledger/ledger/records.jsonl")).read({ from: "2020-01-01T00:00:00Z", to: "2090-01-01T00:00:00Z" })) out.push(r); return out; };
+  /** A private copy of the built artifacts whose watchdog entry point can be removed or broken without touching dist/. */
+  async function privateBuild(cwd: string): Promise<string> {
+    await cp(resolve("dist"), join(cwd, "dist"), { recursive: true });
+    await cp(resolve("policies"), join(cwd, "policies"), { recursive: true });
+    await cp(resolve("package.json"), join(cwd, "package.json"));
+    await symlink(resolve("node_modules"), join(cwd, "node_modules"));
+    return join(cwd, "dist/cli/main.js");
+  }
+
+  it("session-start prints NOTHING on stdout, exits 0 and writes a heartbeat with watchdogCheck ok and nodeOptionsSet false", async () => {
+    const cwd = await sandbox(); expect(run(cwd, ["init"]).status).toBe(0);
+    const r = spawnCli(cli, cwd, ["hook", "--agent", "claude-code", "--event", "session-start"], sessionStart());
+    expect(r.status, r.stderr).toBe(0); expect(r.stdout).toBe(""); expect(r.stderr).toBe("");
+    const all = await records(cwd); expect(all).toHaveLength(1);
+    const hb = all[0]!;
+    expect(hb.phase).toBe("intent"); expect(hb.call.tool).toBe("SessionStart"); expect(hb.policy.ruleId).toBe("heartbeat:session-start");
+    expect(hb.call.agentSessionId).toBe("sess-proc-1");
+    expect(hb.call.args).toMatchObject({ agentSessionId: "sess-proc-1", hookAgent: "claude-code", source: "startup", permissionMode: "default", nodeOptionsSet: false, watchdogCheck: "ok" });
+    expect(hb.call.args["interpreter"]).toBe(await realpath(process.execPath));
+  });
+  it("session-start records nodeOptionsSet true when NODE_OPTIONS is set, and the value never reaches the ledger or any output", async () => {
+    const cwd = await sandbox(); expect(run(cwd, ["init"]).status).toBe(0);
+    const canary = "--title=cli-proc-nodeopt-canary-5a1e";
+    const r = spawnCli(cli, cwd, ["hook", "--agent", "claude-code", "--event", "session-start"], sessionStart(), { ...quiet, NODE_OPTIONS: canary });
+    expect(r.status, r.stderr).toBe(0); expect(r.stdout).toBe(""); expect(r.stderr).toBe("");
+    const hb = (await records(cwd))[0]!;
+    expect(hb.call.args).toMatchObject({ nodeOptionsSet: true, watchdogCheck: "ok" });
+    expect(await readFile(join(cwd, ".agent-ledger/ledger/records.jsonl"), "utf8")).not.toContain("nodeopt-canary");
+  });
+  it("a missing watchdog entry point → watchdogCheck missing; a broken one → failed; both still silent, exit 0", async () => {
+    for (const mode of ["missing", "failed"]) {
+      const cwd = await sandbox(); const bin = await privateBuild(cwd); expect(spawnCli(bin, cwd, ["init"], "").status).toBe(0);
+      const watchdog = join(cwd, "dist/hooks/watchdog-main.js");
+      if (mode === "missing") await rm(watchdog); else await writeFile(watchdog, "process.stdout.write('{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"allow\",\"permissionDecisionReason\":\"x\"}}'); process.exit(1);\n");
+      const r = spawnCli(bin, cwd, ["hook", "--agent", "claude-code", "--event", "session-start"], sessionStart());
+      expect(r.status, r.stderr).toBe(0); expect(r.stdout).toBe(""); expect(r.stderr).toBe("");
+      expect((await records(cwd))[0]!.call.args["watchdogCheck"]).toBe(mode);
+    }
+  });
+  it("session-start and denied exit 0 silently on a corrupt registry or a missing key and change no ledger byte; pre fails closed", async () => {
+    const cwd = await sandbox(); expect(run(cwd, ["init"]).status).toBe(0);
+    const dir = join(cwd, ".agent-ledger"); const ledgerPath = join(dir, "ledger/records.jsonl");
+    expect(spawnCli(cli, cwd, ["hook", "--agent", "claude-code", "--event", "session-start"], sessionStart()).status).toBe(0);
+    const before = await readFile(ledgerPath);
+    const denied = JSON.stringify({ session_id: "sess-proc-1", transcript_path: "/t/x.jsonl", cwd: "/tmp", hook_event_name: "PermissionDenied", tool_name: "Bash", tool_input: { command: "rm -rf /tmp/data" }, tool_use_id: "toolu_proc_denied", reason: "Destructive command" });
+    const registry = await readFile(join(dir, "registry.yaml"));
+    const breakages: [string, () => Promise<void>, () => Promise<void>][] = [
+      ["corrupt registry", () => writeFile(join(dir, "registry.yaml"), "version: 1\nservers:\n  claude-code:\n    trusted: true\n    tools: {}\n"), () => writeFile(join(dir, "registry.yaml"), registry)],
+      ["missing key", () => rm(join(dir, "hmac.key")), async () => { await writeFile(join(dir, "hmac.key"), Buffer.alloc(32, 7), { mode: 0o600 }); }],
+    ];
+    for (const [label, breakIt, restore] of breakages) {
+      await breakIt();
+      try {
+        for (const [event, input] of [["session-start", sessionStart("sess-proc-2")], ["denied", denied]] as const) {
+          const r = spawnCli(cli, cwd, ["hook", "--agent", "claude-code", "--event", event], input);
+          expect(r.status, `${label} ${event}`).toBe(0); expect(r.stdout, `${label} ${event}`).toBe(""); expect(r.stderr, `${label} ${event}`).not.toBe("");
+        }
+        const pre = spawnCli(cli, cwd, ["hook", "--agent", "claude-code", "--event", "pre"], JSON.stringify({ session_id: "s", transcript_path: "/t", cwd: "/tmp", hook_event_name: "PreToolUse", tool_name: "Read", tool_input: {}, tool_use_id: "toolu_x" }));
+        expect(pre.status, label).toBe(1); expect(pre.stdout, label).toBe("");
+      } finally { await restore(); }
+    }
+    expect((await readFile(ledgerPath)).equals(before)).toBe(true);
+  });
+  it("denied chains a blocked auto-mode outcome to the intent that a session-start + pre wrote first", async () => {
+    const cwd = await sandbox(); expect(run(cwd, ["init"]).status).toBe(0);
+    const ledger = createLedger("jsonl", join(cwd, ".agent-ledger/ledger/records.jsonl"));
+    const intent = unsealed(1); intent.call.callId = "toolu_proc_chain"; intent.call.agentSessionId = "sess-proc-3"; await ledger.append(intent);
+    const denied = JSON.stringify({ session_id: "sess-proc-3", transcript_path: "/t/x.jsonl", cwd: "/tmp", hook_event_name: "PermissionDenied", tool_name: "Read", tool_input: {}, tool_use_id: "toolu_proc_chain", reason: "Destructive command" });
+    const r = spawnCli(cli, cwd, ["hook", "--agent", "claude-code", "--event", "denied"], denied);
+    expect(r.status, r.stderr).toBe(0); expect(r.stdout).toBe(""); expect(r.stderr).toBe("");
+    const all = await records(cwd); expect(all).toHaveLength(2);
+    expect(all[1]!.phase).toBe("outcome"); expect(all[1]!.outcome).toEqual({ status: "blocked", errorClass: "permission-denied:auto-mode" });
+    expect(all[1]!.call).toEqual(all[0]!.call); expect(all[1]!.policy).toEqual(all[0]!.policy);
+    expect(await readFile(join(cwd, ".agent-ledger/ledger/records.jsonl"), "utf8")).not.toContain("Destructive command");
+    expect(await ledger.verify()).toEqual({ ok: true, checked: 2 });
+  });
+  it("anchor refuses a broken chain with exit 1 and chain-failed, writing no anchor line; a healthy ledger anchors and verify answers head", async () => {
+    const cwd = await sandbox(); expect(run(cwd, ["init"]).status).toBe(0);
+    const path = join(cwd, ".agent-ledger/ledger/records.jsonl"); const ledger = createLedger("jsonl", path);
+    await ledger.append(unsealed(1)); await ledger.append(unsealed(2));
+    const good = await readFile(path, "utf8");
+    await writeFile(path, good.replace("reviewed read tool", "modified read tool"));
+    const broken = run(cwd, ["anchor"]);
+    expect(broken.status, broken.stderr).toBe(1); expect(JSON.parse(broken.stdout)).toMatchObject({ anchored: false, reason: "chain-failed", chain: { ok: false } });
+    await expect(readFile(join(cwd, ".agent-ledger/anchors.jsonl"))).rejects.toThrow();
+    await writeFile(path, good);
+    const anchored = run(cwd, ["anchor"]);
+    expect(anchored.status, anchored.stderr).toBe(0);
+    const out = JSON.parse(anchored.stdout); expect(out.anchored).toBe(true); expect(out.entry.hash).toBe(await ledger.head()); expect(out.chain).toEqual({ ok: true, checked: 2 });
+    expect(await readFile(out.path, "utf8")).toBe(out.line + "\n");
+    const verified = run(cwd, ["verify"]); expect(verified.status).toBe(0); expect(JSON.parse(verified.stdout).anchor.status).toBe("head");
+    expect(await readFile(path, "utf8")).toBe(good);
+  });
 });
