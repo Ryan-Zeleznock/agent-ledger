@@ -4,11 +4,13 @@ import { readFileSync } from "node:fs";
 import * as hooks from "../src/hooks/contract.js";
 import {
   APPROVAL_MIN_MARGIN_MS, CODEX_ASK_UNSUPPORTED_REASON, HOOK_AGENTS, MAX_MAX_OUTPUT_BYTES, MAX_REASON_CHARS,
-  WATCHDOG_WRITE_BUDGET_MS, WATCHDOG_WRITE_RETRY_SLEEP_MS, formatPreToolUseOutput, parseHookInput, toIncomingCall, toOutcome,
+  WATCHDOG_WRITE_BUDGET_MS, WATCHDOG_WRITE_RETRY_SLEEP_MS, formatPreToolUseOutput, parseHookInput, toHeartbeat, toIncomingCall, toOutcome,
   validateHandlerOutput, validateHookTiming, writeAllSync,
-  type CodexPostToolUseEvent, type CodexPreToolUseEvent, type PostToolUseFailureEvent, type PreToolUseEvent,
+  type CodexPostToolUseEvent, type CodexPreToolUseEvent, type CodexSessionStartEvent, type HeartbeatProbe, type PermissionDeniedEvent,
+  type PostToolUseEvent, type PostToolUseFailureEvent, type PreToolUseEvent, type SessionStartEvent,
 } from "../src/hooks/contract.js";
-import type { AgentCredential, HookAgent, HookDecision, IncomingCall, Outcome } from "../src/types/index.js";
+import type { AgentCredential, HookAgent, HookDecision, IncomingCall, Outcome, SessionHeartbeat } from "../src/types/index.js";
+import { PERMISSION_DENIED_ERROR_CLASS } from "../src/types/index.js";
 
 const load = (name: string) => readFileSync(`test/fixtures/${name}.json`, "utf8");
 const json = (name: string) => JSON.parse(load(name)) as Record<string, unknown>;
@@ -42,6 +44,39 @@ describe("parseHookInput(raw, \"claude-code\")", () => {
   it("tolerates fields Claude Code may add later (agent_id, a new field) but never Codex's markers", () => {
     expect(() => parseHookInput(withField("claude-code-pretooluse", { agent_id: "a1", agent_type: "worker", future_field: 1 }), "claude-code")).not.toThrow();
     expect(() => parseHookInput(withField("claude-code-pretooluse", { turn_id: "t" }), "claude-code")).toThrow(/Codex/);
+    expect(() => parseHookInput(withField("claude-code-pretooluse", { model: "m" }), "claude-code")).toThrow(/Codex/); // `model` is a Codex marker on TOOL events
+  });
+  it("ADR-010: accepts the SessionStart fixture (no tool fields, optional model, cost fields tolerated) and the PermissionDenied fixture", () => {
+    const ss = parseHookInput(load("claude-code-sessionstart"), "claude-code") as SessionStartEvent;
+    expect(ss.hook_event_name).toBe("SessionStart");
+    expect(ss.source).toBe("resume");
+    expect(ss.model).toBe("claude-opus-5");
+    expect(parseHookInput(without("claude-code-sessionstart", "model"), "claude-code").hook_event_name).toBe("SessionStart"); // "can be omitted"
+    expect(parseHookInput(withField("claude-code-sessionstart", { source: "startup", permission_mode: "auto", agent_type: "reviewer", session_title: "t" }), "claude-code").hook_event_name).toBe("SessionStart");
+    const pd = parseHookInput(load("claude-code-permissiondenied"), "claude-code") as PermissionDeniedEvent;
+    expect(pd.hook_event_name).toBe("PermissionDenied");
+    expect(pd.tool_use_id).toBe("toolu_01ABC123...");
+    expect(pd.reason).toBe("Destructive command");
+  });
+  it.each([
+    ["SessionStart without source", without("claude-code-sessionstart", "source")],
+    ["SessionStart with an empty source", withField("claude-code-sessionstart", { source: "" })],
+    ["SessionStart with a non-string model", withField("claude-code-sessionstart", { model: 7 })],
+    ["SessionStart with turn_id (a Codex marker on every Claude Code event)", withField("claude-code-sessionstart", { turn_id: "t" })],
+    ["SessionStart with a null transcript_path", withField("claude-code-sessionstart", { transcript_path: null })],
+    ["SessionStart with a non-string session_title", withField("claude-code-sessionstart", { session_title: 1 })],
+    ["a Codex SessionStart carrying turn_id (a Codex marker; the bare Codex SessionStart shape is indistinguishable by spec, see README)", withField("codex-sessionstart", { turn_id: "t" })],
+    ["PermissionDenied without reason", without("claude-code-permissiondenied", "reason")],
+    ["PermissionDenied without tool_use_id", without("claude-code-permissiondenied", "tool_use_id")],
+    ["PermissionDenied without tool_input", without("claude-code-permissiondenied", "tool_input")],
+    ["PermissionDenied with a non-object tool_input", withField("claude-code-permissiondenied", { tool_input: "rm -rf" })],
+  ])("ADR-010: rejects %s", (_what, raw) => {
+    expect(() => parseHookInput(raw, "claude-code")).toThrow();
+  });
+  it("a tool event is still refused when tool fields are missing: SessionStart leniency never leaks into PreToolUse/PostToolUse/PermissionDenied", () => {
+    for (const fx of ["claude-code-pretooluse", "claude-code-posttooluse", "claude-code-permissiondenied"]) {
+      for (const k of ["tool_name", "tool_use_id", "tool_input"]) expect(() => parseHookInput(without(fx, k), "claude-code"), `${fx} without ${k}`).toThrow();
+    }
   });
 });
 
@@ -65,12 +100,25 @@ describe("parseHookInput(raw, \"codex\")", () => {
     expect(() => parseHookInput(raw, "codex")).toThrow();
   });
   it("accepts any JSON tool_input at parse time (the schema says JSON value); toIncomingCall is the gate", () => {
-    const ev = parseHookInput(withField("codex-pretooluse", { tool_input: "npm test" }), "codex");
+    const ev = parseHookInput(withField("codex-pretooluse", { tool_input: "npm test" }), "codex") as CodexPreToolUseEvent;
     expect(ev.tool_input).toBe("npm test");
-    expect(() => toIncomingCall(ev as CodexPreToolUseEvent, cred, "codex")).toThrow(/plain object/);
+    expect(() => toIncomingCall(ev, cred, "codex")).toThrow(/plain object/);
   });
   it("rejects an unknown agent", () => {
     expect(() => parseHookInput(load("codex-pretooluse"), "cursor" as HookAgent)).toThrow(/unknown agent/);
+  });
+  it("ADR-010: accepts the Codex SessionStart fixture (no turn_id, no model, nullable transcript_path) and rejects the Claude Code SessionStart fixture and bad shapes", () => {
+    const ss = parseHookInput(load("codex-sessionstart"), "codex") as CodexSessionStartEvent;
+    expect(ss.hook_event_name).toBe("SessionStart");
+    expect(ss.source).toBe("startup");
+    expect(ss.permission_mode).toBe("default");
+    expect(parseHookInput(withField("codex-sessionstart", { transcript_path: null, model: "gpt-5.3-codex" }), "codex").hook_event_name).toBe("SessionStart");
+    expect(() => parseHookInput(load("claude-code-sessionstart"), "codex")).toThrow(); // permission_mode missing; cost fields aside
+    expect(() => parseHookInput(without("codex-sessionstart", "source"), "codex")).toThrow(/source/);
+    expect(() => parseHookInput(without("codex-sessionstart", "permission_mode"), "codex")).toThrow(/permission_mode/);
+    expect(() => parseHookInput(withField("codex-sessionstart", { permission_mode: "auto" }), "codex")).toThrow(/permission_mode/);
+    expect(() => parseHookInput(withField("codex-sessionstart", { hook_event_name: "PermissionDenied", tool_name: "Bash", tool_input: {}, tool_use_id: "c", reason: "r", model: "m", turn_id: "t" }), "codex")).toThrow(/unsupported Codex hook_event_name/);
+    expect(() => parseHookInput(withField("codex-sessionstart", { prompt_id: "p" }), "codex")).toThrow(/Claude Code field/);
   });
 });
 
@@ -135,6 +183,16 @@ describe("toIncomingCall naming (both agents)", () => {
     expect(() => new Date(c.receivedAt).toISOString()).not.toThrow();
     expect(c.receivedAt).toBe(new Date(c.receivedAt).toISOString());
   });
+  it("ADR-010: agentSessionId is the event's session_id verbatim, under both agents, and never lands in args", () => {
+    const cc = toIncomingCall(pre("claude-code", "Bash"), cred, "claude-code");
+    expect(cc.agentSessionId).toBe("abc123");
+    const cx = toIncomingCall(pre("codex", "Bash"), cred, "codex");
+    expect(cx.agentSessionId).toBe("thr_123");
+    expect("agentSessionId" in cc.args).toBe(false);
+    expect("session_id" in cc.args).toBe(false);
+    expect(Object.keys(cc).sort()).toEqual(["agentSessionId", "args", "callId", "credential", "receivedAt", "server", "tool"]);
+    expect(() => toIncomingCall({ ...pre("claude-code", "Bash"), session_id: "" } as PreToolUseEvent, cred, "claude-code")).toThrow(/session_id/);
+  });
   it("a tool_input with an own __proto__ key stays data and is copied", () => {
     const ev = JSON.parse(withField("claude-code-pretooluse", { tool_input: JSON.parse('{"__proto__":{"x":1},"command":"ls"}') })) as PreToolUseEvent;
     const c = toIncomingCall(ev, cred, "claude-code");
@@ -171,6 +229,55 @@ describe("toOutcome", () => {
   it("refuses a PreToolUse event and a Codex PostToolUseFailure", () => {
     expect(() => toOutcome(json("claude-code-pretooluse") as never, "claude-code")).toThrow();
     expect(() => toOutcome({ ...fail, model: "m", turn_id: "t" } as never, "codex")).toThrow(/Codex has no/);
+  });
+  it("ADR-010: Claude Code PermissionDenied → blocked with errorClass permission-denied:auto-mode; the reason text is never in the Outcome; Codex has no such event; SessionStart is not an outcome", () => {
+    const pd = parseHookInput(load("claude-code-permissiondenied"), "claude-code") as PermissionDeniedEvent;
+    const o = toOutcome(pd, "claude-code");
+    expect(o).toEqual({ status: "blocked", errorClass: PERMISSION_DENIED_ERROR_CLASS });
+    expect(PERMISSION_DENIED_ERROR_CLASS).toBe("permission-denied:auto-mode");
+    expect(JSON.stringify(toOutcome({ ...pd, reason: "secret=hunter2 is destructive" }, "claude-code"))).not.toContain("hunter2");
+    expect(() => toOutcome({ ...pd, model: "m", turn_id: "t" } as never, "codex")).toThrow(/Codex has no/);
+    expect(() => toOutcome(json("claude-code-sessionstart") as never, "claude-code")).toThrow(/not an outcome event/);
+  });
+});
+
+describe("toHeartbeat (ADR-010, pin 2)", () => {
+  const probe: HeartbeatProbe = { interpreter: "/usr/local/bin/node", nodeOptionsSet: false, watchdogCheck: "ok" };
+  const cc = () => parseHookInput(load("claude-code-sessionstart"), "claude-code") as SessionStartEvent;
+  const cx = () => parseHookInput(load("codex-sessionstart"), "codex") as CodexSessionStartEvent;
+  it("maps exactly the pinned fields and nothing else: Claude Code resume fixture (no permission_mode → no permissionMode key)", () => {
+    const hb = toHeartbeat(cc(), "claude-code", probe);
+    expect(hb).toEqual({ agentSessionId: "abc123", hookAgent: "claude-code", source: "resume", interpreter: "/usr/local/bin/node", nodeOptionsSet: false, watchdogCheck: "ok" });
+    expect(Object.keys(hb).sort()).toEqual(["agentSessionId", "hookAgent", "interpreter", "nodeOptionsSet", "source", "watchdogCheck"]);
+    expect("permissionMode" in hb).toBe(false);
+    const text = JSON.stringify(hb);
+    for (const leak of ["transcript_path", "00893aaf", "/Users/", "claude-opus-5", "cwd", "model", "session_title", "context_tokens", "182340", "1.1396", "NODE_OPTIONS"]) expect(text, leak).not.toContain(leak);
+  });
+  it("Codex startup fixture carries permissionMode verbatim; a Claude Code event with permission_mode too; the probe's three fields pass through", () => {
+    const hb = toHeartbeat(cx(), "codex", { interpreter: "/opt/node", nodeOptionsSet: true, watchdogCheck: "missing" });
+    expect(hb).toEqual({ agentSessionId: "thr_123", hookAgent: "codex", source: "startup", permissionMode: "default", interpreter: "/opt/node", nodeOptionsSet: true, watchdogCheck: "missing" });
+    const withMode = toHeartbeat({ ...cc(), permission_mode: "bypassPermissions" }, "claude-code", { ...probe, watchdogCheck: "failed" });
+    expect(withMode.permissionMode).toBe("bypassPermissions");
+    expect(withMode.watchdogCheck).toBe("failed");
+  });
+  it("the NODE_OPTIONS value is never present even when set in the process environment: the probe is a boolean by construction", () => {
+    const canary = "--title=heartbeat-nodeopt-canary-5c1d";
+    const prev = process.env["NODE_OPTIONS"];
+    process.env["NODE_OPTIONS"] = canary;
+    try {
+      const hb: SessionHeartbeat = toHeartbeat(cc(), "claude-code", { ...probe, nodeOptionsSet: (process.env["NODE_OPTIONS"] ?? "") !== "" });
+      expect(hb.nodeOptionsSet).toBe(true);
+      expect(JSON.stringify(hb)).not.toContain("canary");
+    } finally { if (prev === undefined) delete process.env["NODE_OPTIONS"]; else process.env["NODE_OPTIONS"] = prev; }
+  });
+  it("throws on a non-SessionStart event, an unknown agent, an empty session_id/source, or a malformed probe (never a heartbeat with invented facts)", () => {
+    expect(() => toHeartbeat(json("claude-code-pretooluse") as never, "claude-code", probe)).toThrow(/SessionStart/);
+    expect(() => toHeartbeat(cc(), "cursor" as HookAgent, probe)).toThrow(/unknown agent/);
+    expect(() => toHeartbeat({ ...cc(), session_id: "" }, "claude-code", probe)).toThrow(/session_id/);
+    expect(() => toHeartbeat({ ...cc(), source: "" }, "claude-code", probe)).toThrow(/source/);
+    for (const bad of [{ ...probe, watchdogCheck: "fine" }, { ...probe, nodeOptionsSet: "yes" }, { ...probe, interpreter: "" }, { ...probe, interpreter: 1 }, null, "probe"]) {
+      expect(() => toHeartbeat(cc(), "claude-code", bad as never), JSON.stringify(bad)).toThrow(/probe/);
+    }
   });
 });
 
@@ -347,7 +454,8 @@ describe("round trip through a fake pipeline (per agent)", () => {
     const line = formatPreToolUseOutput(await p.decide(toIncomingCall(ev, cred, "claude-code")), "claude-code");
     expect(JSON.parse(line).hookSpecificOutput.permissionDecision).toBe("ask");
     expect(p.decided[0]?.callId).toBe("toolu_01ABC123...");
-    await p.recordOutcome((parseHookInput(load("claude-code-posttooluse"), "claude-code")).tool_use_id, toOutcome(parseHookInput(load("claude-code-posttooluse"), "claude-code") as never, "claude-code"));
+    const postEv = parseHookInput(load("claude-code-posttooluse"), "claude-code") as PostToolUseEvent;
+    await p.recordOutcome(postEv.tool_use_id, toOutcome(postEv, "claude-code"));
     const f = parseHookInput(load("claude-code-posttoolusefailure"), "claude-code") as PostToolUseFailureEvent;
     await p.recordOutcome(f.tool_use_id, toOutcome(f, "claude-code"));
     expect(p.outcomes).toEqual([["toolu_01ABC123...", { status: "ok" }], ["toolu_01ABC123...", { status: "error", errorClass: "Exit code 1", durationMs: 4187 }]]);

@@ -4,12 +4,12 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import canonicalize from "canonicalize";
-import { ARGS_HMAC_PREFIX, CODEX_NO_CHANNEL_REASON, ORPHAN_OUTCOME_RULE_PREFIX, createPipeline, projectArgs, type PipelineDeps } from "../src/pipeline/contract.js";
+import { ARGS_HMAC_PREFIX, CODEX_NO_CHANNEL_REASON, ORPHAN_OUTCOME_RULE_PREFIX, WATCHDOG_DEADLINE_DENY_REASON, createPipeline, projectArgs, type PipelineDeps } from "../src/pipeline/contract.js";
 import { APPROVAL_MIN_MARGIN_MS, SLACK_HOOK_TIMING, WATCHDOG_DEADLINE_AT_ENV, WATCHDOG_DEADLINE_ENV } from "../src/hooks/contract.js";
 import { createLedger } from "../src/ledger/contract.js";
 import type { ToolRegistry } from "../src/policy/contract.js";
-import type { ApprovalResult, IncomingCall, LedgerRecord, ToolCall, ToolResult, UnsealedRecord } from "../src/types/index.js";
-import { APPROVAL_DECISIONS, CODEX_MCP_NOT_PROXIED_REASON, HANDOFF_TO_PROXY_REASON } from "../src/types/index.js";
+import type { ApprovalResult, IncomingCall, LedgerRecord, SessionHeartbeat, ToolCall, ToolResult, UnsealedRecord } from "../src/types/index.js";
+import { APPROVAL_DECISIONS, CODEX_MCP_NOT_PROXIED_REASON, HANDOFF_TO_PROXY_REASON, HEARTBEAT_REASON, HEARTBEAT_RULE_ID, HEARTBEAT_TOOL, PERMISSION_DENIED_ERROR_CLASS } from "../src/types/index.js";
 import * as approvalsMod from "../src/approvals/contract.js";
 
 // The approvals module is a stub until the Slack slice; the pipeline's contract with it is what these tests pin.
@@ -66,6 +66,8 @@ const call = (server: string, tool: string, args: Record<string, unknown> = {}, 
   ({ callId, credential: { ...CRED }, server, tool, args, receivedAt: "2026-09-30T12:00:00.000Z" });
 const approval = (decision: ApprovalResult["decision"], extra: Partial<ApprovalResult> = {}) => (callId: string): ApprovalResult => ({ callId, decision, decidedAt: new Date().toISOString(), channel: "slack", ...extra });
 const deps = (over: Partial<PipelineDeps> = {}): PipelineDeps => ({ identity, registry, ledger: fakeLedger() as never, upstream, approvals: { kind: "hook-ask" }, hookAgent: "claude-code", argsHmacKey: KEY, ...over });
+const heartbeat = (over: Partial<SessionHeartbeat> = {}): SessionHeartbeat =>
+  ({ agentSessionId: "abc123", hookAgent: "claude-code", source: "startup", permissionMode: "default", interpreter: "/usr/local/bin/node", nodeOptionsSet: false, watchdogCheck: "ok", ...over });
 
 let ledger: FakeLedger;
 beforeEach(() => {
@@ -92,17 +94,43 @@ describe("createPipeline: construction-time refusals", () => {
     await expect(p.handle(call("github", "list_repos"))).rejects.toThrow(/decide-only/);
     expect(upstream.execute).not.toHaveBeenCalled();
   });
-  it("decide-only mode refuses a missing, non-integer or already-past AGENT_LEDGER_WATCHDOG_DEADLINE_AT_MS", () => {
+  it("ADR-011: decide-only mode CONSTRUCTS without AGENT_LEDGER_WATCHDOG_DEADLINE_AT_MS (both agents, hook-ask and slack); proxy mode never needed it", () => {
     delete process.env[WATCHDOG_DEADLINE_AT_ENV];
-    expect(() => createPipeline(deps())).toThrow(new RegExp(WATCHDOG_DEADLINE_AT_ENV));
-    for (const bad of ["soon", "1.5", "-1", "0", ""]) { process.env[WATCHDOG_DEADLINE_AT_ENV] = bad; expect(() => createPipeline(deps()), bad).toThrow(); }
-    process.env[WATCHDOG_DEADLINE_AT_ENV] = String(Date.now() - 1);
-    expect(() => createPipeline(deps())).toThrow(/already past/);
-    // proxy mode does not need it
-    delete process.env[WATCHDOG_DEADLINE_AT_ENV];
+    delete process.env[WATCHDOG_DEADLINE_ENV];
+    expect(() => createPipeline(deps())).not.toThrow();
+    expect(() => createPipeline(deps({ hookAgent: "codex" }))).not.toThrow();
+    expect(() => createPipeline(deps({ hookAgent: "codex", approvals: slack }))).not.toThrow(); // the duration is absent too: decide() denies, construction does not throw
     expect(() => createPipeline(deps({ hookAgent: undefined, approvals: slack }))).not.toThrow();
   });
-  it("under Codex (and Claude Code) a Slack timeoutMs that is not below the watchdog deadline throws at construction; the Slack profile passes", () => {
+  it("ADR-011: decide() denies BEFORE identity, registry or append when the absolute deadline is missing, non-integer or already past; present → the usual answer", async () => {
+    const p = createPipeline(deps({ ledger: ledger as never }));
+    for (const bad of [undefined, "soon", "1.5", "-1", "0", "", String(Date.now() - 1)]) {
+      if (bad === undefined) delete process.env[WATCHDOG_DEADLINE_AT_ENV]; else process.env[WATCHDOG_DEADLINE_AT_ENV] = bad;
+      identity.resolveAgent.mockClear();
+      const d = await p.decide(call("github", "list_repos", { owner: "acme" }, "d1"));
+      expect(d, String(bad)).toEqual({ decision: "deny", reason: expect.stringContaining(WATCHDOG_DEADLINE_DENY_REASON), callId: "d1", kind: "decided" });
+      expect(d.reason).toContain(WATCHDOG_DEADLINE_AT_ENV);
+      expect(identity.resolveAgent).not.toHaveBeenCalled();
+    }
+    expect(ledger.records).toEqual([]);
+    expect(ledger.append).not.toHaveBeenCalled();
+    process.env[WATCHDOG_DEADLINE_AT_ENV] = String(Date.now() + 25_000);
+    expect((await p.decide(call("github", "list_repos", { owner: "acme" }, "d2"))).decision).toBe("allow"); // the same instance, read per call
+    expect(ledger.records.length).toBe(1);
+    // a Codex instance behaves the same; under the real watchdog this deny line is `handler-deny`, exit 2 (test/hooks-watchdog.test.ts "real" mode runs with the env present)
+    delete process.env[WATCHDOG_DEADLINE_AT_ENV];
+    expect((await createPipeline(deps({ hookAgent: "codex", ledger: ledger as never })).decide(call("builtin:codex", "update_plan"))).reason).toContain(WATCHDOG_DEADLINE_DENY_REASON);
+    expect(ledger.records.length).toBe(1);
+  });
+  it("ADR-011: recordOutcome and recordHeartbeat never consult the deadline: both work with neither watchdog variable set", async () => {
+    delete process.env[WATCHDOG_DEADLINE_AT_ENV]; delete process.env[WATCHDOG_DEADLINE_ENV];
+    const p = createPipeline(deps({ ledger: ledger as never }));
+    await p.recordOutcome("orphan-1", { status: "ok" });
+    await p.recordHeartbeat(heartbeat(), CRED);
+    expect(ledger.records.map((r) => r.phase)).toEqual(["outcome", "intent"]);
+    expect(ledger.records[1]!.policy.ruleId).toBe(HEARTBEAT_RULE_ID);
+  });
+  it("Slack clocks: a timeoutMs that does not fit under AGENT_LEDGER_WATCHDOG_DEADLINE_MS still throws at construction when the duration is PRESENT (init:exit-1 under the watchdog); absent → constructs, decide() denies", async () => {
     process.env[WATCHDOG_DEADLINE_ENV] = "25000";
     expect(() => createPipeline(deps({ hookAgent: "codex", approvals: slack }))).toThrow(/approval-not-below-deadline/);
     expect(() => createPipeline(deps({ hookAgent: "claude-code", approvals: slack }))).toThrow(/approval-not-below-deadline/);
@@ -110,8 +138,18 @@ describe("createPipeline: construction-time refusals", () => {
     expect(() => createPipeline(deps({ hookAgent: "codex", approvals: { ...slack, timeoutMs: 25_000 - APPROVAL_MIN_MARGIN_MS } }))).not.toThrow();
     process.env[WATCHDOG_DEADLINE_ENV] = String(SLACK_HOOK_TIMING.deadlineMs);
     expect(() => createPipeline(deps({ hookAgent: "codex", approvals: { ...slack, timeoutMs: SLACK_HOOK_TIMING.approvalTimeoutMs! } }))).not.toThrow();
+    // decide() re-checks on every call: the duration vanishing or shrinking after construction is a deny, never a wait past the deadline
+    const p = createPipeline(deps({ hookAgent: "codex", approvals: slack, ledger: ledger as never }));
     delete process.env[WATCHDOG_DEADLINE_ENV];
-    expect(() => createPipeline(deps({ hookAgent: "codex", approvals: slack }))).toThrow(new RegExp(WATCHDOG_DEADLINE_ENV));
+    const missing = await p.decide(call("builtin:codex", "Bash", {}, "sc1"));
+    expect(missing.decision).toBe("deny");
+    expect(missing.reason).toContain(WATCHDOG_DEADLINE_ENV);
+    process.env[WATCHDOG_DEADLINE_ENV] = "25000";
+    const broken = await p.decide(call("builtin:codex", "Bash", {}, "sc2"));
+    expect(broken.decision).toBe("deny");
+    expect(broken.reason).toMatch(/approval-not-below-deadline/);
+    expect(ledger.records).toEqual([]);
+    expect(requestApproval).not.toHaveBeenCalled();
   });
   it("a Slack channel that fails validateSlackChannel makes every decide a deny (the sync constructor cannot await it)", async () => {
     validateSlackChannel.mockResolvedValue(["approvers: must be non-empty"]);
@@ -362,6 +400,105 @@ describe("recordOutcome()", () => {
     const p = createPipeline(deps({ ledger: ledger as never }));
     await expect(p.recordOutcome("", { status: "ok" })).rejects.toThrow(/callId/);
     await expect(p.recordOutcome("x", { status: "weird" } as never)).rejects.toThrow(/invalid outcome/);
+  });
+  it("ADR-010 pin 7: a Claude Code auto-mode denial (blocked, permission-denied:auto-mode) chains to its intent, like any outcome; unknown callId → orphan", async () => {
+    const p = createPipeline(deps({ ledger: ledger as never }));
+    await p.decide({ ...call("builtin:claude-code", "Bash", { command: "rm -rf /tmp/data" }, "pd1"), agentSessionId: "sess-auto" });
+    await createPipeline(deps({ ledger: ledger as never })).recordOutcome("pd1", { status: "blocked", errorClass: PERMISSION_DENIED_ERROR_CLASS });
+    expect(outcomes()).toHaveLength(1);
+    expect(outcomes()[0]!.outcome).toEqual({ status: "blocked", errorClass: "permission-denied:auto-mode" });
+    expect(outcomes()[0]!.call).toEqual(intents()[0]!.call);
+    expect(outcomes()[0]!.call.agentSessionId).toBe("sess-auto");
+    expect(outcomes()[0]!.policy.ruleId).toBe("registry:builtin:claude-code/Bash");
+    await p.recordOutcome("pd-unknown", { status: "blocked", errorClass: PERMISSION_DENIED_ERROR_CLASS });
+    expect(outcomes()[1]!.policy.ruleId).toBe(`${ORPHAN_OUTCOME_RULE_PREFIX}pd-unknown`);
+  });
+});
+
+describe("ADR-010: agentSessionId projection and recordHeartbeat (Slice 1c pins 3, 4, 7)", () => {
+  it("decide(): the ToolCall projection carries agentSessionId when the IncomingCall has one, and omits the key otherwise; the credential never survives", async () => {
+    const p = createPipeline(deps({ ledger: ledger as never }));
+    await p.decide({ ...call("github", "list_repos", { owner: "acme" }, "p1"), agentSessionId: "abc123", onBehalfOf: "ryan" });
+    await p.decide(call("github", "list_repos", { owner: "acme" }, "p2"));
+    expect(Object.keys(intents()[0]!.call).sort()).toEqual(["agentId", "agentSessionId", "args", "callId", "onBehalfOf", "receivedAt", "server", "sessionId", "tool"]);
+    expect(intents()[0]!.call.agentSessionId).toBe("abc123");
+    expect("agentSessionId" in intents()[1]!.call).toBe(false);
+    expect(JSON.stringify(ledger.records)).not.toContain(CRED.value);
+    // an empty string is not a session id: the key is omitted rather than stored blank
+    await p.decide({ ...call("github", "list_repos", {}, "p3"), agentSessionId: "" });
+    expect("agentSessionId" in intents()[2]!.call).toBe(false);
+  });
+  it("recordHeartbeat writes exactly the pin 7 record: intent, heartbeat:<uuid>, builtin server, SessionStart, agentSessionId, args in the clear, allow/read/heartbeat:session-start; never an outcome", async () => {
+    const p = createPipeline(deps({ ledger: ledger as never }));
+    await p.recordHeartbeat(heartbeat(), CRED);
+    expect(ledger.records).toHaveLength(1);
+    const r = ledger.records[0]!;
+    expect(r.phase).toBe("intent");
+    expect(r.outcome).toBeUndefined(); expect(r.approval).toBeUndefined(); expect(r.handoff).toBeUndefined();
+    expect(r.call.callId).toMatch(/^heartbeat:[0-9a-f-]{36}$/);
+    expect(r.call).toMatchObject({ sessionId: "sess-1", agentId: "fable", agentSessionId: "abc123", server: "builtin:claude-code", tool: HEARTBEAT_TOOL });
+    expect(Object.keys(r.call).sort()).toEqual(["agentId", "agentSessionId", "args", "callId", "receivedAt", "server", "sessionId", "tool"]);
+    expect(r.call.args).toEqual({ agentSessionId: "abc123", hookAgent: "claude-code", source: "startup", permissionMode: "default", interpreter: "/usr/local/bin/node", nodeOptionsSet: false, watchdogCheck: "ok" });
+    expect(r.policy).toEqual({ verdict: "allow", risk: "read", ruleId: HEARTBEAT_RULE_ID, reason: HEARTBEAT_REASON });
+    expect(r.policy.ruleId).toBe("heartbeat:session-start");
+    expect(new Date(r.call.receivedAt).toISOString()).toBe(r.call.receivedAt);
+    expect(identity.resolveAgent).toHaveBeenCalledWith(CRED);
+    // the args object is a copy: mutating the input afterwards changes nothing; permissionMode is omitted when absent
+    const hb = heartbeat({ hookAgent: "codex", agentSessionId: "thr_123", source: "compact", watchdogCheck: "missing", nodeOptionsSet: true });
+    delete hb.permissionMode;
+    await createPipeline(deps({ hookAgent: "codex", ledger: ledger as never })).recordHeartbeat(hb, CRED);
+    hb.source = "mutated";
+    expect(ledger.records[1]!.call.server).toBe("builtin:codex");
+    expect(ledger.records[1]!.call.args).toEqual({ agentSessionId: "thr_123", hookAgent: "codex", source: "compact", interpreter: "/usr/local/bin/node", nodeOptionsSet: true, watchdogCheck: "missing" });
+    expect("permissionMode" in ledger.records[1]!.call.args).toBe(false);
+  });
+  it("recordHeartbeat throws (no record) on: unknown agent, proxy mode, a hookAgent that differs from the pipeline's, a malformed heartbeat, and a failed append", async () => {
+    const p = createPipeline(deps({ ledger: ledger as never }));
+    await expect(p.recordHeartbeat(heartbeat(), { kind: "local", value: "wrong" })).rejects.toThrow(/Unknown agent/);
+    await expect(createPipeline(deps({ hookAgent: undefined, approvals: slack, ledger: ledger as never })).recordHeartbeat(heartbeat(), CRED)).rejects.toThrow(/proxy mode/);
+    await expect(p.recordHeartbeat(heartbeat({ hookAgent: "codex" }), CRED)).rejects.toThrow(/configured for claude-code/);
+    for (const bad of [
+      heartbeat({ agentSessionId: "" }), heartbeat({ source: "" }), heartbeat({ interpreter: "" }), heartbeat({ permissionMode: "" }),
+      heartbeat({ watchdogCheck: "fine" as never }), heartbeat({ nodeOptionsSet: "no" as never }), heartbeat({ hookAgent: "cursor" as never }), null as never, "hb" as never,
+    ]) await expect(p.recordHeartbeat(bad, CRED), JSON.stringify(bad)).rejects.toThrow(/recordHeartbeat/);
+    expect(ledger.records).toEqual([]);
+    ledger.failNext = 1;
+    await expect(p.recordHeartbeat(heartbeat(), CRED)).rejects.toThrow(/lock is held/);
+    expect(ledger.records).toEqual([]);
+    // extra fields on the heartbeat object are dropped, never stored (NODE_OPTIONS value smuggled on the object, say)
+    await p.recordHeartbeat({ ...heartbeat(), nodeOptions: "--import=evil" } as never, CRED);
+    expect("nodeOptions" in ledger.records[0]!.call.args).toBe(false);
+    expect(JSON.stringify(ledger.records)).not.toContain("--import");
+  });
+  it("pin 4 round trip through the REAL jsonl ledger: heartbeat and a tool intent with agentSessionId append, read back with the field present, verify() ok, and the interpreter path survives redaction", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-ledger-pipeline-"));
+    try {
+      const real = createLedger("jsonl", join(dir, "ledger.jsonl"));
+      const p = createPipeline(deps({ ledger: real }));
+      await p.recordHeartbeat(heartbeat({ interpreter: "/Users/someone/.nvm/versions/node/v25.8.2/bin/node", permissionMode: "bypassPermissions" }), CRED);
+      await p.decide({ ...call("builtin:claude-code", "Read", { file_path: "/a" }, "rt1"), agentSessionId: "abc123" });
+      await p.decide({ ...call("builtin:claude-code", "Read", { file_path: "/b" }, "rt2"), agentSessionId: "other-session" });
+      await createPipeline(deps({ ledger: real })).recordOutcome("rt1", { status: "ok" });
+      const recs: LedgerRecord[] = [];
+      for await (const r of real.read({ from: "2020-01-01T00:00:00Z", to: "2100-01-01T00:00:00Z" })) recs.push(r);
+      expect(recs.map((r) => [r.phase, r.policy.ruleId, r.call.agentSessionId])).toEqual([
+        ["intent", HEARTBEAT_RULE_ID, "abc123"],
+        ["intent", "registry:builtin:claude-code/Read", "abc123"],
+        ["intent", "registry:builtin:claude-code/Read", "other-session"],
+        ["outcome", "registry:builtin:claude-code/Read", "abc123"],
+      ]);
+      expect(recs[0]!.call.tool).toBe("SessionStart");
+      expect(recs[0]!.call.args).toEqual({ agentSessionId: "abc123", hookAgent: "claude-code", source: "startup", permissionMode: "bypassPermissions", interpreter: "/Users/someone/.nvm/versions/node/v25.8.2/bin/node", nodeOptionsSet: false, watchdogCheck: "ok" });
+      expect(recs[3]!.call).toEqual(recs[1]!.call);
+      expect(await real.verify()).toEqual({ ok: true, checked: 4 });
+      const text = readFileSync(join(dir, "ledger.jsonl"), "utf8");
+      expect(text).toContain('"agentSessionId":"abc123"');
+      expect(text).not.toContain(CRED.value);
+      // a heartbeat session that only ever heartbeated and a session with tool records but no heartbeat are both visible to a reader (B's report check)
+      const heartbeats = new Set(recs.filter((r) => r.policy.ruleId === HEARTBEAT_RULE_ID).map((r) => r.call.agentSessionId));
+      const toolSessions = new Set(recs.filter((r) => r.phase === "intent" && r.policy.ruleId !== HEARTBEAT_RULE_ID).map((r) => r.call.agentSessionId));
+      expect([...toolSessions].filter((s) => !heartbeats.has(s))).toEqual(["other-session"]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
 

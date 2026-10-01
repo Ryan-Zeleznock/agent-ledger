@@ -1,0 +1,13 @@
+{
+  "session_id": "abc123",
+  "transcript_path": "/Users/.../.claude/projects/.../transcript.jsonl",
+  "cwd": "/Users/my-project",
+  "permission_mode": "default",
+  "hook_event_name": "PermissionDenied",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "rm -rf /tmp/data"
+  },
+  "tool_use_id": "toolu_01ABC123...",
+  "reason": "Destructive command"
+}

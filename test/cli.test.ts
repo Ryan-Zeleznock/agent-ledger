@@ -49,7 +49,8 @@ function hookFakes() {
   const event = { session_id: "s1", transcript_path: "t", cwd: "/tmp", hook_event_name: "PreToolUse" as const, tool_name: "Bash", tool_input: {}, tool_use_id: "t1" };
   const decide = vi.fn(async () => ({ callId: "t1", decision: "ask" as const, kind: "decided" as const, reason: "risky" }));
   const recordOutcome = vi.fn(async () => {});
-  const createPipeline = vi.fn((_deps: PipelineDeps) => ({ decide, recordOutcome, handle: vi.fn() }));
+  const recordHeartbeat = vi.fn(async () => {});
+  const createPipeline = vi.fn((_deps: PipelineDeps) => ({ decide, recordOutcome, recordHeartbeat, handle: vi.fn() }));
   const hooks = { parseHookInput: vi.fn(() => event), toIncomingCall: vi.fn<CliDeps["hooks"]["toIncomingCall"]>(() => incoming), toOutcome: vi.fn(() => ({ status: "ok" as const })), formatPreToolUseOutput: vi.fn(() => '{"decision":"ask"}') };
   return { createPipeline, hooks, decide, recordOutcome, event };
 }
@@ -114,7 +115,7 @@ it("provides post-only construction timing and restores the environment", async 
   const hooks = { ...f.hooks, parseHookInput: (() => ({ ...f.event, hook_event_name: "PostToolUse", tool_response: {} })) as CliDeps["hooks"]["parseHookInput"] };
   f.createPipeline.mockImplementation(() => {
     expect(Number(process.env[envName])).toBeGreaterThan(Date.now());
-    return { decide: f.decide, recordOutcome: f.recordOutcome, handle: vi.fn() };
+    return { decide: f.decide, recordOutcome: f.recordOutcome, recordHeartbeat: vi.fn(), handle: vi.fn() };
   });
   expect(await run(["hook", "--agent", "claude-code", "--event", "post", "--dir", dir], { ...f, hooks, stdin: async () => "raw" }).result).toBe(0);
   expect(f.createPipeline).toHaveBeenCalledOnce(); expect(process.env[envName]).toBe(previous);

@@ -167,7 +167,9 @@ const noExtra = (o: Record<string, unknown>, allowed: readonly string[], field: 
 };
 
 // ---------- projections (#1) ----------
-const CALL_KEYS = ["callId", "sessionId", "agentId", "onBehalfOf", "declaredPlan", "server", "tool", "args", "receivedAt"] as const;
+// `agentSessionId` (ADR-010, Slice 1c pin 4): optional in both modes, scalar-bounded like the other ids. Without it the
+// lenient append would DROP the field and the strict read would REJECT it, so the heartbeat/session checks would compute on nothing.
+const CALL_KEYS = ["callId", "sessionId", "agentId", "agentSessionId", "onBehalfOf", "declaredPlan", "server", "tool", "args", "receivedAt"] as const;
 const POLICY_KEYS = ["verdict", "ruleId", "reason", "risk"] as const;
 const APPROVAL_KEYS = ["callId", "decision", "approver", "reason", "decidedAt", "channel"] as const;
 const OUTCOME_KEYS = ["status", "errorClass", "durationMs"] as const;
@@ -183,7 +185,7 @@ export function projectToolCall(v: unknown, field: string, mode: Mode = LENIENT)
     callId: str(c.callId, `${field}.callId`), sessionId: str(c.sessionId, `${field}.sessionId`), agentId: str(c.agentId, `${field}.agentId`),
     server: str(c.server, `${field}.server`), tool: str(c.tool, `${field}.tool`),
     args, receivedAt: instant(c.receivedAt, `${field}.receivedAt`),
-  }, { onBehalfOf: optStr(c, "onBehalfOf", field), declaredPlan: optStr(c, "declaredPlan", field) });
+  }, { agentSessionId: optStr(c, "agentSessionId", field), onBehalfOf: optStr(c, "onBehalfOf", field), declaredPlan: optStr(c, "declaredPlan", field) });
 }
 export function projectPolicy(v: unknown, field: string, mode: Mode = LENIENT): PolicyDecision {
   const p = obj(v, field);

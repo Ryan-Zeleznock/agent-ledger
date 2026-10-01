@@ -166,7 +166,9 @@ export async function main(argv: string[] = process.argv.slice(2), overrides: Pa
     }
     const raw = await deps.stdin();
     const ev = deps.hooks.parseHookInput(raw, agent);
-    if ((ev.hook_event_name === "PreToolUse") === post) throw new Error("Hook event mismatch");
+    const isPre = ev.hook_event_name === "PreToolUse";
+    const isPost = ev.hook_event_name === "PostToolUse" || ev.hook_event_name === "PostToolUseFailure";
+    if (post ? !isPost : !isPre) throw new Error("Hook event mismatch");
     const key = await privateFile(join(dir, "hmac.key"), 32);
     if (key.length !== 32) throw new Error("Invalid HMAC key");
     const value = (await privateFile(join(dir, "credential"), 256)).toString("utf8").trim();
@@ -191,9 +193,9 @@ export async function main(argv: string[] = process.argv.slice(2), overrides: Pa
         else process.env[hooks.WATCHDOG_DEADLINE_AT_ENV] = priorDeadline;
       }
     }
-    if (ev.hook_event_name !== "PreToolUse") await pipeline.recordOutcome(ev.tool_use_id, deps.hooks.toOutcome(ev, agent));
+    if (ev.hook_event_name !== "PreToolUse") { const out = ev as hooks.AnyPostEvent; await pipeline.recordOutcome(out.tool_use_id, deps.hooks.toOutcome(out, agent)); }
     else {
-      const decision = await pipeline.decide(deps.hooks.toIncomingCall(ev, { kind: "local", value }, agent));
+      const decision = await pipeline.decide(deps.hooks.toIncomingCall(ev as hooks.AnyPreToolUseEvent, { kind: "local", value }, agent));
       deps.stdout(deps.hooks.formatPreToolUseOutput(decision, agent).trimEnd() + "\n");
     }
     return 0;
