@@ -292,3 +292,17 @@ describe("ledger.redact: ADR-009 digests pass through the key layer (Astra P2 #6
     expect(redact({ body: digest, list: [digest] })).toEqual({ body: digest, list: [digest] });
   });
 });
+
+describe("Slice 1c pin 10: only exact digests bypass the object key layer", () => {
+  it.each(["[REDACTED:pair]", "[REDACTED:anything]", `hmac-sha256:${"A".repeat(64)}`, `hmac-sha256:${"a".repeat(63)}`, ` hmac-sha256:${"a".repeat(64)}`])("redacts placeholder-like or inexact digest %s under sensitive keys and header values", value => {
+    const input = { nested: { password: value }, header: { name: "Authorization", value } };
+    const once = redact(input);
+    expect(once).toEqual({ nested: { password: "[REDACTED:key:password]" }, header: { name: "Authorization", value: "[REDACTED:pair]" } });
+    expect(redact(once)).toEqual(once);
+  });
+  it("keeps an exact lowercase digest in both object passes", () => {
+    const digest = `hmac-sha256:${"a".repeat(64)}`;
+    const input = { nested: { password: digest }, header: { name: "Authorization", value: digest } };
+    expect(redact(input)).toEqual(input); expect(redact(redact(input))).toEqual(input);
+  });
+});

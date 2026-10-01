@@ -30,5 +30,7 @@ Added from Astra's round 3 (2026-09-30), all implemented:
 Still to write:
 - [ ] postgres backend (Slice 2): the same chain rules over a table with an append-only role; verify() and read(range) parity with jsonl
 - [ ] pipeline/report: the caller-side anchor comparison (anchored head ∈ verified chain) as a real function, once `src/report/` exists
-- [ ] (Astra verification P2, 2026-09-30) `redact.ts` key-layer exemption also keeps arbitrary `[REDACTED:…]` strings under sensitive keys; narrow it to exact `hmac-sha256:[0-9a-f]{64}` only, with a test that a sensitive-key value shaped like a placeholder is redacted
+- [x] (Astra verification P2, 2026-09-30) `redact.ts` key-layer exemption also keeps arbitrary `[REDACTED:…]` strings under sensitive keys; narrow it to exact `hmac-sha256:[0-9a-f]{64}` only, with a test that a sensitive-key value shaped like a placeholder is redacted
 - [ ] (coordinator, 2026-09-30) full suite is load-sensitive: `ledger-redact-bench` and several real-process watchdog timing tests fail when another suite runs concurrently on the same machine (idle: 3/3 green). Isolate timing suites (vitest project with `fileParallelism: false`, or a separate `npm run test:timing`)
+
+Slice 1c pin 10: `test/ledger-redact.test.ts` covers placeholder values, inexact digests, exact lowercase digests and nested-key/header-object idempotence. Test-first run: the placeholder cases failed before the key-layer fix.

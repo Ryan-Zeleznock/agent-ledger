@@ -36,7 +36,7 @@ const PLACEHOLDER_FULL = /^\[REDACTED:[a-z0-9][a-z0-9:#_-]*\]$/;
  * auditor holding the key could verify neither. Nothing else is exempt: the token shape carries no secret by itself.
  */
 const HMAC_DIGEST_FULL = /^hmac-sha256:[0-9a-f]{64}$/;
-const isProtected = (v: unknown): boolean => typeof v === "string" && (PLACEHOLDER_FULL.test(v) || HMAC_DIGEST_FULL.test(v));
+const isProtected = (v: unknown): boolean => typeof v === "string" && HMAC_DIGEST_FULL.test(v);
 const PLACEHOLDER_AT = /\[REDACTED:[a-z0-9][a-z0-9:#_-]*\]/y;
 
 export const WORD_MAX = 1024;         // longer words are replaced whole
