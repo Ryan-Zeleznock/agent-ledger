@@ -4,19 +4,18 @@ This demo shows **visibility, tamper-evident logging and best-effort gating on g
 It does not show server enforcement or establish SOC 2 compliance. A machine owner can bypass local
 hooks or alter local evidence. The generated pack says this on its cover.
 
-**Dependency checkpoint:** build/init/print/verify/report and direct-ledger smoke tests work on Astra's
-`slice-1b-cli` branch. The **live Claude Code steps 3–5 require Fable's hooks, pipeline, PIN-1 amendment
-and `dist/hooks/watchdog-main.js`**, integrated and independently reviewed. Until then hooks/pipeline
-throw `not implemented`; a missing watchdog cannot protect a call. Ryan merges the reviewed halves.
-Do not present simulated/directly-written ledger records as observed agent activity.
+**Integration checkpoint:** use the reviewed, integrated Slice 1c checkout. Package A supplies the
+five-event collector and `anchor`; Package B supplies this pack. Separate builder branches use
+fixtures and do not establish the live demo. Ryan merges; the coordinator runs
+`test/e2e-slice-1c.test.ts` after integration. Do not present fixture/direct-ledger records as
+observed agent activity. This demo is **sandbox-only: never paste into real config**.
 
 ## 1. Build and create a disposable sandbox
 
 From the integrated repo checkout, using the installed dependency set:
 
 ```sh
-npm run typecheck && npm test
-npm run build
+npm run check
 export LEDGER_DEMO_REPO="$PWD"
 export LEDGER_DEMO_NODE="$(command -v node)"
 export LEDGER_DEMO_DIR="$(mktemp -d /tmp/agent-ledger-demo.XXXXXX)"
@@ -42,15 +41,17 @@ sandbox project's settings file. Never paste it into `~/.claude/settings.json`, 
 project, or any global configuration. The CLI prints only; it never writes any agent settings.
 
 The snippet contains PreToolUse through the watchdog (25-second deadline; 30-second agent timeout),
-and direct PostToolUse and PostToolUseFailure hooks. Paths are absolute. Check the entry exists:
+and four direct hooks: PostToolUse, PostToolUseFailure, SessionStart and PermissionDenied —
+**five events total**. SessionStart and PermissionDenied must not run under the watchdog.
+Paths are absolute. Check the entry exists:
 
 ```sh
 test -f "$LEDGER_DEMO_REPO/dist/hooks/watchdog-main.js"
 ```
 
-If that test fails, stop the live demo here: Fable's half has not been built into this checkout.
+If that test fails, stop: the integrated collector has not been built into this checkout.
 
-## 3. Start Claude Code inside the sandbox (requires Fable)
+## 3. Start Claude Code inside the sandbox
 
 ```sh
 cd "$LEDGER_DEMO_DIR"
@@ -60,10 +61,24 @@ claude
 Accept the sandbox project trust/configuration prompt as appropriate. Use normal interactive
 permissions; do not use a bypass-permissions mode. The exact prompt UI depends on the installed
 Claude Code version [H]; the adapter contract is pinned to the fixtures and spec in this repo.
+Before the first prompt, the SessionStart hook writes a heartbeat. In a second terminal, inspect
+only that health record in the sandbox ledger (the handler itself prints no stdout):
+
+```sh
+# Set LEDGER_DEMO_DIR to the same disposable sandbox path from the setup shell.
+# Keep this terminal outside Claude; use the installed Node executable.
+node -e 'const fs = require("node:fs"); for (const line of fs.readFileSync(process.argv[1], "utf8").trim().split("\n")) { if (!line) continue; const r = JSON.parse(line); if (r.policy.ruleId === "heartbeat:session-start") console.log(JSON.stringify({ id: r.id, session: r.call.agentSessionId, health: r.call.args })); }' "$LEDGER_DEMO_DIR/.agent-ledger/ledger/records.jsonl"
+```
+
+Show `watchdogCheck: "ok"`, the agent session id, interpreter, permission mode and the boolean
+`nodeOptionsSet` (never the NODE_OPTIONS value). A heartbeat proves only that the SessionStart
+hook reached the ledger; it does not prove every later call was hooked. If missing or unhealthy,
+investigate before presenting the collector as healthy.
+
 Tell the audience that the registry classifies **the entire Bash tool**, not regex guesses about a
 particular command's harmlessness.
 
-## 4. Approve one harmless Bash call (requires Fable)
+## 4. Approve one harmless Bash call
 
 Ask Claude:
 
@@ -76,7 +91,7 @@ its output. The post hook should add an outcome `ok` (or `error` if actual execu
 The ledger does **not** record the terminal human as a named approver. The evidence is an ask followed
 by observed execution. Do not describe `delegated` as a Slack-style recorded approval.
 
-## 5. Deny a second harmless Bash call (requires Fable)
+## 5. Deny a second harmless Bash call
 
 Ask Claude:
 
@@ -84,7 +99,9 @@ Ask Claude:
 
 **Deny this one call** at the prompt. The intent should remain with a delegated ask and **no observed
 outcome**. Claude Code permission denial does not fire PostToolUseFailure under the pinned contract.
-The report therefore cannot prove the user's denial: cancellation or lost telemetry looks the same.
+The report labels this **"asked, no outcome observed"**. A manual denial fires no hook event:
+cancellation, an interrupted session or lost telemetry looks the same. Only auto-mode denials
+are recorded as `permission-denied:auto-mode`; this interactive demo does not exercise auto mode.
 Explain the live denial using the visible terminal prompt, and show the report's honest wording.
 No destructive command, real repository, network resource or customer data is needed.
 
@@ -92,56 +109,77 @@ Optional execution-error example: approve `exit 7` in Bash; PostToolUseFailure s
 outcome. This is an execution failure, not a permission denial. Exit Claude before exporting so no
 new hook records arrive during verify/report.
 
-## 6. Verify and export the evidence pack
+## 6. Anchor, verify and export the evidence pack
 
-In the same shell after Claude exits:
+Exit Claude first so no new hook records arrive during anchoring/export. In the original setup
+shell, create the pack directory and preserve the command's printed JSON alongside the pack:
 
 ```sh
+mkdir -p "$LEDGER_DEMO_DIR/evidence-pack"
+"$LEDGER_DEMO_NODE" "$LEDGER_DEMO_REPO/dist/cli/main.js" anchor > "$LEDGER_DEMO_DIR/evidence-pack/anchor-result.json"
+cat "$LEDGER_DEMO_DIR/evidence-pack/anchor-result.json"
 "$LEDGER_DEMO_NODE" "$LEDGER_DEMO_REPO/dist/cli/main.js" verify
 LEDGER_DEMO_VERIFY_CODE=$?
 printf 'verify exit code: %s\n' "$LEDGER_DEMO_VERIFY_CODE"
 ```
 
-Expect `chain.ok: true` and a nonzero checked count after the live steps. **Exit 3 is expected when
-no non-genesis local anchor exists**: it means the chain passed, but no saved anchor was available to check tail
-truncation. Exit 1 is a verification/configuration failure; investigate before continuing. Exit 0
-means an existing anchor also matched the head or a retained ancestor. The CLI never writes an
-anchor just to make verification pass; periodic/independent anchoring is not wired in this slice.
+Check `anchored: true` before continuing. Empty, changed or broken ledgers refuse anchoring;
+a torn anchor file is an error. Expect verify **exit 0**, `chain.ok: true`, a nonzero checked count
+and anchor status **`head`**. An `ancestor` status means records were added after anchoring;
+those later records are unprotected by that saved anchor. Investigate errors rather than
+present a failed chain as verified.
+
+The anchor is a **local file editable by this machine's owner**. Save the exact canonical
+`line` from `anchor-result.json` off-machine. For this demo, Ryan keeps the copy in the private
+off-machine review repository alongside the exported pack (record the repository/commit in
+the demo run note). Saving it only in the sandbox or on the same laptop is not independent
+anchoring. This walkthrough does not upload anything automatically. Tail truncation is
+detectable only relative to the saved copy you retain.
 
 Choose UTC boundaries covering the session. For a demo on the task date:
 
 ```sh
 "$LEDGER_DEMO_NODE" "$LEDGER_DEMO_REPO/dist/cli/main.js" report \
-  --from 2026-09-30T00:00:00Z --to 2026-10-01T00:00:00Z \
+  --from 2026-10-01T00:00:00Z --to 2026-10-02T00:00:00Z \
   --out "$LEDGER_DEMO_DIR/evidence-pack"
 open "$LEDGER_DEMO_DIR/evidence-pack/report.html"
 ```
 
-Report stdout includes `chain`; exit 1 with `chain.ok: false` means a failed-chain diagnostic pack
-was written. Investigate it before presenting the evidence as verified.
+Use the actual dates if running later. Report stdout includes `chain` and `anchor`; exit 1
+with `chain.ok: false` means a diagnostic pack was written. `open` is the macOS opener;
+elsewhere use the browser's Open File action. Existing pack files are never replaced; for
+another export choose a fresh output directory. PDF and CSV links open the sibling files.
 
-Use the actual dates if running later. `open` is the macOS opener; elsewhere use the browser's Open
-File action. For another export, choose a new output directory: existing pack files are never
-replaced. PDF and CSV links in the HTML open the other two files in the same directory.
+Walk these sections in order on the **real sandbox pack**:
 
-Show the cover trust boundary and full-ledger verify result first. Then show CC6.1 identity/policy,
-CC7.2 chain links and anomaly sections, and CC8.1 asks/approvals/denials for candidate change evidence.
-Expect the unreconciled-handoff section to be empty in this Claude builtins demo. There should be no
-orphan outcomes in a healthy run. The denied terminal attempt appears among intents with no observed
-outcome. Other Claude tool activity may add records; do not promise an exact count.
+1. `#summary` **Executive summary**: range, counts, observed head, chain PASS, anchor head/time,
+   local-file warning, trust boundary and findings. A session without a heartbeat is a finding;
+   do not infer that absence of findings proves complete hook coverage.
+2. `#cc6-1` **CC6.1 logical access**: tool-intent identity, agent session, risk, verdict and rule.
+   The heartbeat is not a tool authorization and does not appear in this table.
+3. `#cc7-2` **CC7.2 monitoring**: the SessionStart row, watchdog/environment observations,
+   missing-heartbeat sessions, orphan intent gaps and unreconciled handoffs. This Claude builtins
+   demo should have no orphan outcomes or handoffs; investigate if it does.
+4. `#cc8-1` **CC8.1 change management**: approved terminal Bash = `executed after ask`;
+   manually denied Bash = `asked, no outcome observed`; optional `exit 7` = `execution error`.
+   Read the exact denial caveat below the table. Other tool activity may add records, so do not
+   promise an exact count. A terminal ask is not a named recorded approval.
 
-The pack does not include the HMAC key. The shell command is a labeled withheld-argument digest;
-allowlisted identifying fields on other tools can be readable. It is supporting evidence for an
-auditor to assess [H], not a generated audit opinion.
+Then open PDF to check the same section order, tables, page footers and per-record evidence.
+CSV appends agent session id, evidence class and anchor status; heartbeat criteria are CC7.2 only.
+The HMAC key is never in the pack. Shell commands appear as labeled withheld-argument digests;
+allowlisted fields on other tools can remain readable. The [V] criterion scopes and [H] candidate
+evidence mappings are supporting material for an auditor, not a generated audit opinion.
 
-## Smoke test before Fable's integration
+## Integration validation
 
 ```sh
 cd "$LEDGER_DEMO_REPO"
-npx vitest run test/cli.test.ts test/cli-process.test.ts test/report.test.ts
+npm run check
+npx vitest run test/e2e-slice-1c.test.ts
 ```
 
-The process test builds `dist`, initializes temporary directories, writes a real JSONL ledger directly
-with `createLedger("jsonl", ...)`, checks anchors/verification, and reads all three exports. It also
-checks malformed pre/post failure behavior. It does **not** prove that live Claude hooks work; only
-steps 3–5 on the integrated implementation establish that part of the demo.
+The coordinator adds pack assertions (pins' e2e steps 8–10) after both package reviews and runs
+that real-process integration test three times. Package B's `test/report-slice-1c.test.ts` covers
+the interfaces with fixtures; it does not establish live Claude behavior. Only the integrated
+sandbox run and these live steps establish the demo. Never modify a real agent config to test it.
