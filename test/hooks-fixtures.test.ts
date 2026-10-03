@@ -8,7 +8,7 @@ import {
   type CodexPostToolUseEvent, type CodexPreToolUseEvent, type PostToolUseEvent, type PostToolUseFailureEvent, type PreToolUseEvent,
   type PreToolUseOutput, type ValidatedHandlerOutput, type WatchdogOptions, type WatchdogResult,
 } from "../src/hooks/contract.js";
-import type { HookDecision, Outcome } from "../src/types/index.js";
+import { HEARTBEAT_RULE_ID, HEARTBEAT_TOOL, PERMISSION_DENIED_ERROR_CLASS, type HookDecision, type Outcome } from "../src/types/index.js";
 
 // Format-drift guard. The Claude Code fixtures are the example blocks from https://code.claude.com/docs/en/hooks (read
 // 2026-09-29). The Codex fixtures are composed from the field tables at https://learn.chatgpt.com/docs/hooks and the
@@ -219,10 +219,16 @@ describe("Slice 1c fixtures (ADR-010): SessionStart (both agents) and Permission
     const noTurn: string = typed.turn_id;
     expect(noTurn).toBeUndefined();
   });
-  it("the heartbeat constants are what the report discriminates on, and the denial errorClass names auto mode", () => {
+  it("the heartbeat constants are what the report discriminates on (tool, rule id, builtin servers), and the denial errorClass names auto mode and is what toOutcome(PermissionDenied) emits", () => {
     expect(hooks.HOOK_EVENT_NAMES).toContain("SessionStart");
     expect(hooks.CODEX_HOOK_EVENT_NAMES).toContain("SessionStart");
     expect(hooks.CODEX_UNUSED_EVENTS).toEqual(["PermissionRequest"]);
+    // the literal values are the contract the report (Package B) keys on; a rename here would silently break its findings
+    expect(HEARTBEAT_TOOL).toBe("SessionStart"); expect(HEARTBEAT_RULE_ID).toBe("heartbeat:session-start");
+    expect(hooks.BUILTIN_SERVERS).toEqual({ "claude-code": "builtin:claude-code", codex: "builtin:codex" });
+    expect(PERMISSION_DENIED_ERROR_CLASS).toBe("permission-denied:auto-mode");
+    const denied = hooks.parseHookInput(JSON.stringify(load("claude-code-permissiondenied")), "claude-code");
+    expect(hooks.toOutcome(denied as hooks.AnyOutcomeEvent, "claude-code")).toEqual({ status: "blocked", errorClass: PERMISSION_DENIED_ERROR_CLASS });
   });
 });
 

@@ -167,7 +167,7 @@ describe("ADR-011: no watchdog-deadline shim", () => {
     const code = await withoutWatchdogEnv(() => run(["hook", "--agent", "claude-code", "--event", event, "--dir", dir], { ...f, hooks: f.parsing(ev), stdin: async () => "raw" }).result);
     expect(code).toBe(0); expect(f.createPipeline).toHaveBeenCalledOnce(); expect(seen).toEqual([undefined, undefined]);
   });
-  it("real modules: session-start writes the pin 7 heartbeat and denied chains a blocked outcome through the real jsonl ledger with no deadline in the environment", async () => {
+  it("real modules, no deadline in the environment: session-start writes the pin 7 heartbeat; pre outside the watchdog denies and appends nothing; so denied records an ORPHAN blocked outcome through the real jsonl ledger (the chained case is test/cli-process.test.ts and e2e step 3)", async () => {
     const dir = await initialized();
     const sessionStart = JSON.stringify({ session_id: "sess-real-1", transcript_path: "/t/x.jsonl", cwd: "/tmp", hook_event_name: "SessionStart", source: "startup", permission_mode: "default" });
     const pre = JSON.stringify({ session_id: "sess-real-1", transcript_path: "/t/x.jsonl", cwd: "/tmp", hook_event_name: "PreToolUse", tool_name: "Read", tool_input: { file_path: "/tmp/a" }, tool_use_id: "toolu_real_1" });
