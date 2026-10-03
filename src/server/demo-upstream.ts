@@ -47,8 +47,39 @@ export function createDemoHandler(token: Buffer, log: (line: Record<string, unkn
     return result;
   };
 }
+/**
+ * F9: the demo enforces its own published `inputSchema` before a tool runs (tools page: servers MUST validate all tool
+ * inputs). A deliberately small validator for the subset those five schemas use: `type` (object/string/number/integer/
+ * boolean/array), `properties`, `required`, `additionalProperties: false`, `enum`; any other keyword (`$ref`, composition,
+ * `items`, …) is "unsupported schema" and fails closed. Nothing is ever fetched. Returns a value-free problem or undefined.
+ */
+export function validateArgs(value: unknown, schema: unknown, at = "arguments", depth = 0): string | undefined {
+  if (depth > 16) return `${at}: schema too deep`;
+  if (typeof schema !== "object" || schema === null || Array.isArray(schema)) return `${at}: unsupported schema`;
+  const s = schema as Record<string, unknown>;
+  for (const k of Object.keys(s)) if (!["type", "properties", "required", "additionalProperties", "enum", "description", "title", "$schema", "default", "examples"].includes(k)) return `${at}: unsupported schema keyword`;
+  const type = s["type"];
+  const actual = value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+  if (type !== undefined) {
+    if (type === "integer" ? !Number.isInteger(value) : type === "number" ? typeof value !== "number" || !Number.isFinite(value) : actual !== type) return `${at}: expected ${String(type)}`;
+  }
+  if (Array.isArray(s["enum"]) && !s["enum"].some((e) => e === value)) return `${at}: not one of the allowed values`;
+  if (actual === "object") {
+    const obj = value as Record<string, unknown>;
+    const props = typeof s["properties"] === "object" && s["properties"] !== null ? (s["properties"] as Record<string, unknown>) : {};
+    for (const r of Array.isArray(s["required"]) ? s["required"] : []) if (typeof r !== "string" || !Object.hasOwn(obj, r)) return `${at}: missing required property ${String(r).slice(0, 64)}`;
+    for (const [k, v] of Object.entries(obj)) {
+      if (Object.hasOwn(props, k)) { const problem = validateArgs(v, props[k], `${at}.${k}`, depth + 1); if (problem) return problem; }
+      else if (s["additionalProperties"] === false) return `${at}: unexpected property ${k.slice(0, 64)}`;
+    }
+  }
+  return undefined;
+}
+const schemaOf = new Map(DEMO_TOOLS.map((t) => [t.name, t.inputSchema] as const));
 function run(incoming: IncomingCall): ToolResult {
   const a = incoming.args ?? {};
+  const schema = schemaOf.get(incoming.tool);
+  if (schema !== undefined) { const problem = validateArgs(a, schema); if (problem !== undefined) return text(`invalid arguments for ${incoming.tool}: ${problem}`, true); }
   switch (incoming.tool) {
     case "echo": return typeof a["message"] === "string" ? text(a["message"]) : text("echo: message must be a string", true);
     case "now": return text(new Date().toISOString());

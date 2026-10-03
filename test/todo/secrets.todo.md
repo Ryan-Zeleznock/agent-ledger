@@ -8,4 +8,5 @@ are ticked against it and the `env` form is a 2b item.
 - [x] secrets never appear in thrown error messages (every refusal path checked against canary values), nor on the provider object (`JSON.stringify(provider) === "{}"`)
 - [x] symlinks refused with `O_NOFOLLOW` (a directly mounted K8s Secret volume is all symlinks; pin 8 stages it first)
 - [x] read once at construction; prototype-named servers/keys are plain data
+- [x] fix round (Astra review 2026-10-03, F8): a FIFO named like a secret is refused by `fstat` after an `O_NONBLOCK` open instead of blocking start-up (child-process test with a timeout; same fix in `src/server/files.ts`)
 - [ ] 2b: `createSecretsProvider("env", …)` (currently `not implemented`); refresh after construction; `SecretRef` resolution for the Slack tokens

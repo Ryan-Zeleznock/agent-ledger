@@ -2,6 +2,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createServer, type Server, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -200,7 +202,7 @@ describe.sequential("Slice 2a demo path: proxy → policy → ledger → demo up
     expect(intent!.approval).toMatchObject({ decision: "no-channel", channel: "none" });
     expect(outcome!.outcome).toEqual({ status: "blocked" });
   });
-  it("7. protocol and auth rejections write no record: no bearer 401; wrong key denied by identity; missing Mcp-Name 400 -32020; 2025-11-25 400 -32022; evil Origin 403; GET 405; initialize 404 -32601 naming 2026-07-28; notification 202; 2 MiB 413", async () => {
+  it("7. protocol and auth rejections write no record: no bearer 401; wrong key denied by identity; missing Mcp-Name 400 -32020; 2025-11-25 400 -32022; evil Origin 403; GET 405; legacy initialize 400 -32020 naming 2026-07-28 (modern-framed: 404 -32601); notification 202; 2 MiB 413", async () => {
     const before = (await records()).length;
     const noBearer = await post({ method: "server/discover" });
     expect(noBearer.status).toBe(401); expect(noBearer.headers.get("www-authenticate")).toBe('Bearer realm="agent-ledger"');
@@ -215,8 +217,11 @@ describe.sequential("Slice 2a demo path: proxy → policy → ledger → demo up
     const evil = await post({ token: K, method: "server/discover", headers: { origin: "https://evil.example" } });
     expect(evil.status).toBe(403); expect(Object.hasOwn(evil.json as object, "id")).toBe(false);
     expect((await post({ token: K, method: "server/discover", httpMethod: "GET" })).status).toBe(405);
+    // F6: a legacy initialize (no headers) fails HTTP validation first (400 -32020, versioning matrix) and the error still names 2026-07-28; a modern-framed initialize is the unknown method (404 -32601)
     const init = await post({ token: K, method: "initialize", meta: false, params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "legacy", version: "1" } }, headers: { "mcp-protocol-version": null, "mcp-method": null } });
-    expect(init.status).toBe(404); expect(rpcErr(init)!.code).toBe(-32601); expect(rpcErr(init)!.message).toContain("2026-07-28");
+    expect(init.status).toBe(400); expect(rpcErr(init)!.code).toBe(-32020); expect(rpcErr(init)!.message).toContain("2026-07-28"); expect(rpcErr(init)!.data).toEqual({ supported: ["2026-07-28"] });
+    const initModern = await post({ token: K, method: "initialize" });
+    expect(initModern.status).toBe(404); expect(rpcErr(initModern)!.code).toBe(-32601); expect(rpcErr(initModern)!.message).toContain("2026-07-28");
     const note = await post({ token: K, method: "notifications/initialized", notification: true });
     expect(note.status).toBe(202); expect(note.text).toBe("");
     const big = await post({ token: K, method: "server/discover", rawBody: "x".repeat(2 * 1024 * 1024) });
@@ -280,24 +285,56 @@ describe.sequential("Slice 2a demo path: proxy → policy → ledger → demo up
     }
     expect(html).toContain("executed (allowed)");
   });
-  it("11. SIGTERM: the proxy exits 0 within 10 s and every intent has an outcome (a call in flight gets ok or error, never a missing intent); NODE_OPTIONS set → it refuses to start", async () => {
-    const inflight = mcpPost({ url: proxyUrl, token: K, method: "tools/call", params: { name: "demo__now", arguments: {} } }).then((r) => r.text, () => "connection closed");
-    const stopped = await proxy.stop();
-    expect(stopped.code).toBe(0); expect(stopped.signal).toBeNull(); expect(stopped.ms).toBeLessThan(10_000);
-    expect(proxy.events().some((e) => e["event"] === "shutdown" && e["signal"] === "SIGTERM")).toBe(true);
-    expect(proxy.events().at(-1)).toMatchObject({ event: "stopped" });
-    responses.push(await inflight);
-    const recs = await records();
-    const intents = recs.filter((r) => r.phase === "intent").map((r) => r.call.callId);
-    const outcomes = new Set(recs.filter((r) => r.phase === "outcome").map((r) => r.call.callId));
-    expect(intents.filter((id) => !outcomes.has(id))).toEqual([]);
-    for (const r of recs.filter((r) => r.phase === "outcome")) expect(["ok", "error", "blocked"]).toContain(r.outcome!.status);
+  it("11. SIGTERM with a call in flight against a deliberately PENDING upstream, twice: the proxy exits 0 within 10 s, the in-flight call's intent gets an `error` outcome (UpstreamClosed) persisted BEFORE exit, drained:true; NODE_OPTIONS set → it refuses to start", async () => {
+    // a second config: the demo plus a `slow` upstream (in this process, loopback) whose tools/call is never answered
+    const held: ServerResponse[] = [];
+    const slow: Server = createServer((req, res) => {
+      const chunks: Buffer[] = []; req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", () => {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { id: unknown; method: string };
+        const json = (result: unknown) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ jsonrpc: "2.0", id: body.id, result })); };
+        if (body.method === "server/discover") return json({ resultType: "complete", supportedVersions: ["2026-07-28"], capabilities: { tools: {} }, _meta: {}, ttlMs: 1, cacheScope: "public" });
+        if (body.method === "tools/list") return json({ resultType: "complete", tools: [{ name: "wait", description: "never answers", inputSchema: { type: "object" } }], ttlMs: 1, cacheScope: "public" });
+        held.push(res); // tools/call: hold forever
+      });
+    });
+    await new Promise<void>((r) => slow.listen(0, "127.0.0.1", r));
+    const slowUrl = `http://127.0.0.1:${(slow.address() as AddressInfo).port}/mcp`;
+    const configDir2 = join(sandbox, "config-slow"); cpSync(configDir, configDir2, { recursive: true });
+    write(join(configDir2, "registry.yaml"), `${PIN6_REGISTRY}  slow:\n    trusted: true\n    tools:\n      wait: { class: read, reviewedBy: ryan, reviewedAt: 2026-10-03 }\n`);
+    write(join(configDir2, "upstreams.yaml"), `version: 1\nupstreams:\n  - name: demo\n    transport: http\n    url: ${demoUrl}\n  - name: slow\n    transport: http\n    url: ${slowUrl}\n`);
+    try {
+      await proxy.stop(5_000);
+      for (let round = 1; round <= 2; round++) {
+        const before = (await records()).filter((r) => r.phase === "intent" && r.call.tool === "wait").length;
+        proxy = await startProxy({ AGENT_LEDGER_CONFIG_DIR: configDir2 });
+        const inflight = mcpPost({ url: proxyUrl, token: K, method: "tools/call", params: { name: "slow__wait", arguments: {} } }).then((r) => r.text, () => "connection closed");
+        // latch on BOTH the upstream's receipt of this exact call and its durable intent record
+        const t0 = Date.now();
+        while (held.length < round) { if (Date.now() - t0 > 10_000) throw new Error("slow upstream never received the call"); await new Promise((r) => setTimeout(r, 25)); }
+        let intent: LedgerRecord | undefined;
+        while (!intent) { if (Date.now() - t0 > 10_000) throw new Error("no intent record for slow__wait"); intent = (await records()).filter((r) => r.phase === "intent" && r.call.tool === "wait")[before]; if (!intent) await new Promise((r) => setTimeout(r, 25)); }
+        const stopped = await proxy.stop();
+        expect(stopped.code, `round ${round}`).toBe(0); expect(stopped.signal).toBeNull(); expect(stopped.ms).toBeLessThan(10_000);
+        expect(proxy.events().some((e) => e["event"] === "shutdown" && e["signal"] === "SIGTERM")).toBe(true);
+        expect(proxy.events().at(-1)).toMatchObject({ event: "stopped", drained: true, inflight: 0 });
+        responses.push(await inflight);
+        const recs = await records();
+        const outcome = recs.find((r) => r.phase === "outcome" && r.call.callId === intent!.call.callId);
+        expect(outcome?.outcome, `round ${round}: the in-flight call's outcome was persisted before exit`).toMatchObject({ status: "error", errorClass: "UpstreamClosed" });
+        expect(proxy.events().find((e) => e["callId"] === intent!.call.callId)).toMatchObject({ tool: "wait", status: "error" });
+        const intents = recs.filter((r) => r.phase === "intent").map((r) => r.call.callId);
+        const outcomes = new Set(recs.filter((r) => r.phase === "outcome").map((r) => r.call.callId));
+        expect(intents.filter((id) => !outcomes.has(id))).toEqual([]); // never a missing outcome
+        for (const r of recs.filter((r) => r.phase === "outcome")) expect(["ok", "error", "blocked"]).toContain(r.outcome!.status);
+      }
+    } finally { for (const r of held) r.destroy(); slow.closeAllConnections(); await new Promise<void>((r) => slow.close(() => r())); }
     const refused = startServerProcess(join(root, "dist/server/main.js"), { ...serverEnv, NODE_OPTIONS: `--title=${NODE_OPTIONS_CANARY}` }, sandbox, transcript);
     const exit = await refused.exited;
     expect(exit.code).toBe(1);
     expect(refused.events().at(-1)).toMatchObject({ event: "refused", reason: expect.stringMatching(/NODE_OPTIONS is set/) });
     expect(refused.stderr.join("\n")).not.toContain(NODE_OPTIONS_CANARY);
-  });
+  }, 90_000);
   it("12. leak sweep: K, T, the hashed canary, the Postgres URL/password and the NODE_OPTIONS canary are absent from the ledger, both process outputs, the pack, the anchor and the smoke output; the clear canary is in the ledger by design", async () => {
     const ledgerDump = PG_URL ? JSON.stringify(await records()) : readFileSync(ledgerPath, "utf8");
     const pack = ["report.html", "report.pdf", "records.csv"].map((f) => readFileSync(join(packDir, f)).toString("latin1")).join("\n");

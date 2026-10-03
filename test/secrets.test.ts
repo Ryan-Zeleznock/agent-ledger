@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { MAX_SECRET_FILE_BYTES, SECRET_FILE_NAME_RE, createSecretsProvider } from "../src/secrets/contract.js";
 
 // Slice 2a pin 4: `createSecretsProvider("file", dir)`; `<server>.<key>` files; read once; symlinks refused; errors name the file, never a value.
@@ -100,5 +102,17 @@ describe("secrets: file provider", () => {
     const demo = await p.get("demo");
     expect(Object.hasOwn(demo, "__proto__")).toBe(true); expect(Object.getPrototypeOf(demo)).toBe(Object.prototype);
     expect(await p.get("toString")).toEqual({});
+  });
+});
+
+describe("secrets F8: a FIFO in the secrets directory is refused, not blocked on (Astra review)", () => {
+  it("a correctly named FIFO with no writer: construction fails fast in a child process with a timeout, naming the file", () => {
+    const dir = sandbox();
+    put(dir, "fine.key", T1);
+    execFileSync("mkfifo", ["-m", "600", join(dir, "demo.bearerToken")]);
+    const script = `import(${JSON.stringify(pathToFileURL(resolve(".test-build/src/secrets/contract.js")).href)}).then((m) => { try { m.createSecretsProvider("file", ${JSON.stringify(dir)}); console.log("NO THROW"); } catch (e) { console.log(e.message); } })`;
+    const out = execFileSync(process.execPath, ["-e", script], { timeout: 5_000, encoding: "utf8" });
+    expect(out.trim()).toBe('secrets: "demo.bearerToken" is not a regular file');
+    expect(out).not.toContain(T1);
   });
 });

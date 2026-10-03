@@ -7,13 +7,13 @@ import { MCP_SERVER_NAME_RE } from "../types/index.js";
 import type { UpstreamConfig } from "../upstream/contract.js";
 
 /**
- * A key or password file: regular, not a symlink (O_NOFOLLOW), owned by this uid, mode 0600/0400 (no group/other bits),
- * at most `maxBytes`. The CLI's hook private files follow the same rule; the staging initContainer (pin 8) writes 0600.
+ * A key or password file: regular (checked on the fd of a non-blocking open, so a FIFO or device is refused instead of
+ * blocking startup), not a symlink (O_NOFOLLOW), owned by this uid, mode 0600/0400 (no group/other bits), at most `maxBytes`. The CLI's hook private files follow the same rule; the staging initContainer (pin 8) writes 0600.
  */
 export function readPrivateFile(path: string, maxBytes: number): Buffer {
   const name = basename(path);
   let fd: number;
-  try { fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW); }
+  try { fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); } // O_NONBLOCK: a FIFO with no writer must not block the open before fstat can refuse it (F8)
   catch (e) {
     const code = (e as { code?: string }).code;
     throw new Error(code === "ELOOP" || code === "EMLINK" ? `${name}: is a symlink; refused` : `${name}: cannot be opened (${code ?? "error"})`);

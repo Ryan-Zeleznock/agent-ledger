@@ -17,12 +17,13 @@ export async function runSmoke(o: SmokeOptions, out: (line: string) => void): Pr
   const checks: [name: string, run: () => Promise<void>][] = [
     ["discover lists 2026-07-28", async () => {
       const r = await mcpCall(o.url, o.key, "server/discover");
-      must(Array.isArray(r["supportedVersions"]) && (r["supportedVersions"] as unknown[]).includes("2026-07-28"), `supportedVersions ${JSON.stringify(r["supportedVersions"])}`);
+      const versions = Array.isArray(r["supportedVersions"]) ? (r["supportedVersions"] as unknown[]) : [];
+      must(versions.includes("2026-07-28"), `supportedVersions ${JSON.stringify(versions.filter((v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v)))} (${versions.length} entries)`);
     }],
     ["tools/list is exactly the five demo tools, sorted", async () => {
       const r = await mcpCall(o.url, o.key, "tools/list");
       const names = Array.isArray(r["tools"]) ? (r["tools"] as { name?: unknown }[]).map((t) => String(t.name)) : [];
-      must(JSON.stringify(names) === JSON.stringify(SMOKE_EXPECTED_TOOLS), `got ${JSON.stringify(names)}`);
+      must(JSON.stringify(names) === JSON.stringify(SMOKE_EXPECTED_TOOLS), `got ${JSON.stringify(names.map((n) => (/^[A-Za-z0-9_.-]{1,128}$/.test(n) ? n : "<unprintable>")))}`);
     }],
     ["demo__echo ok", async () => { const r = await call("demo__echo", { message: "hello" }); must(r["isError"] === false && toolText(r) === "hello", describe(r)); }],
     ["demo__now ok", async () => { const r = await call("demo__now", {}); must(r["isError"] === false && Number.isFinite(Date.parse(toolText(r))), describe(r)); }],
@@ -51,7 +52,7 @@ export async function runSmoke(o: SmokeOptions, out: (line: string) => void): Pr
   }
   for (const [name, run] of checks) {
     try { await run(); out(`ok ${name}`); }
-    catch (e) { out(`FAIL ${name}: ${e instanceof Error ? e.message : String(e)}`); out(`SMOKE FAIL ${name}`); return 1; }
+    catch (e) { out(`FAIL ${name}: ${e instanceof Error ? `${e.name}: ${e.message}` : "error"}`); out(`SMOKE FAIL ${name}`); return 1; }
   }
   out("SMOKE PASS");
   return 0;
@@ -59,7 +60,8 @@ export async function runSmoke(o: SmokeOptions, out: (line: string) => void): Pr
   function call(name: string, args: Record<string, unknown>) { return mcpCall(o.url, o.key, "tools/call", { name, arguments: args }); }
 }
 function must(ok: boolean, detail: string): void { if (!ok) throw new Error(detail); }
-function describe(r: Record<string, unknown>): string { return `isError=${String(r["isError"])} text=${JSON.stringify(toolText(r)).slice(0, 200)}`; }
+/** Value-free (F1): the smoke output is pod-log evidence, so a failing check reports shape, never remote text. */
+function describe(r: Record<string, unknown>): string { return `isError=${String(r["isError"])} blocks=${Array.isArray(r["content"]) ? r["content"].length : "none"} textBytes=${Buffer.byteLength(toolText(r))}`; }
 
 export function parseSmokeArgs(argv: string[]): SmokeOptions {
   const { values } = parseArgs({ args: argv, options: { url: { type: "string" }, "key-file": { type: "string" }, "expect-upstream-401": { type: "string" } }, strict: true, allowPositionals: false });

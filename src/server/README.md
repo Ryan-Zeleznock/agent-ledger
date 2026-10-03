@@ -14,8 +14,9 @@ password are safe and `pg` decodes them; a URL that already carries a password i
 selects the jsonl backend, which is how `test/e2e-slice-2a.test.ts` runs the real binary without Postgres),
 `AGENT_LEDGER_PORT` (default 8787; `0` = ephemeral, logged), `AGENT_LEDGER_BIND_HOST` (default `0.0.0.0`: the one place
 that address is chosen, on purpose; tests pass `127.0.0.1`), `AGENT_LEDGER_ALLOWED_ORIGINS` (comma-separated; empty = no
-browser origin), `AGENT_LEDGER_APPROVALS` (must be `none` this slice; ADR-012). `NODE_OPTIONS` defined at all → refuse
-(spec §7 launch-environment residual; the Kyverno policy forbids it as well).
+browser origin), `AGENT_LEDGER_APPROVALS` (must be `none` this slice; ADR-012), `AGENT_LEDGER_MAX_INFLIGHT` (additive,
+fix round F10: concurrent `tools/call` invocations admitted, integer 1-100000, default 64; the next one is `503`).
+`NODE_OPTIONS` defined at all → refuse (spec §7 launch-environment residual; the Kyverno policy forbids it as well).
 
 **Files.** `registry.yaml` through `policy.loadRegistry`; `agents.yaml` through `identity.createIdentity("file")` (holds
 the api_key SHA-256 only); `hmac.key` exactly 32 raw bytes; `ledger.password`; both private files are read with
@@ -29,8 +30,11 @@ never its contents (HOMELAB step 9's verify line).
 **Start order and refusals.** Any failure logs ONE JSON line `{ ts, event: "refused", reason }` and the process exits 1
 with no stack trace. The reason is redacted against the ledger URL, the password (raw and encoded) and the URL with the
 password, longest match first. `ledger.head()` is awaited before anything listens: an unreachable database refuses the
-start. Logged on success: `{ event: "ledger", backend, head }`, `{ event: "upstreams", servers, tools }`,
-`{ event: "listening", port, bindHost, approvals: "none", allowedOrigins }`.
+start. Logged on success: `{ event: "ledger", backend, head }`, `{ event: "upstreams", servers, tools, rejected? }`
+(`rejected` = tool definitions the upstream client excluded for an invalid `x-mcp-header`, `{ server, tool, reason }`,
+the transport's SHOULD warning), `{ event: "listening", port, bindHost, approvals: "none", allowedOrigins, maxInFlight }`.
+Upstream refusals are value-free end to end (F1): an upstream that reflects its own bearer or a request argument into an
+error is reported as `HTTP <status> on <method>` or `failed (JSON-RPC error <code>)`.
 
 **Per-call log line** (stderr, pin 8): `{ ts, callId, agentId?, server, tool, verdict?, ruleId?, status, ms }`, nothing
 else: no args, no credential, no token, no URL. `agentId`, `verdict` and `ruleId` come from observing the pipeline's
@@ -39,10 +43,15 @@ the outcome record's status (`ok` | `error` | `blocked`), or `denied` when the p
 agent, malformed call, a refused intent append), or `exception` when `handle` threw (the front answers `500`). Requests
 rejected before a call exists (401, 400, 405) carry no callId and are not logged this slice; `front` logs nothing.
 
-**Shutdown.** `SIGTERM`/`SIGINT` → `front.stop()` → `upstream.close()` → the ledger's `close()` when the backend has one
-(B's Postgres pool; duck-typed because `LedgerStore` has no `close`) → `{ event: "stopped" }` → exit 0; a hard timer exits
-0 at `SHUTDOWN_GRACE_MS` (10 s) with `{ event: "shutdown-timeout" }`. A call in flight finishes its outcome record or
-its `error` outcome inside the grace (e2e step 11).
+**Shutdown (F3 order).** `SIGTERM`/`SIGINT` → `front.stop()` (new POSTs `503`, `/healthz` `503`; admitted calls get up to
+`SHUTDOWN_DRAIN_MS` = 5 s to finish against the upstream; then their connections are cut) → `upstream.close()` (aborts
+whatever is still waiting; the pipeline appends that call's `error` outcome, `errorClass: UpstreamClosed`) → wait for every
+admitted call's outcome attempt, bounded by what is left of `SHUTDOWN_GRACE_MS` → the ledger's `close()` when the backend
+has one (B's Postgres pool; duck-typed because `LedgerStore` has no `close`) → `{ event: "stopped", drained, inflight }`
+→ exit 0; a hard timer exits 0 at `SHUTDOWN_GRACE_MS` (10 s) with `{ event: "shutdown-timeout" }`. `drained: false` means
+storage closed with an outcome attempt still pending. Storage is never closed before the outcome appends of admitted calls
+have had their turn (`test/server.test.ts` F3: a late answer → `ok` persisted before `stop()` resolves; a never-answering
+upstream → `error` persisted; e2e step 11: real process, pending upstream, latched on the durable intent, twice).
 
 ## `demo-upstream.ts`: `node dist/server/demo-upstream.js` (pin 6)
 
@@ -51,7 +60,10 @@ The harmless upstream, built on the same `front` with `naming: "tool"` (raw name
 target }` → `"nothing was wiped: demo tool"` (REVIEWED AS RISKY in the registry so the no-channel deny is demonstrable),
 `whoami {}` → `"demo upstream"` (deliberately NOT in the registry → `unreviewed`). The handler accepts only
 `credential.value === <token>` (constant-time compare over equal-length buffers; wrong → `isError` `"unauthorized"`; a
-missing bearer is already the front's `401`). The token comes from `AGENT_LEDGER_DEMO_TOKEN_FILE` (`readPrivateFile`,
+missing bearer is already the front's `401`). Each call is validated against the tool's own published `inputSchema`
+before it runs (`validateArgs`, F9: `type`, `properties`, `required`, `additionalProperties: false`, `enum`; any other
+keyword fails closed as "unsupported schema"; nothing is fetched) → `isError` `"invalid arguments for <tool>: <problem>"`
+with property names and expected types only. The token comes from `AGENT_LEDGER_DEMO_TOKEN_FILE` (`readPrivateFile`,
 never argv); `AGENT_LEDGER_DEMO_PORT` (3001) and `AGENT_LEDGER_DEMO_BIND_HOST` (`0.0.0.0`; tests `127.0.0.1`, an additive
 variable, flagged). It is the credential boundary of the demo: Claude Code holds the proxy key, only the proxy holds this
 token, and the NetworkPolicy (pin 10) makes it unreachable from anything but the proxy. One JSON line per call on stderr
@@ -60,7 +72,8 @@ token, and the NetworkPolicy (pin 10) makes it unreachable from anything but the
 ## `smoke.ts`: `node dist/server/smoke.js --url <proxy mcp url> --key-file <path> [--expect-upstream-401 <upstream url>]`
 
 Runs the pin 8 sequence against a live proxy and prints one line per check, then `SMOKE PASS` (exit 0) or `SMOKE FAIL
-<check>` (exit 1): discover lists `2026-07-28` → `tools/list` is exactly the five `demo__*` names, sorted → `demo__echo`
+<check>` (exit 1); a failing check prints shape only (`isError`, block count, text byte count, HTTP status, integer
+JSON-RPC code: never remote text, F1): discover lists `2026-07-28` → `tools/list` is exactly the five `demo__*` names, sorted → `demo__echo`
 `{ message: "hello" }` ok → `demo__now` ok → `demo__add { a: 2, b: 3 }` = `5` → `demo__wipe` is `isError` with
 `PROXY_NO_CHANNEL_REASON` → `demo__whoami` is `isError` naming `unreviewed` → a request with no bearer → `401` → a
 well-formed WRONG key → `isError` "unknown agent" (the front does not authenticate; identity does, in the pipeline; pin 8
@@ -74,7 +87,8 @@ Used by B's integration Job (pin 12) and by Ryan from the Mac.
 
 The raw 2026-07-28 client over `fetch` the smoke client and the tests share (`test/helpers/mcp-client.ts` re-exports it;
 the pins placed it under `test/helpers/`, but `dist/server/smoke.js` cannot import `test/`). Every knob exists so a test
-can send a deliberately wrong request (missing header, old version, no `_meta`, raw body, GET).
+can send a deliberately wrong request (missing header, old version, no `_meta`, raw body, GET). `McpClientError` carries
+the HTTP status and the integer JSON-RPC code, never the remote error message (F1).
 
 Sources re-read 2026-10-03: MCP 2026-07-28 transport/versioning/discover/tools pages (see `src/front/README.md`,
 `src/upstream/README.md`); node-postgres connection strings decode percent-encoded userinfo ([H] until B cites the

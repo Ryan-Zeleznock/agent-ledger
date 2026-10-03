@@ -41,11 +41,12 @@ export async function mcpPost(o: McpPostOptions): Promise<McpPostResult> {
 }
 
 export class McpClientError extends Error { override name = "McpClientError"; constructor(message: string, readonly status: number, readonly code?: number) { super(message); } }
-/** A well-formed request; resolves to `result`, throws McpClientError on a non-200 or a JSON-RPC error. */
+/** A well-formed request; resolves to `result`, throws McpClientError on a non-200 or a JSON-RPC error. The error text carries the status and the integer code only, never the remote message (F1). */
 export async function mcpCall(url: string, token: string | undefined, method: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
   const r = await mcpPost({ url, token, method, params });
-  const body = (r.json ?? {}) as { result?: unknown; error?: { code?: number; message?: string } };
-  if (r.status !== 200 || body.error || typeof body.result !== "object" || body.result === null) throw new McpClientError(`${method}: HTTP ${r.status}${body.error ? ` ${body.error.code} ${body.error.message ?? ""}` : ""}`, r.status, body.error?.code);
+  const body = (r.json ?? {}) as { result?: unknown; error?: unknown };
+  const code = typeof body.error === "object" && body.error !== null && Number.isInteger((body.error as { code?: unknown }).code) ? (body.error as { code: number }).code : undefined;
+  if (r.status !== 200 || body.error !== undefined || typeof body.result !== "object" || body.result === null) throw new McpClientError(`${method}: HTTP ${r.status}${body.error !== undefined ? ` (JSON-RPC error ${code === undefined ? "malformed" : code})` : ""}`, r.status, code);
   return body.result as Record<string, unknown>;
 }
 /** The concatenated text of a tool result's text content blocks. */

@@ -1,17 +1,21 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import type { LedgerRecord } from "../src/types/index.js";
+import type { LedgerRecord, UnsealedRecord } from "../src/types/index.js";
 import { PROXY_NO_CHANNEL_REASON } from "../src/types/index.js";
 import { createLedger, type LedgerStore } from "../src/ledger/contract.js";
 import { ENV, StartupRefused, startServer, type LogLine, type RunningServer } from "../src/server/main.js";
-import { DEMO_TOOLS, DEMO_UNAUTHORIZED_TEXT, DEMO_WHOAMI_TEXT, DEMO_WIPE_TEXT, createDemoHandler, demoMain, startDemoUpstream, tokenMatches } from "../src/server/demo-upstream.js";
+import { DEMO_TOOLS, DEMO_UNAUTHORIZED_TEXT, DEMO_WHOAMI_TEXT, DEMO_WIPE_TEXT, createDemoHandler, demoMain, startDemoUpstream, tokenMatches, validateArgs } from "../src/server/demo-upstream.js";
+import { JSONRPC_OVERLOADED } from "../src/front/contract.js";
 import type { RunningFront } from "../src/front/contract.js";
 import { parseSmokeArgs, runSmoke } from "../src/server/smoke.js";
-import { mcpCall, toolText } from "./helpers/mcp-client.js";
+import { mcpCall, mcpPost, toolText } from "./helpers/mcp-client.js";
 
 // Slice 2a pins 6 and 8, in process: the real demo upstream on 127.0.0.1:0, the real composition root on 127.0.0.1:0, a
 // jsonl ledger behind a file:// URL, the real identity/registry/secrets files in a tmp config dir.
@@ -23,10 +27,11 @@ const REGISTRY = { version: 1, servers: { demo: { trusted: true, tools: {
   add: { class: "write", reviewedBy: "ryan", reviewedAt: "2026-10-03", storeArgs: ["a", "b"] },
   wipe: { class: "risky", reviewedBy: "ryan", reviewedAt: "2026-10-03", storeArgs: [] },
 } } } };
-const dirs: string[] = []; const fronts: RunningFront[] = []; const servers: RunningServer[] = [];
+const dirs: string[] = []; const fronts: RunningFront[] = []; const servers: RunningServer[] = []; const rawServers: Server[] = [];
 afterEach(async () => {
   for (const s of servers.splice(0)) await s.stop().catch(() => undefined);
   for (const f of fronts.splice(0)) await f.stop().catch(() => undefined);
+  for (const r of rawServers.splice(0)) { r.closeAllConnections(); await new Promise<void>((done) => r.close(() => done())); }
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 const tmp = () => { const d = mkdtempSync(join(tmpdir(), "agent-ledger-server-")); dirs.push(d); return d; };
@@ -54,6 +59,7 @@ async function up(l: Lab, log: LogLine[] = []): Promise<{ server: RunningServer;
   servers.push(server);
   return { server, url: `http://127.0.0.1:${server.port}/mcp`, log };
 }
+const up2 = up;
 const records = (l: Lab): LedgerRecord[] => { try { return readFileSync(l.ledgerPath, "utf8").split("\n").filter(Boolean).map((x) => JSON.parse(x) as LedgerRecord); } catch { return []; } };
 /** Whether the ledger validator on this branch accepts channel "none" yet (B's pin 1 line); the proxy's no-channel text depends on it. */
 async function validatorAcceptsNone(): Promise<boolean> {
@@ -247,7 +253,7 @@ describe("smoke client (pin 8), in process against the root + demo upstream", ()
     expect(lines.join("\n")).not.toContain(KEY); expect(lines.join("\n")).not.toContain(T);
     expect(lines.slice(0, 5)).toEqual(["ok discover lists 2026-07-28", "ok tools/list is exactly the five demo tools, sorted", "ok demo__echo ok", "ok demo__now ok", "ok demo__add ok"]);
     if (!accepts) {
-      expect(code).toBe(1); expect(lines.at(-1)).toBe("SMOKE FAIL demo__wipe denied: no channel"); expect(lines.at(-2)).toMatch(/^FAIL demo__wipe denied: no channel: isError=true text=.*ledger unavailable/);
+      expect(code).toBe(1); expect(lines.at(-1)).toBe("SMOKE FAIL demo__wipe denied: no channel"); expect(lines.at(-2)).toMatch(/^FAIL demo__wipe denied: no channel: Error: isError=true blocks=1 textBytes=\d+$/); // value-free (F1)
     } else {
       expect(code).toBe(0); expect(lines.at(-1)).toBe("SMOKE PASS");
       expect(lines.filter((x) => x.startsWith("ok ")).length).toBe(13);
@@ -263,5 +269,156 @@ describe("smoke client (pin 8), in process against the root + demo upstream", ()
     expect(parseSmokeArgs(["--url", url, "--key-file", keyFile, "--expect-upstream-401", l.demoUrl])).toEqual({ url, key: KEY, upstreamUrl: l.demoUrl });
     expect(() => parseSmokeArgs(["--url", url])).toThrow(/usage: smoke/);
     expect(() => parseSmokeArgs(["--url", url, "--key-file", keyFile, "--bogus"])).toThrow();
+  });
+});
+
+// ---------- Fix round after Astra's review (docs/reviews/2026-10-03-astra-slice-2a-proxy-review.md) ----------
+/** A raw 2026-07-28 upstream (node:http on 127.0.0.1:0) advertising the five demo tools; `onCall` decides each tools/call answer. */
+interface RawCall { id: unknown; params: Record<string, unknown>; req: IncomingMessage; res: ServerResponse; }
+async function rawUpstream(onCall: (c: RawCall) => void, onDiscover?: (c: RawCall) => boolean): Promise<{ url: string; calls: RawCall[] }> {
+  const calls: RawCall[] = [];
+  const json = (res: ServerResponse, status: number, body: unknown) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(body)); };
+  const srv = createServer((req, res) => {
+    const chunks: Buffer[] = []; req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>; const id = body["id"]; const params = (body["params"] ?? {}) as Record<string, unknown>;
+      if (body["method"] === "server/discover") { if (onDiscover?.({ id, params, req, res })) return; return json(res, 200, { jsonrpc: "2.0", id, result: { resultType: "complete", supportedVersions: ["2026-07-28"], capabilities: { tools: {} }, _meta: {}, ttlMs: 1, cacheScope: "public" } }); }
+      if (body["method"] === "tools/list") return json(res, 200, { jsonrpc: "2.0", id, result: { resultType: "complete", tools: DEMO_TOOLS.map(({ name, description, inputSchema, annotations }) => ({ name, description, inputSchema, annotations })), ttlMs: 1, cacheScope: "public" } });
+      const c = { id, params, req, res }; calls.push(c); onCall(c);
+    });
+  });
+  rawServers.push(srv);
+  await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+  return { url: `http://127.0.0.1:${(srv.address() as AddressInfo).port}/mcp`, calls };
+}
+const okJson = (c: RawCall, result: unknown) => { c.res.writeHead(200, { "content-type": "application/json" }); c.res.end(JSON.stringify({ jsonrpc: "2.0", id: c.id, result })); };
+const pointAt = (l: Lab, url: string) => write(join(l.dir, "upstreams.yaml"), `version: 1\nupstreams:\n  - name: demo\n    transport: http\n    url: ${url}\n`);
+const ARG_CANARY = "root-arg-canary-5a9c";
+
+describe("server root F1: upstream diagnostics reaching the agent, the log and the startup refusal are value-free", () => {
+  it("a JSON-RPC error that reflects the upstream token and the raw argument: the reply, the log line and the ledger carry neither; the outcome is `error` with the error class", async () => {
+    const up = await rawUpstream((c) => { c.res.writeHead(200, { "content-type": "application/json" }); c.res.end(JSON.stringify({ jsonrpc: "2.0", id: c.id, error: { code: -32000, message: `auth=${String(c.req.headers.authorization)} args=${JSON.stringify(c.params["arguments"])}` } })); });
+    const l = await lab((l) => pointAt(l, up.url));
+    const { url, log } = await up2(l);
+    const r = await mcpCall(url, KEY, "tools/call", { name: "demo__echo", arguments: { message: ARG_CANARY } });
+    expect(r["isError"]).toBe(true);
+    expect(toolText(r)).toBe("agent-ledger: upstream failed: upstream demo: tools/call failed (JSON-RPC error -32000)");
+    const everything = JSON.stringify(r) + JSON.stringify(log) + readFileSync(l.ledgerPath, "utf8");
+    expect(everything).not.toContain(T); expect(everything).not.toContain("auth="); expect(JSON.stringify(log) + JSON.stringify(r)).not.toContain(ARG_CANARY);
+    const recs = records(l);
+    expect(recs.map((x) => [x.phase, x.outcome?.status ?? "-", x.outcome?.errorClass ?? "-"])).toEqual([["intent", "-", "-"], ["outcome", "error", "UpstreamError"]]);
+    expect(log.at(-1)).toMatchObject({ tool: "echo", status: "error" });
+  });
+  it("startup: a discover failure that echoes the Authorization header is refused with status only; a 404 whose body is a JSON-RPC error echoing it likewise", async () => {
+    for (const status of [500, 404]) {
+      const up = await rawUpstream(() => undefined, (c) => { c.res.writeHead(status, { "content-type": "application/json" }); c.res.end(JSON.stringify({ jsonrpc: "2.0", id: c.id, error: { code: -32603, message: `saw ${String(c.req.headers.authorization)}` } })); return true; });
+      const l = await lab((l) => pointAt(l, up.url));
+      const log: LogLine[] = [];
+      let err: unknown; try { servers.push(await startServer(l.env, { log: (x) => log.push(x) })); } catch (e) { err = e; }
+      expect(err).toBeInstanceOf(StartupRefused);
+      expect((err as Error).message).toBe(`upstreams: upstream demo: HTTP ${status} on server/discover`);
+      expect(JSON.stringify(log)).not.toContain(T); expect(JSON.stringify(log)).not.toContain("saw ");
+    }
+  });
+});
+
+describe("server root F2: a malformed upstream result is an `error` outcome and an isError reply, never `ok`", () => {
+  it.each([
+    ["content not an array, isError a string", { resultType: "complete", content: "not-content", isError: "true" }],
+    ["content [null]", { resultType: "complete", content: [null] }],
+    ["unrecognised resultType", { resultType: "partial", content: [] }],
+  ])("%s", async (_label, result) => {
+    const up = await rawUpstream((c) => okJson(c, result));
+    const l = await lab((l) => pointAt(l, up.url));
+    const { url, log } = await up2(l);
+    const r = await mcpCall(url, KEY, "tools/call", { name: "demo__echo", arguments: { message: "x" } });
+    expect(r["isError"]).toBe(true); expect(toolText(r)).toMatch(/^agent-ledger: upstream failed: upstream demo: tools\/call result is malformed/);
+    expect(records(l).map((x) => [x.phase, x.outcome?.status ?? "-", x.outcome?.errorClass ?? "-"])).toEqual([["intent", "-", "-"], ["outcome", "error", "UpstreamError"]]);
+    expect(log.at(-1)).toMatchObject({ tool: "echo", status: "error" });
+  });
+});
+
+describe("server root F3: stop() drains in-flight calls before closing storage", () => {
+  /** The real jsonl ledger, with every OUTCOME append delayed so the race the review found (storage closed before the outcome lands) is reproducible. */
+  const slowOutcomes = (delayMs: number) => (kind: "jsonl" | "postgres", target: string): LedgerStore => {
+    const real = createLedger(kind, target);
+    return { ...real, head: () => real.head(), verify: () => real.verify(), read: (r) => real.read(r), async append(rec: UnsealedRecord) { if (rec.phase === "outcome") await new Promise((r) => setTimeout(r, delayMs)); return real.append(rec); } };
+  };
+  it("an upstream that answers during the drain: stop() resolves only after the `ok` outcome is persisted and the client got its result", async () => {
+    const up = await rawUpstream(() => undefined);
+    const l = await lab((l) => pointAt(l, up.url));
+    const log: LogLine[] = [];
+    const server = await startServer(l.env, { log: (x) => log.push(x), createLedger: slowOutcomes(300) }); servers.push(server);
+    const url = `http://127.0.0.1:${server.port}/mcp`;
+    const reply = mcpCall(url, KEY, "tools/call", { name: "demo__echo", arguments: { message: "late" } });
+    await vi.waitFor(() => expect(up.calls).toHaveLength(1));
+    await vi.waitFor(() => expect(records(l).map((x) => x.phase)).toEqual(["intent"])); // the intent is durable; the upstream has the call
+    const stopping = server.stop();
+    setTimeout(() => okJson(up.calls[0]!, { resultType: "complete", content: [{ type: "text", text: "late" }], isError: false }), 100);
+    await stopping;
+    expect(records(l).map((x) => [x.phase, x.outcome?.status ?? "-"])).toEqual([["intent", "-"], ["outcome", "ok"]]); // persisted BEFORE stop() resolved
+    expect(toolText(await reply)).toBe("late");
+    expect(log.at(-1)).toMatchObject({ event: "stopped", drained: true, inflight: 0 });
+  });
+  it("an upstream that never answers: stop() aborts it, waits for the `error` outcome (UpstreamClosed) to persist, then closes; bounded well inside the 10 s grace", async () => {
+    const up = await rawUpstream(() => undefined);
+    const l = await lab((l) => pointAt(l, up.url));
+    const log: LogLine[] = [];
+    const server = await startServer(l.env, { log: (x) => log.push(x), createLedger: slowOutcomes(300) }); servers.push(server);
+    const url = `http://127.0.0.1:${server.port}/mcp`;
+    const reply = mcpCall(url, KEY, "tools/call", { name: "demo__echo", arguments: { message: "never" } }).then((r) => r, (e: Error) => e);
+    await vi.waitFor(() => expect(up.calls).toHaveLength(1));
+    await vi.waitFor(() => expect(records(l).map((x) => x.phase)).toEqual(["intent"]));
+    const started = Date.now();
+    await server.stop();
+    expect(Date.now() - started).toBeLessThan(9_000);
+    expect(records(l).map((x) => [x.phase, x.outcome?.status ?? "-", x.outcome?.errorClass ?? "-"])).toEqual([["intent", "-", "-"], ["outcome", "error", "UpstreamClosed"]]);
+    expect(log.at(-1)).toMatchObject({ event: "stopped", drained: true, inflight: 0 });
+    expect(log.find((x) => x["callId"] !== undefined)).toMatchObject({ tool: "echo", status: "error" });
+    await reply; // settled either way (result or connection closed); no unhandled rejection
+    up.calls[0]!.res.destroy();
+  }, 15_000); // the front's drain budget (SHUTDOWN_DRAIN_MS, 5 s) is spent waiting for the upstream before the abort
+});
+
+describe("server root F10: AGENT_LEDGER_MAX_INFLIGHT bounds concurrent tool invocations", () => {
+  it("default 64; =1 → the second concurrent call is 503 with the overload code and no upstream call; an invalid value refuses to start", async () => {
+    const up = await rawUpstream(() => undefined);
+    const l = await lab((l) => { pointAt(l, up.url); l.env[ENV.maxInFlight] = "1"; });
+    const { url, log } = await up2(l);
+    expect(log.find((x) => x["event"] === "listening")).toMatchObject({ maxInFlight: 1 });
+    const first = mcpCall(url, KEY, "tools/call", { name: "demo__echo", arguments: { message: "a" } });
+    await vi.waitFor(() => expect(up.calls).toHaveLength(1));
+    const second = await mcpPost({ url, token: KEY, method: "tools/call", params: { name: "demo__echo", arguments: { message: "b" } } });
+    expect(second.status).toBe(503); expect((second.json as { error: { code: number } }).error.code).toBe(JSONRPC_OVERLOADED);
+    expect(up.calls).toHaveLength(1); expect(records(l)).toHaveLength(1); // no intent for the refused call: it never became an IncomingCall
+    okJson(up.calls[0]!, { resultType: "complete", content: [{ type: "text", text: "a" }], isError: false });
+    expect(toolText(await first)).toBe("a");
+    const bad = await lab((l) => { l.env[ENV.maxInFlight] = "0"; });
+    await expect(startServer(bad.env, { log: () => undefined })).rejects.toThrow(/AGENT_LEDGER_MAX_INFLIGHT must be an integer 1-100000/);
+  });
+});
+
+describe("server root F8: a FIFO where a private file is expected is refused, not blocked on", () => {
+  it("hmac.key as a FIFO with no writer: the child refuses within the timeout naming the file (O_NONBLOCK open + same-fd regular-file check)", async () => {
+    const l = await lab((l) => { rmSync(join(l.dir, "hmac.key")); execFileSync("mkfifo", ["-m", "600", join(l.dir, "hmac.key")]); });
+    const script = `import(${JSON.stringify(pathToFileURL(resolve(".test-build/src/server/files.js")).href)}).then((m) => { try { m.readPrivateFile(${JSON.stringify(join(l.dir, "hmac.key"))}, 1024); console.log("NO THROW"); } catch (e) { console.log(e.message); } })`;
+    const out = execFileSync(process.execPath, ["-e", script], { timeout: 5_000, encoding: "utf8" });
+    expect(out.trim()).toBe("hmac.key: not a regular file");
+  });
+});
+
+describe("demo upstream F9: the published input schemas are enforced before a tool runs", () => {
+  it("additionalProperties:false, required and types are enforced for echo/now/whoami/add/wipe; valid calls still run", async () => {
+    const h = createDemoHandler(Buffer.from(T));
+    const c = (tool: string, args: Record<string, unknown>) => h({ callId: "c", credential: { kind: "api_key", value: T }, server: "demo", tool, args, receivedAt: new Date().toISOString() });
+    const bad: [string, Record<string, unknown>][] = [["echo", { message: "hello", unexpected: 1 }], ["echo", {}], ["echo", { message: 5 }], ["now", { x: 1 }], ["whoami", { x: 1 }], ["add", { a: 1 }], ["add", { a: "1", b: 2 }], ["wipe", {}], ["wipe", { target: 7 }]];
+    for (const [tool, args] of bad) { const r = await c(tool, args); expect(r.isError, `${tool} ${JSON.stringify(args)}`).toBe(true); expect(toolText(r as never), tool).toMatch(/^invalid arguments for /); }
+    expect(toolText(await c("echo", { message: "hello" }) as never)).toBe("hello");
+    expect(toolText(await c("add", { a: 1, b: 2, note: "extra allowed: the schema does not forbid it" }) as never)).toBe("3");
+    expect(toolText(await c("wipe", { target: "prod" }) as never)).toBe(DEMO_WIPE_TEXT);
+    expect(toolText(await c("now", {}) as never)).toMatch(/^\d{4}-/); expect(toolText(await c("whoami", {}) as never)).toBe(DEMO_WHOAMI_TEXT);
+    expect(validateArgs({ a: 1 }, { type: "object", properties: { a: { type: "integer" } }, required: ["a"], additionalProperties: false })).toBeUndefined();
+    expect(validateArgs({ a: 1.5 }, { type: "object", properties: { a: { type: "integer" } } })).toMatch(/a: expected integer/);
+    expect(validateArgs({ a: 1 }, { type: "object", $ref: "https://example.com/schema" })).toMatch(/unsupported schema/); // never fetched, never permissive
   });
 });

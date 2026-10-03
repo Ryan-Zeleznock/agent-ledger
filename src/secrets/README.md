@@ -13,7 +13,9 @@ Kubernetes Secret key becomes a file of that name). `get(server)` resolves to a 
 `{}` for a server with no entry (the consumer decides what absence means: `upstream` sends no `Authorization` header).
 Values are held in a closure and never on the returned object. Refused at construction, with an error that names the
 FILE and never a value: a name outside the pattern (dot files such as `..data` included), a symlink (opened with
-`O_NOFOLLOW` and checked on the same fd; the error says `is a symlink; refused`), a non-regular file, a file not owned
+`O_NOFOLLOW` and checked on the same fd; the error says `is a symlink; refused`), a non-regular file (the open is
+`O_NONBLOCK`, so a FIFO with no writer or a device is refused by `fstat` on that fd instead of blocking start-up; Astra
+review F8, `test/secrets.test.ts` child-process case), a file not owned
 by the process uid or group/world-writable (the `readConfigFile` rule), a file over `MAX_SECRET_FILE_BYTES` (64 KiB).
 
 **Why symlinks are refused.** A Kubernetes Secret volume mounted directly presents every key as a symlink into a

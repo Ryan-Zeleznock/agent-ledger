@@ -48,10 +48,10 @@ export function createSecretsProvider(kind: "env" | "file", target?: string): Se
   };
 }
 
-/** Same fd for the checks and the read (no stat/open race); the error text carries the file NAME only. */
+/** Same fd for the checks and the read (no stat/open race); non-blocking open so a special file is refused by fstat, never waited on; the error text carries the file NAME only. */
 function readSecretFile(path: string, name: string): string {
   let fd: number;
-  try { fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW); }
+  try { fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); } // O_NONBLOCK: a FIFO with no writer must not block the open before fstat can refuse it (F8)
   catch (e) {
     const code = (e as { code?: string }).code;
     throw new Error(code === "ELOOP" || code === "EMLINK" ? `secrets: ${JSON.stringify(name)} is a symlink; refused` : `secrets: ${JSON.stringify(name)} cannot be opened`);

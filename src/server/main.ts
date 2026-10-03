@@ -1,6 +1,7 @@
 // Slice 2a pin 8 (ADR-013): the server-mode composition root. `node dist/server/main.js` in the home-lab cluster.
 // Environment contract: AGENT_LEDGER_CONFIG_DIR, AGENT_LEDGER_LEDGER_URL, AGENT_LEDGER_PORT, AGENT_LEDGER_BIND_HOST,
-// AGENT_LEDGER_ALLOWED_ORIGINS, AGENT_LEDGER_APPROVALS; nothing else is read (NODE_OPTIONS is checked, never read).
+// AGENT_LEDGER_ALLOWED_ORIGINS, AGENT_LEDGER_APPROVALS, AGENT_LEDGER_MAX_INFLIGHT (additive, fix round F10); nothing else is
+// read (NODE_OPTIONS is checked, never read).
 import { realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,17 +12,20 @@ import { loadRegistry } from "../policy/contract.js";
 import { createSecretsProvider } from "../secrets/contract.js";
 import { connectUpstreams, type Upstream } from "../upstream/contract.js";
 import { createPipeline } from "../pipeline/contract.js";
-import { startFront, type RunningFront } from "../front/contract.js";
+import { DEFAULT_MAX_IN_FLIGHT, startFront, type RunningFront } from "../front/contract.js";
 import { readPrivateFile, readUpstreamsConfig } from "./files.js";
 
 export const ENV = {
   configDir: "AGENT_LEDGER_CONFIG_DIR", ledgerUrl: "AGENT_LEDGER_LEDGER_URL", port: "AGENT_LEDGER_PORT",
   bindHost: "AGENT_LEDGER_BIND_HOST", allowedOrigins: "AGENT_LEDGER_ALLOWED_ORIGINS", approvals: "AGENT_LEDGER_APPROVALS",
+  maxInFlight: "AGENT_LEDGER_MAX_INFLIGHT",
 } as const;
 export const CONFIG_FILES = { registry: "registry.yaml", agents: "agents.yaml", upstreams: "upstreams.yaml", hmacKey: "hmac.key", ledgerPassword: "ledger.password", secretsDir: "secrets" } as const;
 export const DEFAULT_SERVER_PORT = 8787;
 export const DEFAULT_SERVER_BIND_HOST = "0.0.0.0"; // the ONE place 0.0.0.0 is chosen, on purpose (pin 8)
 export const SHUTDOWN_GRACE_MS = 10_000;
+/** How long `stop()` lets admitted calls finish against the upstream before aborting them (inside SHUTDOWN_GRACE_MS; F3). */
+export const SHUTDOWN_DRAIN_MS = 5_000;
 export const HMAC_KEY_BYTES = 32;
 
 /** A refused start: the reason is already logged (one JSON line, no URL, no value); the process exits 1. */
@@ -68,6 +72,9 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env, override
   const bindHost = env[ENV.bindHost] ?? DEFAULT_SERVER_BIND_HOST;
   if (bindHost.length === 0) refuse(`${ENV.bindHost} must not be empty`);
   const allowedOrigins = (env[ENV.allowedOrigins] ?? "").split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+  const maxInFlightRaw = env[ENV.maxInFlight] ?? String(DEFAULT_MAX_IN_FLIGHT);
+  if (!/^\d{1,6}$/.test(maxInFlightRaw) || Number(maxInFlightRaw) < 1 || Number(maxInFlightRaw) > 100_000) refuse(`${ENV.maxInFlight} must be an integer 1-100000`);
+  const maxInFlight = Number(maxInFlightRaw);
   if (env[ENV.approvals] !== "none") refuse(`${ENV.approvals} must be "none" in this slice (slack arrives with the approvals module; got ${env[ENV.approvals] === undefined ? "nothing" : JSON.stringify(env[ENV.approvals]).slice(0, 32)})`);
 
   let ledgerUrl: URL;
@@ -113,7 +120,9 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env, override
     upstream = await connectUpstreams(config, secrets);
   } catch (e) { return refuse(`upstreams: ${message(e)}`); }
   const tools = await upstream.listTools();
-  deps.log({ ts: now(), event: "upstreams", servers: [...new Set(tools.map((t) => t.server))], tools: tools.length });
+  const upstreamsLine: LogLine = { ts: now(), event: "upstreams", servers: [...new Set(tools.map((t) => t.server))], tools: tools.length };
+  if (upstream.rejectedTools && upstream.rejectedTools.length > 0) upstreamsLine["rejected"] = upstream.rejectedTools.map((r) => ({ ...r })); // transport: the client SHOULD log a warning naming the tool and the reason (F4)
+  deps.log(upstreamsLine);
   // 7. pipeline, with the ledger observed so each call's log line can carry agentId/verdict/ruleId/status
   const seen = new Map<string, { agentId?: string; verdict?: string; ruleId?: string; outcome?: string }>();
   const observed: LedgerStore = {
@@ -133,7 +142,13 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env, override
   try {
     pipeline = createPipeline({ identity, registry, ledger: observed, upstream, approvals: { kind: "none" }, argsHmacKey });
   } catch (e) { await upstream.close().catch(() => undefined); return refuse(`pipeline: ${message(e)}`); }
+  const inflight = new Set<Promise<ToolResult>>(); // admitted calls whose outcome attempt stop() must wait for (F3)
   const handler = async (incoming: IncomingCall): Promise<ToolResult> => {
+    const p = handleOne(incoming);
+    inflight.add(p);
+    try { return await p; } finally { inflight.delete(p); }
+  };
+  const handleOne = async (incoming: IncomingCall): Promise<ToolResult> => {
     const started = Date.now();
     let status = "exception";
     try {
@@ -154,21 +169,38 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env, override
   };
   // 8. front
   let front: RunningFront;
-  try { front = await startFront(handler, { mode: "http", port, bindHost, allowedOrigins, tools: () => upstream.listTools() }); }
+  try { front = await startFront(handler, { mode: "http", port, bindHost, allowedOrigins, maxInFlight, drainTimeoutMs: SHUTDOWN_DRAIN_MS, tools: () => upstream.listTools() }); }
   catch (e) { await upstream.close().catch(() => undefined); return refuse(`front: ${message(e)}`); }
-  deps.log({ ts: now(), event: "listening", port: front.port, bindHost, approvals: "none", allowedOrigins: allowedOrigins.length });
+  deps.log({ ts: now(), event: "listening", port: front.port, bindHost, approvals: "none", allowedOrigins: allowedOrigins.length, maxInFlight });
   let stopped = false;
   return {
     port: front.port, head,
+    /**
+     * F3 order: stop admitting and let admitted calls finish (front drains up to SHUTDOWN_DRAIN_MS) → abort whatever is
+     * still waiting on an upstream (the pipeline then appends its `error` outcome) → wait for every admitted call's
+     * outcome attempt, bounded by what is left of SHUTDOWN_GRACE_MS → only then close the ledger. `drained: false` in the
+     * `stopped` line means some outcome attempt was still pending when storage closed.
+     */
     async stop() {
       if (stopped) return; stopped = true;
+      const deadline = Date.now() + SHUTDOWN_GRACE_MS - 1_000;
       await front.stop();
       await upstream.close().catch(() => undefined);
+      const drained = await settleWithin([...inflight], Math.max(0, deadline - Date.now()));
       const closable = ledger as LedgerStore & { close?: () => Promise<void> };
       if (typeof closable.close === "function") await closable.close().catch(() => undefined); // pool end (B's Postgres ledger; duck-typed, the contract has no close)
-      deps.log({ ts: now(), event: "stopped" });
+      deps.log({ ts: now(), event: "stopped", drained, inflight: inflight.size });
     },
   };
+}
+
+/** True when every promise settled within `ms`. */
+async function settleWithin(promises: Promise<unknown>[], ms: number): Promise<boolean> {
+  if (promises.length === 0) return true;
+  let timer: NodeJS.Timeout | undefined;
+  const done = await Promise.race([Promise.allSettled(promises).then(() => true), new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), ms); })]);
+  clearTimeout(timer);
+  return done;
 }
 
 /** Entrypoint: start, then SIGTERM/SIGINT → stop → exit 0 within SHUTDOWN_GRACE_MS (hard exit 0 at the limit, logged). */
