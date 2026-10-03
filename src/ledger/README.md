@@ -240,3 +240,10 @@ Round 3 (Astra, 2026-09-30: `docs/reviews/2026-09-30-astra-ledger-round3.md`):
 - [H] A single `write(2)` of one JSONL line on a local APFS/ext4 file opened `O_APPEND` is not interleaved with another
   process's write in practice; POSIX does not promise it, and the lock file is the actual guarantee.
 - [H] The `wx` lock file behaves the same on Windows (`O_EXCL` maps to `CREATE_NEW`); not tested here.
+
+## Slice 2a shared chain (2026-10-03)
+
+`chain.ts` owns sealing, strict parsing, self-hash checks and streaming verification. JSONL retains its physical
+LF framing and file lock. ADR-012 `channel: none` is accepted and round-trips; the `PIN-2A` enum literal/type assertion
+is temporary under the coordinator amendment and must become `APPROVAL_CHANNEL_KINDS` at integration.
+Test-first: the new no-channel regression failed against the old enum (1 failed / 1075 passed / 7 skipped).

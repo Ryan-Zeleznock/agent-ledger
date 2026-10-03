@@ -197,7 +197,8 @@ export function projectApproval(v: unknown, field: string, mode: Mode = LENIENT)
   noExtra(a, APPROVAL_KEYS, field, mode);
   return withOpt<ApprovalResult>({
     callId: str(a.callId, `${field}.callId`), decision: oneOf(a.decision, APPROVAL_DECISIONS, `${field}.decision`),
-    decidedAt: instant(a.decidedAt, `${field}.decidedAt`), channel: oneOf(a.channel, ["slack", "hook-ask"] as const, `${field}.channel`),
+    decidedAt: instant(a.decidedAt, `${field}.decidedAt`), // PIN-2A: replace with APPROVAL_CHANNEL_KINDS at merge
+    channel: oneOf(a.channel, ["slack", "hook-ask", "none"] as const, `${field}.channel`) as ApprovalResult["channel"],
   }, { approver: optStr(a, "approver", field), reason: optStr(a, "reason", field) });
 }
 export function projectOutcome(v: unknown, field: string, mode: Mode = LENIENT): Outcome {
