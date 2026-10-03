@@ -135,7 +135,8 @@ describe.sequential("Slice 1b demo path, real processes, built artifacts", () =>
     const printed = await agentLedger(["install-hooks", "--print", "--dir", ledgerDir]);
     expect(printed.code, printed.stderr).toBe(0);
     snippet = JSON.parse(printed.stdout) as HookSnippet;
-    expect(Object.keys(snippet.hooks).sort()).toEqual(["PostToolUse", "PostToolUseFailure", "PreToolUse"]);
+    // Slice 1c (pin 5) added SessionStart and PermissionDenied; this 1b path still only exercises the first three.
+    expect(Object.keys(snippet.hooks).sort()).toEqual(["PermissionDenied", "PostToolUse", "PostToolUseFailure", "PreToolUse", "SessionStart"]);
     for (const entries of Object.values(snippet.hooks)) {
       expect(entries).toHaveLength(1);
       expect(entries[0]!.matcher).toBe("");

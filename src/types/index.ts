@@ -11,6 +11,8 @@ export interface IncomingCall {
   args: Record<string, unknown>;
   receivedAt: string;
   onBehalfOf?: string; declaredPlan?: string;
+  /** The agent runtime's own session id, verbatim from the hook event's `session_id` (ADR-010). Absent in proxy mode, where no hook event exists. */
+  agentSessionId?: string;
 }
 
 /** An authenticated call. No credential here, so none can reach the ledger. */
@@ -20,7 +22,34 @@ export interface ToolCall {
   server: string; tool: string;
   args: Record<string, unknown>;
   receivedAt: string;
+  /** The agent runtime's own session id (hook event `session_id`), so the report can check sessions per agent session (ADR-010). Absent in proxy mode and on pre-1c records. */
+  agentSessionId?: string;
 }
+
+// ---------- Session heartbeat (ADR-010, Slice 1c pin 1) ----------
+
+/**
+ * Heartbeat facts, stored as `call.args` of the heartbeat record (an ordinary `intent` record with `call.tool`
+ * HEARTBEAT_TOOL and `policy.ruleId` HEARTBEAT_RULE_ID). These are OUR observations of the hook process, never
+ * agent-supplied text (ADR-009's "no clear args for unreviewed tools" is about tool arguments; this is not a tool
+ * call). The NODE_OPTIONS VALUE, `transcript_path`, `cwd`, `model` and `session_title` are never stored.
+ */
+export interface SessionHeartbeat {
+  agentSessionId: string;                        // hook event session_id
+  hookAgent: HookAgent;                          // "claude-code" | "codex"
+  source: string;                                // startup | resume | clear | compact | fork (Claude Code); no fork under Codex
+  permissionMode?: string;                       // the event's permission_mode when present, verbatim
+  interpreter: string;                           // realpath of process.execPath of the handler
+  nodeOptionsSet: boolean;                       // NODE_OPTIONS non-empty in the handler's env; the VALUE is never stored
+  watchdogCheck: "ok" | "missing" | "failed";    // the CLI's watchdog self-test result (pin 5)
+}
+/** `call.tool` of a heartbeat record. */
+export const HEARTBEAT_TOOL = "SessionStart" as const;
+/** `policy.ruleId` of a heartbeat record; the discriminator every consumer (report) uses. */
+export const HEARTBEAT_RULE_ID = "heartbeat:session-start" as const;
+export const HEARTBEAT_REASON = "agent-ledger: session heartbeat written by the SessionStart hook; a health record, not a tool decision" as const;
+/** `Outcome.errorClass` of the `blocked` outcome a Claude Code auto-mode PermissionDenied event produces (pin 7). */
+export const PERMISSION_DENIED_ERROR_CLASS = "permission-denied:auto-mode" as const;
 
 // ---------- Server identity: built-in tools live in a namespace MCP can never produce (spec §8) ----------
 

@@ -5,6 +5,8 @@
 import { spawn } from "node:child_process";
 import { appendFileSync, readFileSync, writeSync } from "node:fs";
 import process from "node:process";
+import type { ToolRegistry } from "../../src/policy/contract.js";
+import type { LedgerRecord, UnsealedRecord } from "../../src/types/index.js";
 
 const [mode = "", param = ""] = process.argv.slice(2);
 // Liveness marker for the tests: proves (or disproves) that the watchdog spawned us, and names our pid while we run.
@@ -102,18 +104,28 @@ switch (mode) {
   // falls through (never)
   case "pgid": { err(`pid:${process.pid}\n`); spin(); }
   // falls through (never)
-  case "pipeline-init": { // Astra pin 4 shape: construct the pipeline; a throw is a non-zero exit, never a decision
+  case "pipeline-init": { // Astra pin 4 shape, updated for ADR-011 (Slice 1c): construct the pipeline, then DECIDE one reviewed read.
+    // A construction throw is still a non-zero exit, never a decision; but no watchdog clock is read at construction any
+    // more (ADR-011), so `slack-timeout` constructs and `decide()` prints a deny carrying the `validateHookTiming` violation
+    // (handler-deny, exit 2). With `hook-ask` the printed line is the REAL `decide()` answer, so the watchdog's absolute deadline is
+    // exercised: under the watchdog (deadline env present) it is `allow` → exit 0; started without that env the same
+    // handler prints a deny carrying WATCHDOG_DEADLINE_DENY_REASON (the integration assertion for the moved watchdog test).
     const { createPipeline } = await import("../../src/pipeline/contract.js");
-    const registry = { version: 1 as const, servers: {} };
+    const hooks = await import("../../src/hooks/contract.js");
+    const registry: ToolRegistry = { version: 1, servers: { "builtin:codex": { trusted: true, tools: { Read: { class: "read", reviewedBy: "hooks-handler", reviewedAt: "2026-10-01" } } } } };
     const identity = { resolveAgent: async () => "a", startSession: async () => "s" };
-    const ledger = { append: async () => { throw new Error("unused"); }, verify: async () => ({ ok: true, checked: 0 }), head: async () => "0", read: async function* () { /* none */ } };
+    const ledger = {
+      append: async (r: UnsealedRecord) => ({ ...r, hash: "0".repeat(64), prevHash: "0", parentRecordId: null, writtenAt: new Date().toISOString() }) as unknown as LedgerRecord,
+      verify: async () => ({ ok: true, checked: 0 }), head: async () => "0", read: async function* () { /* none */ },
+    };
     const upstream = { listTools: async () => [], execute: async () => { throw new Error("decide-only"); }, close: async () => {} };
     const argsHmacKey = new Uint8Array(32);
     const approvals = param === "slack-timeout"
       ? { kind: "slack" as const, channelId: "C012345678", timeoutMs: 300_000, transport: "socket-mode" as const, botToken: { kind: "env" as const, name: "X" }, appToken: { kind: "env" as const, name: "Y" }, approvers: ["U012345678"] }
       : { kind: "hook-ask" as const };
-    createPipeline({ identity, registry, ledger, upstream, approvals, hookAgent: "codex", argsHmacKey });
-    out(ALLOW); process.exit(0);
+    const pipeline = createPipeline({ identity, registry, ledger, upstream, approvals, hookAgent: "codex", argsHmacKey });
+    const decision = await pipeline.decide({ callId: "pipeline-init", credential: { kind: "local", value: "scripted" }, server: "builtin:codex", tool: "Read", args: {}, receivedAt: new Date().toISOString() });
+    out(hooks.formatPreToolUseOutput(decision, "codex")); process.exit(0);
   }
   // falls through (never)
   case "real": { // a real decide-only handler: registry + agents + jsonl ledger from env (what Astra's `hook` command does)

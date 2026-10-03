@@ -1,5 +1,5 @@
-import type { AgentCredential, HookAgent, HookDecision, IncomingCall, Outcome } from "../types/index.js";
-import { BUILTIN_CODEX_SERVER, BUILTIN_NAMESPACE, BUILTIN_SERVER, BUILTIN_SERVERS, HOOK_AGENTS, RESERVED_SERVER_NAMES } from "../types/index.js";
+import type { AgentCredential, HookAgent, HookDecision, IncomingCall, Outcome, SessionHeartbeat } from "../types/index.js";
+import { BUILTIN_CODEX_SERVER, BUILTIN_NAMESPACE, BUILTIN_SERVER, BUILTIN_SERVERS, HOOK_AGENTS, PERMISSION_DENIED_ERROR_CLASS, RESERVED_SERVER_NAMES } from "../types/index.js";
 import {
   APPROVAL_MIN_MARGIN_MS, CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_S, CODEX_DEFAULT_HOOK_TIMEOUT_S, DEFAULT_DEADLINE_MS, DEFAULT_HOOK_TIMING,
   DEFAULT_MAX_OUTPUT_BYTES, HOOK_TIMEOUT_S, MAX_HANDLER_STDERR_BYTES, MAX_MAX_OUTPUT_BYTES, MAX_REASON_CHARS, MAX_STDIN_BYTES,
@@ -25,8 +25,9 @@ export {
 // `hookSpecificOutput.permissionDecision` block, so the collector is one code path with an `agent` argument and
 // two sets of wire types; a separate codex.ts would duplicate the naming rule and the output shape and make the
 // test tables diverge. Where the agents differ (Codex: `model`/`turn_id` required, `transcript_path` nullable,
-// `tool_input` any JSON, no PostToolUseFailure, no `ask`), the difference lives in the Codex types and in the
-// documented behaviour of the three functions below. Verified 2026-09-29; sources on each type.
+// `tool_input` any JSON, no PostToolUseFailure, no PermissionDenied, no `ask`), the difference lives in the Codex
+// types and in the documented behaviour of the functions below. Verified 2026-09-29 (tool events) and 2026-10-01
+// (SessionStart, PermissionDenied; ADR-010); sources on each type.
 
 // ---------- Claude Code wire format ----------
 
@@ -80,8 +81,40 @@ export interface PostToolUseFailureEvent extends HookCommon, ToolEventFields {
   /** Tool execution time, excluding permission prompts and PreToolUse hooks. */
   duration_ms?: number;
 }
-export type HookEvent = PreToolUseEvent | PostToolUseEvent | PostToolUseFailureEvent;
-export const HOOK_EVENT_NAMES = ["PreToolUse", "PostToolUse", "PostToolUseFailure"] as const;
+/**
+ * SessionStart (ADR-010; https://code.claude.com/docs/en/hooks "SessionStart", read 2026-10-01): "Runs when Claude Code
+ * starts a new session or resumes an existing session." Input: the common fields plus `source` ("startup" | "resume" |
+ * "clear" | "compact" | "fork") and optionally `model` ("can be omitted, for example after /clear"), `agent_type`,
+ * `session_title`; on resume/fork (≥ v2.1.251) four cost fields, tolerated and never stored. `prompt_id` is "Absent
+ * until the first user input". No tool fields, no `tool_use_id`. TRAP: Claude Code "adds stdout it treats as plain
+ * text to Claude's context", so the handler for this event prints NOTHING on stdout. "Only type: command and
+ * type: mcp_tool hooks are supported." Exit 2 "Shows stderr to user only" and the session proceeds.
+ */
+export interface SessionStartEvent extends HookCommon {
+  hook_event_name: "SessionStart";
+  source: "startup" | "resume" | "clear" | "compact" | "fork" | string;
+  model?: string;
+  session_title?: string;
+  seconds_since_last_response?: number;
+  context_tokens?: number;
+  prompt_cache_likely_expired?: boolean;
+  estimated_cache_write_usd?: number;
+}
+/**
+ * PermissionDenied (ADR-010; same page, read 2026-10-01): "fires after Claude Code denies a tool call through the
+ * permission system. It does not fire when you block a tool with a PreToolUse hook, when a deny rule in the permission
+ * system blocks the call, or when you manually deny a permission prompt." Events table: "When auto mode denies a tool
+ * call". So it is observable for AUTO MODE only; the demo's manual denial is unobservable (pin 8 wording). "PermissionDenied
+ * hooks receive tool_name, tool_input, tool_use_id, and reason"; it is "async and observational"; "Exit code and stderr
+ * are ignored because the denial already occurred." `tool_use_id` chains it to our intent record.
+ */
+export interface PermissionDeniedEvent extends HookCommon, ToolEventFields {
+  hook_event_name: "PermissionDenied";
+  /** Why the permission system denied it: display text, never stored (same rule as PostToolUseFailure's `error`). */
+  reason: string;
+}
+export type HookEvent = PreToolUseEvent | PostToolUseEvent | PostToolUseFailureEvent | SessionStartEvent | PermissionDeniedEvent;
+export const HOOK_EVENT_NAMES = ["PreToolUse", "PostToolUse", "PostToolUseFailure", "SessionStart", "PermissionDenied"] as const;
 
 // ---------- Codex wire format (ADR-005) ----------
 
@@ -129,15 +162,37 @@ export interface CodexPostToolUseEvent extends CodexHookCommon, CodexToolEventFi
   /** "JSON value": MCP tools send the MCP call result; other tools their model-facing output. Format not stable. */
   tool_response: unknown;
 }
-export type CodexHookEvent = CodexPreToolUseEvent | CodexPostToolUseEvent;
-/** Codex has no failure event: a failed Bash command still arrives as PostToolUse (verified 2026-09-29). */
-export const CODEX_HOOK_EVENT_NAMES = ["PreToolUse", "PostToolUse"] as const;
+/**
+ * Codex SessionStart (ADR-010; https://learn.chatgpt.com/docs/hooks, read 2026-10-01): `source` is "startup, resume,
+ * clear, or compact" (no `fork`); the matcher "is applied to source". Common fields `session_id`, `transcript_path`
+ * (nullable), `cwd`, `hook_event_name`, `model`, plus `permission_mode` ("The events SessionStart, PreToolUse, ... also
+ * include permission_mode"); NO `turn_id` ("Turn-scoped hooks include turn_id"). The page's SessionStart example omits
+ * `model`, so it is optional here [H: the common-fields table lists it; the example does not]. Same trap: "Plain text on
+ * stdout is added as extra developer context."
+ */
+export interface CodexSessionStartEvent extends Omit<CodexHookCommon, "turn_id" | "model"> {
+  hook_event_name: "SessionStart";
+  source: "startup" | "resume" | "clear" | "compact" | string;
+  model?: string;
+}
+export type CodexHookEvent = CodexPreToolUseEvent | CodexPostToolUseEvent | CodexSessionStartEvent;
+/** Codex has no failure event (a failed Bash command still arrives as PostToolUse, verified 2026-09-29) and no PermissionDenied (verified 2026-10-01). */
+export const CODEX_HOOK_EVENT_NAMES = ["PreToolUse", "PostToolUse", "SessionStart"] as const;
 /** PermissionRequest exists in Codex too (allow/deny an approval prompt via a `decision` object) but it has no `tool_use_id`, so we do not consume it. */
 export const CODEX_UNUSED_EVENTS = ["PermissionRequest"] as const;
 
 export type AnyHookEvent = HookEvent | CodexHookEvent;
 export type AnyPreToolUseEvent = PreToolUseEvent | CodexPreToolUseEvent;
 export type AnyPostEvent = PostToolUseEvent | PostToolUseFailureEvent | CodexPostToolUseEvent;
+export type AnySessionStartEvent = SessionStartEvent | CodexSessionStartEvent;
+/** Every event `toOutcome` maps: the post events plus Claude Code's auto-mode PermissionDenied. */
+export type AnyOutcomeEvent = AnyPostEvent | PermissionDeniedEvent;
+/**
+ * What the CLI measures about its own process for the heartbeat (pin 5); `toHeartbeat` only maps it. `interpreter` is
+ * `realpathSync(process.execPath)`; `nodeOptionsSet` is whether NODE_OPTIONS is non-empty (the value is never stored);
+ * `watchdogCheck` is the watchdog self-test result ("ok" | "missing" | "failed").
+ */
+export interface HeartbeatProbe { interpreter: string; nodeOptionsSet: boolean; watchdogCheck: SessionHeartbeat["watchdogCheck"] }
 
 /** Both agents name MCP tools `mcp__<server>__<tool>`; Claude Code plugin servers appear as `mcp__plugin_<plugin>_<server>__<tool>`. */
 export const MCP_TOOL_PREFIX = "mcp__";
@@ -152,9 +207,14 @@ export const MCP_TOOL_PREFIX = "mcp__";
 // (PreToolUseOutput is declared in ./watchdog.ts, which the watchdog validates against, and re-exported above.)
 
 /**
- * Parses stdin for the given agent. Throws (→ watchdog deny) on invalid JSON, a non-object, a missing required field
- * for that agent (Codex adds `model`, `turn_id`, `permission_mode`; `transcript_path` may be null there and only there),
- * or a `hook_event_name` outside HOOK_EVENT_NAMES / CODEX_HOOK_EVENT_NAMES. Never accepts one agent's event for the other.
+ * Parses stdin for the given agent. Throws (→ watchdog deny for PreToolUse; a silent exit 0 for the record-only
+ * handlers) on invalid JSON, a non-object, a missing required field for that agent (Codex tool events add `model`,
+ * `turn_id`, `permission_mode`; `transcript_path` may be null there and only there), or a `hook_event_name` outside
+ * HOOK_EVENT_NAMES / CODEX_HOOK_EVENT_NAMES. Never accepts one agent's event for the other.
+ * SessionStart (both agents) carries NO tool fields: `tool_name`, `tool_input`, `tool_use_id` are not required there
+ * (they are required on every tool event, PermissionDenied included), `source` is; Codex's `turn_id` is turn-scoped and
+ * not required on SessionStart; Claude Code's optional `model` on SessionStart is a documented Claude Code field, so the
+ * "Codex marker" rule rejects `model` on Claude Code TOOL events only (`turn_id` is rejected on every Claude Code event).
  */
 export function parseHookInput(raw: string, agent: "claude-code"): HookEvent;
 export function parseHookInput(raw: string, agent: "codex"): CodexHookEvent;
@@ -166,16 +226,20 @@ export function parseHookInput(raw: string, agent: HookAgent): AnyHookEvent {
   if (!isPlainObject(parsed)) throw new Error("hooks: hook event must be a JSON object");
   const ev = parsed;
   const str = (k: string) => { if (typeof ev[k] !== "string" || (ev[k] as string).length === 0) throw new Error(`hooks: ${k} must be a non-empty string`); };
-  for (const k of ["session_id", "cwd", "hook_event_name", "tool_name", "tool_use_id"]) str(k);
-  if (!Object.hasOwn(ev, "tool_input")) throw new Error("hooks: tool_input is required");
+  const optStr = (k: string) => { if (Object.hasOwn(ev, k) && typeof ev[k] !== "string") throw new Error(`hooks: ${k} must be a string`); };
+  for (const k of ["session_id", "cwd", "hook_event_name"]) str(k);
   const name = ev["hook_event_name"] as string;
+  const sessionStart = name === "SessionStart";
+  if (sessionStart) { str("source"); optStr("model"); }
+  else { for (const k of ["tool_name", "tool_use_id"]) str(k); if (!Object.hasOwn(ev, "tool_input")) throw new Error("hooks: tool_input is required"); }
   if (agent === "claude-code") {
-    // Never one agent's event for the other: the Codex-only required extensions are refused here.
-    for (const k of CODEX_ONLY_FIELDS) if (Object.hasOwn(ev, k)) throw new Error(`hooks: ${k} is a Codex field; not a Claude Code event`);
+    // Never one agent's event for the other: the Codex-only required extensions are refused here (`model` is a documented
+    // optional Claude Code field on SessionStart, so it counts as a Codex marker on tool events only).
+    for (const k of CODEX_ONLY_FIELDS) if (Object.hasOwn(ev, k) && !(sessionStart && k === "model")) throw new Error(`hooks: ${k} is a Codex field; not a Claude Code event`);
     if (typeof ev["transcript_path"] !== "string") throw new Error("hooks: transcript_path must be a string");
     if (!(HOOK_EVENT_NAMES as readonly string[]).includes(name)) throw new Error(`hooks: unsupported hook_event_name ${JSON.stringify(name)}`);
-    if (!isPlainObject(ev["tool_input"])) throw new Error("hooks: tool_input must be an object");
-    if (Object.hasOwn(ev, "permission_mode") && typeof ev["permission_mode"] !== "string") throw new Error("hooks: permission_mode must be a string");
+    if (!sessionStart && !isPlainObject(ev["tool_input"])) throw new Error("hooks: tool_input must be an object");
+    optStr("permission_mode");
     if (Object.hasOwn(ev, "mcp_server")) {
       const m = ev["mcp_server"];
       if (!isPlainObject(m) || typeof m["name"] !== "string" || typeof m["source"] !== "string") throw new Error("hooks: mcp_server must be { name, source }");
@@ -186,10 +250,12 @@ export function parseHookInput(raw: string, agent: HookAgent): AnyHookEvent {
       if (Object.hasOwn(ev, "is_interrupt") && typeof ev["is_interrupt"] !== "boolean") throw new Error("hooks: is_interrupt must be boolean");
       if (Object.hasOwn(ev, "duration_ms") && typeof ev["duration_ms"] !== "number") throw new Error("hooks: duration_ms must be a number");
     }
+    if (name === "PermissionDenied" && typeof ev["reason"] !== "string") throw new Error("hooks: PermissionDenied requires reason (string)");
+    if (sessionStart) { optStr("agent_type"); optStr("session_title"); }
     return ev as unknown as HookEvent;
   }
   for (const k of CLAUDE_CODE_ONLY_FIELDS) if (Object.hasOwn(ev, k)) throw new Error(`hooks: ${k} is a Claude Code field; not a Codex event`);
-  str("model"); str("turn_id");
+  if (!sessionStart) { str("model"); str("turn_id"); } // SessionStart is not turn-scoped (no turn_id); its `model` is optional [H]
   if (!(CODEX_PERMISSION_MODES as readonly unknown[]).includes(ev["permission_mode"])) throw new Error("hooks: permission_mode must be one of Codex's five modes");
   if (ev["transcript_path"] !== null && typeof ev["transcript_path"] !== "string") throw new Error("hooks: transcript_path must be a string or null");
   if (!(CODEX_HOOK_EVENT_NAMES as readonly string[]).includes(name)) throw new Error(`hooks: unsupported Codex hook_event_name ${JSON.stringify(name)}`);
@@ -227,7 +293,29 @@ export function toIncomingCall(ev: AnyPreToolUseEvent, credential: AgentCredenti
   const { server, tool } = splitToolName(ev.tool_name, agent, agent === "claude-code" && Object.hasOwn(ev, "mcp_server"));
   // Reference-free copy: the event came from JSON.parse, so a JSON round trip is lossless and shares nothing.
   const args = JSON.parse(JSON.stringify(input)) as Record<string, unknown>;
-  return { callId: ev.tool_use_id, credential: { kind: credential.kind, value: credential.value }, server, tool, args, receivedAt: new Date().toISOString() };
+  if (typeof ev.session_id !== "string" || ev.session_id.length === 0) throw new Error("hooks: session_id must be a non-empty string");
+  // ADR-010: the agent runtime's own session id rides along verbatim (never into args), so the report can check per agent session.
+  return { callId: ev.tool_use_id, credential: { kind: credential.kind, value: credential.value }, server, tool, args, receivedAt: new Date().toISOString(), agentSessionId: ev.session_id };
+}
+
+/**
+ * Maps a SessionStart event plus the CLI's probe onto the heartbeat facts (ADR-010, pin 2). Pure field mapping: exactly
+ * `agentSessionId` (= `session_id`), `hookAgent`, `source`, `permissionMode` (only when the event carries a non-empty
+ * string `permission_mode`), and the three probe fields. The NODE_OPTIONS value, `transcript_path`, `cwd`, `model`,
+ * `session_title` and the resume-cost fields never appear in the result. Throws on a non-SessionStart event, an
+ * unknown agent, or a malformed probe (a heartbeat with invented facts is worse than none).
+ */
+export function toHeartbeat(ev: AnySessionStartEvent, agent: HookAgent, probe: HeartbeatProbe): SessionHeartbeat {
+  assertAgent(agent);
+  if (!isPlainObject(ev) || ev.hook_event_name !== "SessionStart") throw new Error("hooks: not a SessionStart event");
+  if (typeof ev.session_id !== "string" || ev.session_id.length === 0) throw new Error("hooks: session_id must be a non-empty string");
+  if (typeof ev.source !== "string" || ev.source.length === 0) throw new Error("hooks: source must be a non-empty string");
+  if (!isPlainObject(probe) || typeof probe.interpreter !== "string" || probe.interpreter.length === 0 || typeof probe.nodeOptionsSet !== "boolean"
+    || !(WATCHDOG_CHECKS as readonly unknown[]).includes(probe.watchdogCheck)) throw new Error("hooks: invalid heartbeat probe");
+  const hb: SessionHeartbeat = { agentSessionId: ev.session_id, hookAgent: agent, source: ev.source, interpreter: probe.interpreter, nodeOptionsSet: probe.nodeOptionsSet, watchdogCheck: probe.watchdogCheck };
+  const mode: unknown = (ev as { permission_mode?: unknown }).permission_mode;
+  if (typeof mode === "string" && mode.length > 0) hb.permissionMode = mode;
+  return hb;
 }
 
 /**
@@ -235,11 +323,13 @@ export function toIncomingCall(ev: AnyPreToolUseEvent, credential: AgentCredenti
  * Claude Code: PostToolUse → { status: "ok" }; PostToolUseFailure → { status: "error", errorClass, durationMs: duration_ms }
  * where errorClass is "interrupt" when is_interrupt is true, else the `Exit code N` first line when present, else
  * "tool-error". The error text itself is not stored (it is display text and may carry secrets).
+ * Claude Code PermissionDenied (auto mode only, ADR-010) → { status: "blocked", errorClass: PERMISSION_DENIED_ERROR_CLASS };
+ * the event's `reason` is display text and is not stored. Under Codex there is no such event (throw).
  * Codex: PostToolUse → { status: "ok" } ALWAYS, and "ok" there means "the tool ran and returned", not "succeeded":
  * Codex has no failure event and `tool_response` has no stable shape to read an exit code from. Deriving an
  * errorClass from `tool_response` is future work and is recorded as such in spec §6.
  */
-export function toOutcome(ev: AnyPostEvent, agent: HookAgent): Outcome {
+export function toOutcome(ev: AnyOutcomeEvent, agent: HookAgent): Outcome {
   assertAgent(agent);
   if (!isPlainObject(ev)) throw new Error("hooks: not a hook event");
   const name = ev.hook_event_name;
@@ -248,6 +338,7 @@ export function toOutcome(ev: AnyPostEvent, agent: HookAgent): Outcome {
     return { status: "ok" };
   }
   if (name === "PostToolUse") return { status: "ok" };
+  if (name === "PermissionDenied") return { status: "blocked", errorClass: PERMISSION_DENIED_ERROR_CLASS };
   if (name !== "PostToolUseFailure") throw new Error(`hooks: ${String(name)} is not an outcome event`);
   const f = ev as PostToolUseFailureEvent;
   const firstLine = typeof f.error === "string" ? f.error.split("\n")[0] ?? "" : "";
@@ -286,6 +377,7 @@ export function formatPreToolUseOutput(d: HookDecision, agent: HookAgent): strin
 const CODEX_ONLY_FIELDS = ["model", "turn_id"] as const;
 const CLAUDE_CODE_ONLY_FIELDS = ["prompt_id", "scratchpad_dir", "mcp_server", "is_interrupt", "duration_ms", "error"] as const;
 const CODEX_PERMISSION_MODES = ["default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"] as const;
+const WATCHDOG_CHECKS = ["ok", "missing", "failed"] as const satisfies readonly SessionHeartbeat["watchdogCheck"][];
 const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 function assertAgent(agent: unknown): asserts agent is HookAgent {
   if (!(HOOK_AGENTS as readonly unknown[]).includes(agent)) throw new Error(`hooks: unknown agent ${JSON.stringify(agent)}`);
