@@ -551,3 +551,11 @@ termination-message limit (a digest is 71 bytes; fine) or missing because Kaniko
 - B's branch is wide (ledger + deploy + runbook) but its code surface (`postgres.ts`, `chain.ts`) is the part that needs
   the ledger-engineer bar; the YAML is reviewable by `kubectl --dry-run` and by A's read of the manifests against pins
   8-10. If B runs long, the coordinator may pull `docs/HOMELAB.md` steps 12-15 into A's package after the manifests land.
+
+## Amendments (coordinator, 2026-10-03, after Astra's blocker handoff)
+- Postgres pod identity: `postgres:17.11-alpine3.24` defines user/group `postgres` = **70/70** (official Dockerfile,
+  docker-library/postgres 17/alpine3.24). Use `runAsUser: 70`, `runAsGroup: 70`, `fsGroup: 70`; drop the uid-999
+  rationale. Keep the PGDATA subdirectory on the local-path volume.
+- `channel: "none"` before integration: B codes the validator's one enum line against the pinned literal `"none"`
+  (comment `// PIN-2A: replace with APPROVAL_CHANNEL_KINDS at merge`); B never edits src/types. The coordinator swaps it
+  to A's exported constant at integration. B's tests use the literal.
