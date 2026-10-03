@@ -72,15 +72,26 @@ Changes: namespace `agent-ledger` with enforce/audit/warn `restricted`, version 
 kubectl apply -f deploy/k8s/00-namespace.yaml
 ```
 
-Verify: `kubectl get ns agent-ledger --show-labels`. The following **server dry-run must be rejected by PSA**;
-no root Pod should exist afterwards. Before Kyverno is installed, PSA is the expected rejection source.
+Verify: `kubectl get ns agent-ledger --show-labels`. The root Pod uses the namespace's default ServiceAccount with
+`automountServiceAccountToken: false`; it does not depend on step 6's `integration` account. Confirm the default
+account exists first. The **server dry-run must fail and contain the PodSecurity rejection**, not merely any error:
 
 ```sh
-kubectl -n agent-ledger apply --dry-run=server -f deploy/k8s/test/root-pod.yaml
+kubectl -n agent-ledger get serviceaccount default
+if kubectl -n agent-ledger apply --dry-run=server -f deploy/k8s/test/root-pod.yaml > "$LAB_WORK/psa-root-proof.log" 2>&1; then
+  echo 'FAIL: root Pod passed admission'
+  false
+else
+  cat "$LAB_WORK/psa-root-proof.log"
+  grep -F 'violates PodSecurity "restricted:latest"' "$LAB_WORK/psa-root-proof.log"
+fi
 kubectl -n agent-ledger get pods
 ```
 
-Undo: `kubectl delete namespace agent-ledger` (after data/evidence retention; also deletes namespaced resources).
+A missing ServiceAccount, unavailable webhook or other unrelated failure is **not** a passing proof. Require the
+exact PodSecurity text above; no root Pod should exist afterwards. Before Kyverno is installed, PSA is the rejection source.
+Undo: `kubectl delete namespace agent-ledger` (after data/evidence retention). **Once step 8 has run, this also deletes
+the PVC and therefore the ledger**, as well as the other namespaced resources. Keep the namespace if retaining its PVC.
 
 ## 3. GHCR pull credentials
 
@@ -102,7 +113,7 @@ Only Ryan runs this push. Kaniko is archived; replacing it is Slice 2b. The repo
 build context. Confirm `src/server/main.ts`, `demo-upstream.ts`, and `smoke.ts` exist in the integrated HEAD first.
 
 ```sh
-git archive --format=tar.gz -o "$LAB_WORK/context.tar.gz" HEAD Dockerfile .dockerignore src policies package.json package-lock.json tsconfig.json tsconfig.build.json .npmrc
+git archive --format=tar.gz -o "$LAB_WORK/context.tar.gz" HEAD Dockerfile .dockerignore src package.json package-lock.json tsconfig.json tsconfig.build.json .npmrc
 wc -c "$LAB_WORK/context.tar.gz"
 ```
 
@@ -257,6 +268,8 @@ Undo: `kubectl delete validatingpolicy agent-ledger-hardening`. Negative tests a
 Changes: all seven NetworkPolicies, Postgres Service and StatefulSet with a 2Gi local-path PVC.
 Postgres/demo have no outbound allowance; DNS is allowed only for proxy/integration. Replies to allowed inbound
 connections remain allowed. Pod selectors are namespace-local; attacker labels in another namespace grant no access.
+The LAN range `10.20.0.0/24` also includes the nodes' own IPs (`10.20.0.10`–`10.20.0.12`); it is not a Mac-only allowlist.
+Do not claim node/host-network isolation from this rule: Cilium's treatment of node traffic must be observed separately.
 
 ```sh
 kubectl apply -f deploy/k8s/10-networkpolicies.yaml
@@ -282,6 +295,8 @@ kubectl -n agent-ledger exec postgres-0 -- psql -U ledger_app -d ledger -c 'DELE
 ```
 
 Expected: uid/gid 70, accepting connections, ledger_app/ledger_reader roles, permission denied on DELETE.
+The official image's local trust authentication makes exec on postgres-0 a **password-less database-superuser path**:
+anyone permitted to exec can run `psql -U postgres`. This is the cluster-admin boundary, not a ledger protection.
 SELECT+INSERT app grants and SELECT-only reader grants are backed by UPDATE/DELETE/TRUNCATE refusal triggers.
 A superuser can deliberately disable/drop triggers: this is not protection against the cluster/database administrator.
 Keep anchors off-machine. If initdb cannot use the mount, inspect the local-path directory permissions and fsGroup;
@@ -327,17 +342,48 @@ helm -n falco get values falco > "$LAB_WORK/falco-before.yaml"
 helm upgrade falco falcosecurity/falco --namespace falco --version 9.1.0 --reuse-values -f deploy/falco/values.yaml
 ```
 
-Verify: `kubectl -n falco get pods` and `kubectl -n falco logs ds/falco --since=10m` show loaded rules without errors.
-Ryan-only trigger (exec starts a process; builders do not run it):
+Verify: `kubectl -n falco get pods` and the logs from **all** Falco pods show the rules loaded without errors.
+Do not count an empty log or absence of alerts as proof of detection. The repository filters use `endswith` so both
+`ghcr.io/ryan-zeleznock/agent-ledger` and `ryan-zeleznock/agent-ledger` match; the BusyBox exclusion likewise accepts
+`docker.io/library/busybox` and `library/busybox`. The [Falco field reference](https://falco.org/docs/reference/rules/supported-fields/)
+documents the unprefixed repository form, and [condition syntax](https://falco.org/docs/concepts/rules/conditions/)
+defines suffix matching (checked 2026-10-03). Runtime field population still needs the controls below.
+
+Step 9's init shells ran **before** these custom rules were installed. Once Falco is ready on the nodes hosting
+postgres/proxy/demo, Ryan reruns staging with fresh Deployment rollouts (briefly interrupts the lab proxy):
+
+```sh
+kubectl -n falco logs ds/falco --all-pods=true --prefix=true --since=10m --tail=-1
+export FALCO_PROOF_SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+kubectl -n agent-ledger rollout restart deployment/demo-upstream
+kubectl -n agent-ledger rollout restart deployment/proxy
+kubectl -n agent-ledger rollout status deployment/demo-upstream --timeout=120s
+kubectl -n agent-ledger rollout status deployment/proxy --timeout=120s
+kubectl -n agent-ledger get pods -l 'app in (proxy,demo-upstream)' -o wide
+kubectl -n agent-ledger get pods -l 'app in (proxy,demo-upstream)' -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.initContainerStatuses}{"\n"}{end}'
+```
+
+Require a newly created ready Pod for **each** Deployment, with `stage-config` terminated successfully (exit 0)
+after `FALCO_PROOF_SINCE`; record their Pod names and nodes. Ignore terminating old Pods. Confirm Falco is running
+on both of those nodes; an unobserved node cannot provide a negative control.
+Then run the Ryan-only **positive control** (builders do not execute this):
 
 ```sh
 kubectl -n agent-ledger exec postgres-0 -- sh -c id
-kubectl -n falco logs ds/falco --since=5m
+kubectl -n falco logs ds/falco --all-pods=true --prefix=true --since-time="$FALCO_PROOF_SINCE" --tail=-1 > "$LAB_WORK/falco-proof.log"
 ```
 
-Find `Shell in agent-ledger namespace` with postgres-0. BusyBox staging is deliberately excluded from that rule.
-The distroless proxy has no shell, so demonstrate its rule by **absence of unexpected process alerts**, not by
-claiming a successful shell exec. Initial postgres entrypoint shells can also legitimately trigger the namespace rule.
+Inspect the complete capture, allowing time for event delivery and rereading logs if necessary. **Both** conditions
+are required: the deliberate postgres-0 shell produces this rule's alert, and neither fresh `stage-config` BusyBox
+shell produces one. In text logs the rule's output starts `Agent Ledger shell (namespace=agent-ledger pod=...)`;
+in JSON logs require `rule: Shell in agent-ledger namespace` and the corresponding Pod field. The postgres alert
+must match the exec's timestamp and `sh -c id` command, so an earlier entrypoint shell does not satisfy the control.
+No positive alert, any staging-shell alert, missing node coverage or rule-load errors means **FAIL**, never a pass
+based on silence. Save the log and fresh Pod names with the evidence. Undo the proof restarts by completing their
+rollouts; they change no image/configuration. If a rollout fails, diagnose it before continuing.
+
+The distroless proxy has no shell. Absence of its process-rule alerts is normal operation, **not** a positive test
+of that separate rule. Initial postgres entrypoint shells can also legitimately trigger the namespace shell rule.
 Undo: `helm -n falco rollback falco <the-recorded-previous-revision>` (replace the placeholder with the saved revision).
 
 ## 11. Integration Job and image startup check
@@ -406,8 +452,32 @@ MCP_SDK_GENERATION=v2 MCP_PROTOCOL_NEGOTIATION=auto claude mcp add --scope local
 MCP_SDK_GENERATION=v2 MCP_PROTOCOL_NEGOTIATION=auto claude
 ```
 
-The single quotes deliberately retain Claude Code's `${AGENT_LEDGER_KEY}` expansion; the secret is not in argv or
-the saved configuration. Keep that environment variable set for the sandbox Claude process, then unset it afterwards.
+The single quotes retain `${AGENT_LEDGER_KEY}` as a reference, so the secret is not in argv or saved configuration.
+Header expansion through the local-scope CLI flag is a hypothesis to verify here. Keep that environment variable
+set for the sandbox Claude process. If `/mcp` reports 401 despite the correct exported key, exit Claude, remove the
+local-scope entry (it would override project scope), and use the documented project-scope `.mcp.json` fallback in
+this **fresh sandbox directory only**. The quoted heredoc keeps the key reference literal:
+
+```sh
+claude mcp remove --scope local agent-ledger
+cat > .mcp.json <<'JSON'
+{
+  "mcpServers": {
+    "agent-ledger": {
+      "type": "http",
+      "url": "http://10.20.0.11:30787/mcp",
+      "headers": {"Authorization": "Bearer ${AGENT_LEDGER_KEY}"}
+    }
+  }
+}
+JSON
+MCP_SDK_GENERATION=v2 MCP_PROTOCOL_NEGOTIATION=auto claude
+```
+
+Set the URL to the actual endpoint chosen above (or the port-forward URL below), then accept the project's MCP
+configuration prompt. This creates only the sandbox's `.mcp.json`; do not overwrite an existing project's file.
+[Claude Code documents header expansion in `.mcp.json`](https://code.claude.com/docs/en/mcp#environment-variable-expansion-in-mcpjson)
+(checked 2026-10-03). If it still returns 401, stop and diagnose the key/identity mapping; do not embed the raw key.
 Verify `/mcp` shows five tools. Ask Claude to echo hello, add 2+3, call `demo__wipe`, and call `demo__whoami`.
 Echo/add succeed; wipe is denied with no channel; whoami is denied as unreviewed. No real data is wiped.
 
@@ -418,7 +488,9 @@ Hubble verdict and use `kubectl -n agent-ledger port-forward svc/proxy 8787:8787
 `http://127.0.0.1:8787/mcp`. This tests application behavior, not the NodePort policy claim.
 If the v2 protocol probe fails, port-forward cannot fix an era mismatch: retain smoke evidence and report the need
 for Slice 2b's dual-era front. Never silently call this a successful Claude integration.
-Undo: in the sandbox, `claude mcp remove --scope local agent-ledger`; exit Claude, `unset AGENT_LEDGER_KEY`, stop tunnels.
+Undo: exit Claude and, in the sandbox, remove the entry with `claude mcp remove --scope local agent-ledger` for the
+original setup or `claude mcp remove --scope project agent-ledger` for the fallback. Remove the fallback's newly created
+`.mcp.json` if now empty, `unset AGENT_LEDGER_KEY`, and stop tunnels.
 Return to the integrated repo before the remaining steps.
 
 ## 13. Evidence and off-machine anchors

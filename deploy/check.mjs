@@ -4,6 +4,17 @@ import fs from 'node:fs';
 import {execFileSync} from 'node:child_process';
 import YAML from 'yaml';
 
+// P2 review regressions: the early PSA proof must not depend on a later-created ServiceAccount,
+// and Falco repository filters must tolerate the runtime omitting the registry prefix.
+const rootProof = YAML.parse(fs.readFileSync('deploy/k8s/test/root-pod.yaml','utf8'));
+assert.equal(rootProof.spec.serviceAccountName,undefined,'step 2 must use the default ServiceAccount');
+assert.equal(rootProof.spec.automountServiceAccountToken,false);
+const falco = YAML.parse(YAML.parse(fs.readFileSync('deploy/falco/values.yaml','utf8')).customRules['agent-ledger.yaml']);
+const processRule = falco.find(rule=>rule.rule==='Agent Ledger proxy spawned a process');
+const shellRule = falco.find(rule=>rule.rule==='Shell in agent-ledger namespace');
+assert.match(processRule.condition,/container\.image\.repository endswith "ryan-zeleznock\/agent-ledger"/);
+assert.match(shellRule.condition,/not container\.image\.repository endswith "library\/busybox"/);
+
 assert.equal(fs.readFileSync('deploy/sql/001_init.sql','utf8'), fs.readFileSync('deploy/k8s/config/001_init.sql','utf8'), 'SQL copy drift');
 const rendered = execFileSync('kubectl', ['kustomize', 'deploy/k8s'], {encoding:'utf8', timeout:30_000});
 const docs = YAML.parseAllDocuments(rendered).map(doc => { assert.equal(doc.errors.length,0); return doc.toJS(); });
