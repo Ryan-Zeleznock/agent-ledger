@@ -292,3 +292,28 @@ describe("ledger.redact: ADR-009 digests pass through the key layer (Astra P2 #6
     expect(redact({ body: digest, list: [digest] })).toEqual({ body: digest, list: [digest] });
   });
 });
+
+describe("Slice 1c pin 10: only exact digests bypass the object key layer", () => {
+  it.each(["[REDACTED:pair]", "[REDACTED:anything]", `hmac-sha256:${"A".repeat(64)}`, `hmac-sha256:${"a".repeat(63)}`, ` hmac-sha256:${"a".repeat(64)}`])("redacts placeholder-like or inexact digest %s under sensitive keys and header values", value => {
+    const input = { nested: { password: value }, header: { name: "Authorization", value } };
+    const once = redact(input);
+    expect(once).toEqual({ nested: { password: "[REDACTED:key:password]" }, header: { name: "Authorization", value: "[REDACTED:pair]" } });
+    expect(redact(once)).toEqual(once);
+  });
+  it("keeps an exact lowercase digest in both object passes", () => {
+    const digest = `hmac-sha256:${"a".repeat(64)}`;
+    const input = { nested: { password: digest }, header: { name: "Authorization", value: digest } };
+    expect(redact(input)).toEqual(input); expect(redact(redact(input))).toEqual(input);
+  });
+});
+
+it.each(["password", "Authorization", "--token"])("review #3: array pair %s exempts only exact digests and remains idempotent", key => {
+  const digest = `hmac-sha256:${"a".repeat(64)}`;
+  for (const value of ["[REDACTED:anything]", "[REDACTED:pair]", `${digest}x`, digest.toUpperCase(), digest]) {
+    const input = { pairs: [key, value], nested: [[key, value]], triple: ["Authorization", "Bearer", value] };
+    const expected = value === digest ? digest : "[REDACTED:pair]";
+    const once = redact(input);
+    expect(once).toEqual({ pairs: [key, expected], nested: [[key, expected]], triple: ["Authorization", "Bearer", expected] });
+    expect(redact(once)).toEqual(once);
+  }
+});

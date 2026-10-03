@@ -8,7 +8,7 @@ import {
   type CodexPostToolUseEvent, type CodexPreToolUseEvent, type PostToolUseEvent, type PostToolUseFailureEvent, type PreToolUseEvent,
   type PreToolUseOutput, type ValidatedHandlerOutput, type WatchdogOptions, type WatchdogResult,
 } from "../src/hooks/contract.js";
-import type { HookDecision, Outcome } from "../src/types/index.js";
+import { HEARTBEAT_RULE_ID, HEARTBEAT_TOOL, PERMISSION_DENIED_ERROR_CLASS, type HookDecision, type Outcome } from "../src/types/index.js";
 
 // Format-drift guard. The Claude Code fixtures are the example blocks from https://code.claude.com/docs/en/hooks (read
 // 2026-09-29). The Codex fixtures are composed from the field tables at https://learn.chatgpt.com/docs/hooks and the
@@ -34,9 +34,9 @@ describe("Claude Code hook fixtures", () => {
       expect(typeof ev["tool_use_id"], n).toBe("string");
     }
   });
-  it("the three event names are exactly the ones the collector accepts", () => {
-    expect(HOOK_EVENT_NAMES).toEqual(["PreToolUse", "PostToolUse", "PostToolUseFailure"]);
-    expect([pre, post, fail].map((e) => e["hook_event_name"])).toEqual([...HOOK_EVENT_NAMES]);
+  it("the five event names are exactly the ones the collector accepts (ADR-010 added SessionStart and PermissionDenied)", () => {
+    expect(HOOK_EVENT_NAMES).toEqual(["PreToolUse", "PostToolUse", "PostToolUseFailure", "SessionStart", "PermissionDenied"]);
+    expect([pre, post, fail, load("claude-code-sessionstart"), load("claude-code-permissiondenied")].map((e) => e["hook_event_name"])).toEqual([...HOOK_EVENT_NAMES]);
   });
   it("PreToolUse has no tool_response and no error", () => {
     expect("tool_response" in pre).toBe(false);
@@ -130,10 +130,11 @@ describe("Codex hook fixtures (ADR-005)", () => {
     const bad: CodexPreToolUseEvent = { ...typed, permission_mode: "auto" };
     expect(bad.permission_mode).toBe("auto");
   });
-  it("Codex has only two tool events the collector consumes: there is no PostToolUseFailure", () => {
-    expect(CODEX_HOOK_EVENT_NAMES).toEqual(["PreToolUse", "PostToolUse"]);
+  it("Codex has two tool events plus SessionStart: there is no PostToolUseFailure and no PermissionDenied", () => {
+    expect(CODEX_HOOK_EVENT_NAMES).toEqual(["PreToolUse", "PostToolUse", "SessionStart"]);
     expect(CODEX_HOOK_EVENT_NAMES).not.toContain("PostToolUseFailure");
-    expect([pre, post].map((e) => e["hook_event_name"])).toEqual([...CODEX_HOOK_EVENT_NAMES]);
+    expect(CODEX_HOOK_EVENT_NAMES).not.toContain("PermissionDenied");
+    expect([pre, post, load("codex-sessionstart")].map((e) => e["hook_event_name"])).toEqual([...CODEX_HOOK_EVENT_NAMES]);
     // a failed Bash command still arrives as PostToolUse; the outcome is `ok` = "ran and returned" (spec §6)
     const typed = post as unknown as CodexPostToolUseEvent;
     expect(String(typed.tool_response).startsWith("Exit code 1")).toBe(true);
@@ -169,6 +170,65 @@ describe("Codex hook fixtures (ADR-005)", () => {
     for (const bad of ["sessionId", "toolName", "toolInput", "toolUseId", "hookEventName", "turnId", "transcriptPath", "permissionMode"]) {
       for (const [n, ev] of Object.entries(both)) expect(bad in ev, `${n}.${bad}`).toBe(false);
     }
+  });
+});
+
+describe("Slice 1c fixtures (ADR-010): SessionStart (both agents) and PermissionDenied (Claude Code), docs read 2026-10-01", () => {
+  // Claude Code: the SessionStart example block (a `resume` with the four v2.1.251 cost fields) and the PermissionDenied
+  // example block, both verbatim from https://code.claude.com/docs/en/hooks. Codex: the SessionStart example block
+  // verbatim from https://learn.chatgpt.com/docs/hooks (it carries no `model` and no `turn_id`).
+  const cc = load("claude-code-sessionstart");
+  const denied = load("claude-code-permissiondenied");
+  const cx = load("codex-sessionstart");
+  it("Claude Code SessionStart: common fields + source; optional model; the cost fields are numbers/booleans; NO tool fields and NO tool_use_id", () => {
+    for (const [f, t] of Object.entries(COMMON)) expect(typeof cc[f], f).toBe(t);
+    expect(cc["hook_event_name"]).toBe("SessionStart");
+    expect(["startup", "resume", "clear", "compact", "fork"]).toContain(cc["source"]);
+    expect(typeof cc["model"]).toBe("string");
+    for (const absent of ["tool_name", "tool_input", "tool_use_id", "turn_id", "tool_response", "error"]) expect(absent in cc, absent).toBe(false);
+    expect(typeof cc["seconds_since_last_response"]).toBe("number");
+    expect(typeof cc["context_tokens"]).toBe("number");
+    expect(typeof cc["prompt_cache_likely_expired"]).toBe("boolean");
+    expect(typeof cc["estimated_cache_write_usd"]).toBe("number");
+    const typed: hooks.SessionStartEvent = cc as unknown as hooks.SessionStartEvent;
+    expect(typed.source).toBe("resume");
+    expect(typed.permission_mode).toBeUndefined(); // "Not all events receive this field": the SessionStart example has none
+  });
+  it("Claude Code PermissionDenied: tool fields + tool_use_id + reason, sharing tool_use_id with the PreToolUse fixture so recordOutcome chains it", () => {
+    for (const [f, t] of Object.entries(COMMON)) expect(typeof denied[f], f).toBe(t);
+    expect(denied["hook_event_name"]).toBe("PermissionDenied");
+    expect(typeof denied["tool_name"]).toBe("string");
+    expect(typeof denied["tool_input"]).toBe("object");
+    expect(typeof denied["tool_use_id"]).toBe("string");
+    expect(typeof denied["reason"]).toBe("string");
+    expect(denied["tool_use_id"]).toBe(load("claude-code-pretooluse")["tool_use_id"]);
+    expect(denied["permission_mode"]).toBe("default");
+    for (const absent of ["tool_response", "error", "is_interrupt", "duration_ms", "turn_id", "model"]) expect(absent in denied, absent).toBe(false);
+    const typed: hooks.PermissionDeniedEvent = denied as unknown as hooks.PermissionDeniedEvent;
+    expect(typed.reason).toBe("Destructive command");
+  });
+  it("Codex SessionStart: session_id, nullable transcript_path, cwd, hook_event_name, source, permission_mode; no turn_id (turn-scoped), no tool fields", () => {
+    for (const f of ["session_id", "transcript_path", "cwd", "hook_event_name", "source", "permission_mode"]) expect(f in cx, f).toBe(true);
+    expect(["startup", "resume", "clear", "compact"]).toContain(cx["source"]);
+    expect(cx["source"]).not.toBe("fork"); // no fork under Codex
+    expect(["default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"]).toContain(cx["permission_mode"]);
+    for (const absent of ["turn_id", "tool_name", "tool_input", "tool_use_id", "prompt_id", "scratchpad_dir"]) expect(absent in cx, absent).toBe(false);
+    const typed: hooks.CodexSessionStartEvent = cx as unknown as hooks.CodexSessionStartEvent;
+    expect(typed.model).toBeUndefined(); // the page's example omits it [H]; the parser treats it as optional
+    // @ts-expect-error turn_id is turn-scoped and omitted from CodexSessionStartEvent (the type pins that)
+    const noTurn: string = typed.turn_id;
+    expect(noTurn).toBeUndefined();
+  });
+  it("the heartbeat constants are what the report discriminates on (tool, rule id, builtin servers), and the denial errorClass names auto mode and is what toOutcome(PermissionDenied) emits", () => {
+    expect(hooks.HOOK_EVENT_NAMES).toContain("SessionStart");
+    expect(hooks.CODEX_HOOK_EVENT_NAMES).toContain("SessionStart");
+    expect(hooks.CODEX_UNUSED_EVENTS).toEqual(["PermissionRequest"]);
+    // the literal values are the contract the report (Package B) keys on; a rename here would silently break its findings
+    expect(HEARTBEAT_TOOL).toBe("SessionStart"); expect(HEARTBEAT_RULE_ID).toBe("heartbeat:session-start");
+    expect(hooks.BUILTIN_SERVERS).toEqual({ "claude-code": "builtin:claude-code", codex: "builtin:codex" });
+    expect(PERMISSION_DENIED_ERROR_CLASS).toBe("permission-denied:auto-mode");
+    const denied = hooks.parseHookInput(JSON.stringify(load("claude-code-permissiondenied")), "claude-code");
+    expect(hooks.toOutcome(denied as hooks.AnyOutcomeEvent, "claude-code")).toEqual({ status: "blocked", errorClass: PERMISSION_DENIED_ERROR_CLASS });
   });
 });
 

@@ -2,7 +2,9 @@ import type { DateRange } from "../types/index.js";
 import type { LedgerStore } from "../ledger/contract.js";
 import { checkedRange, findHandoffs, renderReport, HANDOFF_RECONCILE_GRACE_MS } from "./render.js";
 export interface ReportFiles { pdfPath: string; csvPath: string; }
-export function generateReport(ledger: LedgerStore, range: DateRange, outDir: string): Promise<ReportFiles> { return renderReport(ledger, range, outDir); }
+export type AnchorStatus = "head" | "ancestor" | "missing" | "mismatch" | "untrusted";
+export interface ReportContext { anchor?: { status: AnchorStatus; latest: { hash: string; at: string } | null } }
+export function generateReport(ledger: LedgerStore, range: DateRange, outDir: string, context?: ReportContext): Promise<ReportFiles> { return renderReport(ledger, range, outDir, context); }
 
 /**
  * Reconciliation of `handoff-to-proxy` records (Codex local mode, ADR-006, spec v2.1 §6/§7). Every hook intent record

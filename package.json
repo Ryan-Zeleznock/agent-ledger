@@ -4,10 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "vitest run",
+    "test": "npm run test:unit && npm run test:timing",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json && chmod +x dist/cli/main.js",
-    "check": "npm run typecheck && npm test && npm run build"
+    "check": "npm run typecheck && npm test && npm run build",
+    "test:unit": "vitest run --exclude \"test/timing/**\" --reporter=verbose",
+    "test:timing": "vitest run test/timing/ --no-file-parallelism --maxWorkers=1 --reporter=verbose"
   },
   "devDependencies": {
     "@types/node": "26.6.3",

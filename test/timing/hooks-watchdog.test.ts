@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -8,10 +8,10 @@ import { stringify } from "yaml";
 import {
   DEFAULT_MAX_OUTPUT_BYTES, HOOK_AGENTS, MAX_MAX_OUTPUT_BYTES, MAX_STDIN_BYTES, MIN_MAX_OUTPUT_BYTES, WATCHDOG_DEADLINE_AT_ENV,
   WATCHDOG_DEADLINE_ENV, WATCHDOG_MIN_MARGIN_MS, WATCHDOG_WRITE_BUDGET_MS,
-} from "../src/hooks/contract.js";
-import { WATCHDOG_AGENTS } from "../src/hooks/watchdog.js";
-import { createLedger } from "../src/ledger/contract.js";
-import { ARGS_HMAC_PREFIX } from "../src/pipeline/contract.js";
+} from "../../src/hooks/contract.js";
+import { WATCHDOG_AGENTS } from "../../src/hooks/watchdog.js";
+import { createLedger } from "../../src/ledger/contract.js";
+import { ARGS_HMAC_PREFIX } from "../../src/pipeline/contract.js";
 
 /**
  * REAL-process watchdog tests (spec §7; Astra P1/P2 reviews 2026-09-29/30). Every case spawns the compiled entry point
@@ -25,8 +25,8 @@ const EVENT = readFileSync("test/fixtures/claude-code-pretooluse.json", "utf8");
 const DEADLINE = 1_500; const TIMEOUT_S = 4; // fast profile for tests: 1500 + 2000 <= 4000
 
 interface Run { stdout: string; stderr: string; code: number | null; signal: string | null; ms: number; }
-interface RunOpts { stdin?: string | Buffer | null; env?: Record<string, string>; harness?: boolean; keepStdinOpen?: boolean; deadline?: number; timeoutS?: number; agent?: string; extra?: string[]; started?: (c: ChildProcess) => void; noRead?: boolean; }
-const live: ChildProcess[] = [];
+interface RunOpts { stdin?: string | Buffer | null; env?: Record<string, string>; harness?: boolean; keepStdinOpen?: boolean; deadline?: number; timeoutS?: number; agent?: string; extra?: string[]; started?: (c: ChildProcess) => void; noRead?: boolean; hardTimeoutMs?: number; }
+const live: (() => void)[] = [];
 const codes: number[] = [];
 
 function watchdog(handlerArgs: string[], o: RunOpts = {}): Promise<Run> {
@@ -38,19 +38,45 @@ function watchdog(handlerArgs: string[], o: RunOpts = {}): Promise<Run> {
 }
 function raw(args: string[], o: RunOpts = {}): Promise<Run> {
   const started = Date.now();
-  return new Promise((res) => {
-    const c = spawn(process.execPath, args, { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, ...o.env } });
-    live.push(c);
-    o.started?.(c);
-    let stdout = ""; let stderr = "";
-    // noRead: the harness never drains the watchdog's stdout (the full-pipe case); the verdict is observed at `exit`.
+  return new Promise((res, rej) => {
+    // Each invocation owns a PID file even if its test does not request one. The watchdog's
+    // detached handler survives killing only the watchdog; reap it on timeout/assertion abort.
+    const pidFile = o.env?.HOOKS_TEST_PID_FILE ?? join(dir, `owned-${randomBytes(8).toString("hex")}`);
+    const c = spawn(process.execPath, args, { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, ...o.env, HOOKS_TEST_PID_FILE: pidFile } });
+    let stdout = "", stderr = "", settled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const cleanup = () => {
+      const owned = existsSync(pidFile) ? readFileSync(pidFile, "utf8").trim().split("\n").map(Number) : [];
+      const named = [...stderr.matchAll(/^(?:pid|escapee):(\d+)$/gm)].map(m => Number(m[1]));
+      for (const pid of new Set([...owned, ...named])) {
+        if (!Number.isSafeInteger(pid) || pid <= 1) continue;
+        try { process.kill(-pid, "SIGKILL"); } catch { /* already gone or not a group leader */ }
+        try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+      }
+      if (c.exitCode === null && c.signalCode === null) c.kill("SIGKILL");
+      c.stdin.destroy(); c.stdout.destroy(); c.stderr.destroy();
+      clearTimeout(timer);
+      if (!settled) { settled = true; rej(new Error("test runner cancelled before child pipes closed")); }
+    };
+    live.push(cleanup);
+    timer = setTimeout(() => {
+      if (!settled) { settled = true; rej(new Error(`test runner hard deadline (${o.hardTimeoutMs ?? 15_000} ms): ${args[0]}`)); }
+      cleanup();
+    }, o.hardTimeoutMs ?? 15_000);
+    const finish = (code: number | null, signal: NodeJS.Signals | null) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer);
+      if (code !== null) codes.push(code);
+      res({ stdout, stderr, code, signal, ms: Date.now() - started });
+    };
+    c.once("error", error => { if (!settled) { settled = true; rej(error); } cleanup(); });
     if (!o.noRead) c.stdout.on("data", (d: Buffer) => { stdout += d.toString("utf8"); });
     c.stderr.on("data", (d: Buffer) => { stderr += d.toString("utf8"); });
     c.stdin.on("error", () => { /* EPIPE when the watchdog denies before reading */ });
+    if (o.noRead) c.once("exit", (code, signal) => { setTimeout(() => { stdout = c.stdout.read()?.toString("utf8") ?? ""; finish(code, signal); }, 50); });
+    else c.once("close", finish);
+    o.started?.(c);
     if (!o.keepStdinOpen) c.stdin.end(o.stdin === null ? "" : o.stdin ?? EVENT);
-    const finish = (code: number | null, signal: NodeJS.Signals | null) => { if (code !== null) codes.push(code); res({ stdout, stderr, code, signal, ms: Date.now() - started }); };
-    if (o.noRead) c.on("exit", (code, signal) => { setTimeout(() => { stdout = c.stdout.read()?.toString("utf8") ?? ""; finish(code, signal); }, 50); });
-    else c.on("close", finish);
   });
 }
 const out = (r: Run) => JSON.parse(r.stdout) as { hookSpecificOutput: { hookEventName: string; permissionDecision: string; permissionDecisionReason: string } };
@@ -73,7 +99,8 @@ async function eventuallyGone(list: number[]): Promise<void> {
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "agent-ledger-hooks-")); });
-afterEach(() => { for (const c of live) if (c.exitCode === null && c.signalCode === null) c.kill("SIGKILL"); live.length = 0; rmSync(dir, { recursive: true, force: true }); });
+function cleanupRuns(): void { for (const cleanup of live.splice(0)) cleanup(); }
+afterEach(() => { cleanupRuns(); rmSync(dir, { recursive: true, force: true }); });
 
 describe("watchdog: built by construction", () => {
   it("compiled entry point, harness and handler exist", () => {
@@ -291,13 +318,13 @@ describe("watchdog: exit vs close, group kill, PGID (Astra re-review 2026-09-29/
       for (const pid of owned) { if (alive(pid)) process.kill(pid, "SIGKILL"); }
     }
   }, 10_000);
-  it("the handler is its own process group leader (spawned detached: getpgid(child) === child.pid)", async () => {
+  it("the detached handler has a process group addressed by its own pid, and the watchdog reaps it", async () => {
     const pidFile = join(dir, "pids");
     const done = watchdog(["pgid"], { env: { HOOKS_TEST_PID_FILE: pidFile } });
     for (let i = 0; i < 60 && !existsSync(pidFile); i++) await sleep(25);
     const pid = Number(readFileSync(pidFile, "utf8").trim());
-    const pgid = Number(execFileSync("ps", ["-o", "pgid=", "-p", String(pid)], { encoding: "utf8" }).trim());
-    expect(pgid).toBe(pid);
+    // POSIX kill(-pid, 0) checks that the handler's group exists without shelling out to ps.
+    expect(() => process.kill(-pid, 0)).not.toThrow();
     const r = await done;
     expectDeny(r, /^watchdog:deadline:handler$/);
     await eventuallyGone([pid]);
@@ -447,8 +474,8 @@ describe("watchdog + real handler (what Astra's `hook` command does), spec §7 t
     expectDeny(r, /^watchdog:init:exit-1$/);
     expect(r.stderr).toMatch(/impersonates a builtin namespace/);
   }, 15_000);
-  it("createPipeline under the watchdog: a Slack timeoutMs that breaks the clocks fails init → init:exit-1; hook-ask constructs (deadline env present)", async () => {
-    expectDeny(await watchdog(["pipeline-init", "slack-timeout"], { deadline: 3_000, timeoutS: 6 }), /^watchdog:init:exit-1$/);
+  it("createPipeline under the watchdog: a Slack timeoutMs that breaks the clocks constructs and is DENIED by decide() → handler-deny, exit 2 (ADR-011; Astra 1c P2 #3); hook-ask allows (deadline env present)", async () => {
+    expectDeny(await watchdog(["pipeline-init", "slack-timeout"], { deadline: 3_000, timeoutS: 6 }), /slack timeoutMs breaks the hook clocks.*approval-not-below-deadline/, /^watchdog:handler-deny$/);
     const ok = await watchdog(["pipeline-init", "hook-ask"], { deadline: 3_000, timeoutS: 6 });
     expect(ok.code).toBe(0);
   }, 15_000);
@@ -459,3 +486,26 @@ afterAll(() => {
   expect(codes.length).toBeGreaterThan(50);
   expect(new Set(codes)).toEqual(new Set([0, 2]));
 });
+
+
+it("runner cleanup reaps a detached handler after an assertion aborts before the watchdog deadline", async () => {
+  const pidFile = join(dir, "abort-pids");
+  const done = watchdog(["pgid"], { deadline: 6_000, timeoutS: 10, env: { HOOKS_TEST_PID_FILE: pidFile } }).catch(() => undefined);
+  for (let i = 0; i < 80 && !existsSync(pidFile); i++) await sleep(25);
+  const pid = Number(readFileSync(pidFile, "utf8").trim());
+  try {
+    cleanupRuns();
+    await eventuallyGone([pid]);
+  } finally {
+    try { process.kill(-pid, "SIGKILL"); } catch { /* gone */ }
+    await done;
+  }
+}, 10_000);
+
+it("runner deadline rejects and reaps a detached child holding pipes after its parent exits", async () => {
+  const pidFile = join(dir, "pipe-pids");
+  const script = `const {spawn}=require('node:child_process'); const {writeFileSync}=require('node:fs'); const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'inherit'}); writeFileSync(process.env.HOOKS_TEST_PID_FILE,String(c.pid)); c.unref(); process.exit(0);`;
+  await expect(raw(["-e", script], { hardTimeoutMs: 1_500, env: { HOOKS_TEST_PID_FILE: pidFile } })).rejects.toThrow("test runner hard deadline");
+  const pid = Number(readFileSync(pidFile, "utf8").trim());
+  await eventuallyGone([pid]);
+}, 10_000);

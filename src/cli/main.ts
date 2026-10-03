@@ -1,19 +1,24 @@
 #!/usr/bin/env node
+import { spawn } from "node:child_process";
 import { randomBytes, createHash } from "node:crypto";
 import { constants, realpathSync } from "node:fs";
 import { mkdir, open, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import canonicalize from "canonicalize";
 import * as hooks from "../hooks/contract.js";
 import { createPipeline, type PipelineDeps } from "../pipeline/contract.js";
-import { createLedger } from "../ledger/contract.js";
+import { createLedger, type LedgerStore } from "../ledger/contract.js";
 import { createIdentity } from "../identity/contract.js";
 import { loadRegistry } from "../policy/contract.js";
-import { createAnchor } from "../anchor/contract.js";
-import { generateReport, HANDOFF_RECONCILE_GRACE_MS } from "../report/contract.js";
+import { createAnchor, type Anchor, type AnchorEntry } from "../anchor/contract.js";
+import { generateReport, HANDOFF_RECONCILE_GRACE_MS, type AnchorStatus, type ReportContext, type ReportFiles } from "../report/contract.js";
 import { checkedRange } from "../report/render.js";
-import type { HookAgent, VerifyResult } from "../types/index.js";
+import type { DateRange, HookAgent, SessionHeartbeat, VerifyResult } from "../types/index.js";
+
+// pin 6 (Slice 1c): the report context is defined once, in src/report/contract.ts.
+export type { AnchorStatus, ReportContext };
 
 /** The CLI is the process composition root; ordering inside a call belongs to the pipeline. */
 export interface CliDeps {
@@ -25,13 +30,16 @@ export interface CliDeps {
   createIdentity: typeof createIdentity;
   loadRegistry: typeof loadRegistry;
   createAnchor: typeof createAnchor;
-  generateReport: typeof generateReport;
+  generateReport: (ledger: LedgerStore, range: DateRange, outDir: string, context?: ReportContext) => Promise<ReportFiles>;
   hooks: {
     parseHookInput(raw: string, agent: HookAgent): hooks.AnyHookEvent;
     toIncomingCall: typeof hooks.toIncomingCall;
+    toHeartbeat: typeof hooks.toHeartbeat;
     toOutcome: typeof hooks.toOutcome;
     formatPreToolUseOutput: typeof hooks.formatPreToolUseOutput;
   };
+  /** What the session-start handler measures about its own process (pin 5); injected so unit tests need no watchdog. */
+  heartbeatProbe(agent: HookAgent): Promise<hooks.HeartbeatProbe>;
   registryExamplePath: string;
 }
 const here = dirname(fileURLToPath(import.meta.url));
@@ -44,16 +52,94 @@ async function stdin(): Promise<string> {
   }
   return Buffer.concat(chunks).toString("utf8");
 }
+
+/** The watchdog self-test's clocks (pin 5): a 1 s deadline under a 3 s hook timeout, and a 3 s hard cap on the whole probe. */
+export const WATCHDOG_SELF_TEST = { deadlineMs: 1_000, timeoutS: 3, capMs: 3_000 } as const;
+const isErrno = (e: unknown, code: string) => typeof e === "object" && e !== null && (e as { code?: string }).code === code;
+/** After the watchdog EXITS, how long its pipes may stay open (a descendant holding them) before the probe gives up on `close`. */
+export const WATCHDOG_SELF_TEST_CLOSE_GRACE_MS = 500;
+/**
+ * Runs the REAL compiled watchdog once with a trivial handler that prints one valid allow line (pin 5): exit 0 and
+ * output that passes the hooks module's STRICT `validateHandlerOutput` with decision `allow` → "ok"; ENOENT on the
+ * watchdog file → "missing"; anything else (non-zero exit; output the validator rejects: missing reason, extra or
+ * duplicate keys, several values, a deny/ask, oversized, empty; the cap; pipes still held after exit; a spawn failure)
+ * → "failed" (Astra 1c P2 #2, 2026-10-03). Its stdout and stderr are captured, never ours: the handler prints nothing.
+ *
+ * Lifetime (Astra 1c P2 #1): the watchdog is spawned as its own process-group leader; every terminal path kills that
+ * group if it is still running, destroys our three pipe handles and unrefs the child, so a descendant that inherited
+ * the watchdog's stdio (a preload, a broken entry point) can neither keep this process's event loop alive past the cap
+ * nor outlive the probe. Node: `close` fires only once ALL stdio streams close, and other processes may share them
+ * (nodejs.org/api/child_process.html#event-close, read 2026-10-03).
+ */
+async function watchdogSelfTest(agent: HookAgent): Promise<SessionHeartbeat["watchdogCheck"]> {
+  const watchdog = resolve(here, "../hooks/watchdog-main.js");
+  try { if (!(await stat(watchdog)).isFile()) return "failed"; } catch (e) { return isErrno(e, "ENOENT") ? "missing" : "failed"; }
+  const allow = JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", permissionDecisionReason: "agent-ledger: watchdog self-test" } });
+  const argv = [watchdog, "--agent", agent, "--deadline-ms", String(WATCHDOG_SELF_TEST.deadlineMs), "--timeout-s", String(WATCHDOG_SELF_TEST.timeoutS),
+    "--", process.execPath, "-e", `process.stdout.write(${JSON.stringify(allow)})`];
+  return new Promise((done) => {
+    let settled = false; let out = ""; let overflow = false; let exitCode: number | null | undefined;
+    const timers: NodeJS.Timeout[] = [];
+    let child: ReturnType<typeof spawn> | undefined;
+    const release = () => {
+      for (const t of timers) clearTimeout(t);
+      if (!child) return;
+      // The group outlives its leader while any member runs (POSIX keeps the pgid reserved), so this also reaps a
+      // descendant left behind by a watchdog that exited normally; ESRCH means nothing is left.
+      if (child.pid !== undefined) { try { process.kill(-child.pid, "SIGKILL"); } catch { /* nothing left in the group */ } }
+      if (child.exitCode === null && child.signalCode === null) { try { child.kill("SIGKILL"); } catch { /* already gone */ } }
+      for (const s of [child.stdin, child.stdout, child.stderr]) { try { s?.destroy(); } catch { /* already closed */ } }
+      try { child.unref(); } catch { /* not a handle any more */ }
+    };
+    const finish = (result: SessionHeartbeat["watchdogCheck"]) => { if (settled) return; settled = true; release(); done(result); };
+    const verdict = (): SessionHeartbeat["watchdogCheck"] => {
+      if (exitCode !== 0 || overflow) return "failed";
+      const v = hooks.validateHandlerOutput(out, agent);
+      return v.ok && v.payload.hookSpecificOutput.permissionDecision === "allow" ? "ok" : "failed";
+    };
+    try { child = spawn(process.execPath, argv, { stdio: ["pipe", "pipe", "pipe"], detached: true }); } catch { finish("failed"); return; }
+    timers.push(setTimeout(() => finish("failed"), WATCHDOG_SELF_TEST.capMs));
+    child.stdout?.on("data", (d: Buffer) => { if (overflow) return; out += d.toString("utf8"); if (Buffer.byteLength(out, "utf8") > hooks.MAX_MAX_OUTPUT_BYTES) overflow = true; });
+    child.stderr?.resume();
+    child.stdin?.on("error", () => { /* the watchdog may exit before reading */ });
+    child.stdin?.end("{}");
+    child.on("error", () => finish("failed"));
+    // `exit` says the watchdog is gone; `close` additionally needs every pipe closed. A descendant can hold the pipes open
+    // indefinitely, so after `exit` the probe waits a short grace for `close` and then calls the probe failed.
+    child.on("exit", (code) => { exitCode = code; timers.push(setTimeout(() => finish("failed"), WATCHDOG_SELF_TEST_CLOSE_GRACE_MS)); });
+    child.on("close", (code) => { if (exitCode === undefined) exitCode = code; finish(verdict()); });
+  });
+}
+async function heartbeatProbe(agent: HookAgent): Promise<hooks.HeartbeatProbe> {
+  // The NODE_OPTIONS VALUE is never read into the record: only whether it is set (pin 1).
+  return { interpreter: realpathSync(process.execPath), nodeOptionsSet: (process.env["NODE_OPTIONS"] ?? "") !== "", watchdogCheck: await watchdogSelfTest(agent) };
+}
+
 const defaults: CliDeps = {
   stdin, stdout: s => { process.stdout.write(s); }, stderr: s => { process.stderr.write(s); },
-  createPipeline, createLedger, createIdentity, loadRegistry, createAnchor, generateReport, hooks,
+  createPipeline, createLedger, createIdentity, loadRegistry, createAnchor, generateReport, hooks, heartbeatProbe,
   registryExamplePath: resolve(here, "../../policies/tools.example.yaml"),
 };
 class UsageError extends Error {}
-const usage = "Usage: agent-ledger init [--dir d] | hook --agent claude-code|codex --event pre|post [--dir d] | verify [--dir d] | report --from RFC3339 --to RFC3339 --out d [--dir d] | install-hooks --print [--dir d]";
+const usage = "Usage: agent-ledger init [--dir d] | hook --agent claude-code|codex --event pre|post|session-start|denied [--dir d] | anchor [--dir d] | verify [--dir d] | report --from RFC3339 --to RFC3339 --out d [--dir d] | install-hooks --print [--dir d]";
 // POSIX shell quoting is required: hook commands are shell strings, not argv arrays.
 const quote = (value: string) => "'" + value.replace(/'/g, "'\\''") + "'";
 const command = (args: string[]) => args.map((v, i) => i > 0 && /^[a-zA-Z0-9_-]+$/.test(v) ? v : quote(v)).join(" ");
+
+/** The `--event` flags and the hook event names each one accepts (pin 5). `pre` is the only one that decides and runs under the watchdog. */
+export const HOOK_EVENT_FLAGS = { pre: ["PreToolUse"], post: ["PostToolUse", "PostToolUseFailure"], "session-start": ["SessionStart"], denied: ["PermissionDenied"] } as const;
+type HookEventFlag = keyof typeof HOOK_EVENT_FLAGS;
+const isHookEventFlag = (v: string): v is HookEventFlag => Object.hasOwn(HOOK_EVENT_FLAGS, v);
+/** Record-only handlers never block the agent: their failures go to stderr (one fixed line, never exception text) and exit 0. */
+const RECORD_ONLY_FAILURE: Record<Exclude<HookEventFlag, "pre">, string> = {
+  post: "agent-ledger: post outcome was not recorded; check local configuration and ledger\n",
+  "session-start": "agent-ledger: session heartbeat was not recorded; check local configuration and ledger\n",
+  denied: "agent-ledger: denial outcome was not recorded; check local configuration and ledger\n",
+};
+
+export const ANCHOR_NOTE = "This anchor is one line in a local file (anchors.jsonl) that this machine's owner can edit. Copy `line` off-machine now (git, e-mail, S3) for it to mean anything: it detects tail truncation only relative to the copy you keep. It does not establish enforcement.";
+const VERIFY_NOTE = "Local file anchors are editable on this machine. An ancestor anchors only a prefix; missing means no truncation check. Verification does not establish enforcement.";
+const ALL_TIME: DateRange = { from: "0100-01-01T00:00:00.000Z", to: "9999-12-31T23:59:59.999Z" };
 
 async function privateFile(path: string, maxBytes: number): Promise<Buffer> {
   const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -83,23 +169,41 @@ async function init(dir: string, deps: CliDeps): Promise<void> {
 
 function printHooks(dir: string): string {
   const main = resolve(here, "main.js"), watchdog = resolve(here, "../hooks/watchdog-main.js");
-  const handler = (event: string) => [process.execPath, main, "hook", "--agent", "claude-code", "--event", event, "--dir", dir];
+  const handler = (event: HookEventFlag) => [process.execPath, main, "hook", "--agent", "claude-code", "--event", event, "--dir", dir];
   const pre = [process.execPath, watchdog, "--agent", "claude-code", "--deadline-ms", String(hooks.DEFAULT_DEADLINE_MS), "--timeout-s", String(hooks.HOOK_TIMEOUT_S), "--", ...handler("pre")];
   const entry = (argv: string[]) => [{ matcher: "", hooks: [{ type: "command", command: command(argv), timeout: hooks.HOOK_TIMEOUT_S }] }];
-  return JSON.stringify({ hooks: { PreToolUse: entry(pre), PostToolUse: entry(handler("post")), PostToolUseFailure: entry(handler("post")) } }, null, 2) + "\n";
+  // Only PreToolUse decides, so only it runs under the watchdog; the four record-only events are direct commands (pin 5).
+  return JSON.stringify({ hooks: { PreToolUse: entry(pre), PostToolUse: entry(handler("post")), PostToolUseFailure: entry(handler("post")), SessionStart: entry(handler("session-start")), PermissionDenied: entry(handler("denied")) } }, null, 2) + "\n";
+}
+
+/**
+ * The one anchor-status computation `verify` and `report` share (pin 5): `untrusted` when the chain failed; otherwise
+ * `missing` (no anchor, or the genesis "0"), `head` (latest anchor == observed head), `ancestor` (latest anchor is an
+ * earlier record's hash, so only that prefix is anchored) or `mismatch` (latest anchor is nowhere in the chain).
+ * `anchor.latest()` throws on a torn anchor file; that is an exit 1, never a status.
+ */
+export async function anchorState(ledger: LedgerStore, anchor: Anchor, head: string | null, chainOk: boolean): Promise<{ status: AnchorStatus; latest: AnchorEntry | null }> {
+  const latest = await anchor.latest();
+  let status: AnchorStatus = "missing";
+  if (!chainOk) status = "untrusted";
+  else if (latest) {
+    status = latest.hash === "0" ? "missing" : latest.hash === head ? "head" : "mismatch";
+    if (status === "mismatch") for await (const record of ledger.read(ALL_TIME)) if (record.hash === latest.hash) { status = "ancestor"; break; }
+  }
+  return { status, latest };
 }
 
 /** Returns an exit code; never exits the embedding test process. Only hook JSON goes to hook stdout. */
 export async function main(argv: string[] = process.argv.slice(2), overrides: Partial<CliDeps> = {}): Promise<number> {
   const deps = { ...defaults, ...overrides };
-  let post = false;
+  let event: HookEventFlag | undefined;
   try {
     const name = argv[0];
     const options: Record<string, { type: "string" | "boolean" }> = { dir: { type: "string" } };
     if (name === "hook") Object.assign(options, { agent: { type: "string" }, event: { type: "string" } });
     else if (name === "report") Object.assign(options, { from: { type: "string" }, to: { type: "string" }, out: { type: "string" } });
     else if (name === "install-hooks") options.print = { type: "boolean" };
-    else if (name !== "init" && name !== "verify") throw new UsageError(usage);
+    else if (name !== "init" && name !== "verify" && name !== "anchor") throw new UsageError(usage);
     let values: ReturnType<typeof parseArgs>["values"];
     try {
       const parsed = parseArgs({ args: argv.slice(1), options, strict: true, allowPositionals: false, tokens: true });
@@ -122,9 +226,10 @@ export async function main(argv: string[] = process.argv.slice(2), overrides: Pa
     }
     let agent: HookAgent = "claude-code";
     if (name === "hook") {
-      const a = string("agent"), event = string("event");
-      if ((a !== "claude-code" && a !== "codex") || (event !== "pre" && event !== "post")) throw new UsageError(usage);
-      agent = a; post = event === "post";
+      const a = string("agent"), e = string("event");
+      // `denied` is Claude Code's auto-mode PermissionDenied; Codex has no such event (pin 5): a usage error, not a silent exit.
+      if ((a !== "claude-code" && a !== "codex") || !isHookEventFlag(e) || (a === "codex" && e === "denied")) throw new UsageError(usage);
+      agent = a; event = e;
     }
     // Validate report arguments before touching a ledger or producing output.
     const range = name === "report" ? { from: string("from"), to: string("to") } : undefined;
@@ -134,16 +239,23 @@ export async function main(argv: string[] = process.argv.slice(2), overrides: Pa
     }
     if (!(await stat(join(dir, "ledger"))).isDirectory()) throw new Error("Initialize first");
     const ledger = deps.createLedger("jsonl", join(dir, "ledger", "records.jsonl"));
+    const anchorsPath = join(dir, "anchors.jsonl");
     if (name === "report") {
-      // Capture the report's own verification result without changing ReportFiles or
-      // independently verifying a potentially different ledger state for stdout.
+      // The anchor status is computed exactly as `verify` does (own head + own chain pass) and handed to the report
+      // (pin 6). The report then verifies again itself; stdout carries THAT result, so the pack and the exit code agree.
+      let before: string | null = null;
+      try { before = await ledger.head(); } catch { /* a damaged tail is an untrusted chain below */ }
+      const own = await ledger.verify();
+      if (own.ok && before === null) throw new Error("Unable to capture ledger head");
+      const anchor = await anchorState(ledger, deps.createAnchor("file", anchorsPath), before, own.ok);
       let chain: VerifyResult | undefined;
       const files = await deps.generateReport({
         append: record => ledger.append(record), head: () => ledger.head(), read: range => ledger.read(range),
         verify: async () => { chain = await ledger.verify(); return chain; },
-      }, range!, outDir!);
+      }, range!, outDir!, { anchor });
       if (!chain) throw new Error("Report did not verify the ledger");
-      deps.stdout(JSON.stringify({ ...files, htmlPath: join(outDir!, "report.html"), chain }) + "\n");
+      if (own.ok && await ledger.head() !== before) throw new Error("Ledger changed; retry");
+      deps.stdout(JSON.stringify({ ...files, htmlPath: join(outDir!, "report.html"), chain, anchor }) + "\n");
       return chain.ok ? 0 : 1;
     }
     if (name === "verify") {
@@ -151,22 +263,32 @@ export async function main(argv: string[] = process.argv.slice(2), overrides: Pa
       try { before = await ledger.head(); } catch { /* verify still reports a damaged tail */ }
       const chain = await ledger.verify();
       if (chain.ok && before === null) throw new Error("Unable to capture ledger head");
-      const latest = await deps.createAnchor("file", join(dir, "anchors.jsonl")).latest();
-      let status = "missing";
-      if (!chain.ok) status = "untrusted";
-      else if (latest) {
-        status = latest.hash === "0" ? "missing" : latest.hash === before ? "head" : "mismatch";
-        if (status === "mismatch") for await (const record of ledger.read({ from: "0100-01-01T00:00:00.000Z", to: "9999-12-31T23:59:59.999Z" })) {
-          if (record.hash === latest.hash) { status = "ancestor"; break; }
-        }
-      }
+      const anchor = await anchorState(ledger, deps.createAnchor("file", anchorsPath), before, chain.ok);
       if (chain.ok && await ledger.head() !== before) throw new Error("Ledger changed; retry");
-      deps.stdout(JSON.stringify({ chain, head: before, anchor: { status, latest }, note: "Local file anchors are editable on this machine. An ancestor anchors only a prefix; missing means no truncation check. Verification does not establish enforcement." }) + "\n");
-      return !chain.ok || status === "mismatch" ? 1 : status === "missing" ? 3 : 0;
+      deps.stdout(JSON.stringify({ chain, head: before, anchor, note: VERIFY_NOTE }) + "\n");
+      return !chain.ok || anchor.status === "mismatch" ? 1 : anchor.status === "missing" ? 3 : 0;
+    }
+    if (name === "anchor") {
+      // pin 5: anchor the CURRENT head, and only a head the chain vouches for. Never changes the ledger. Re-anchoring the
+      // same head appends another line on purpose (a time series of "the chain ended here at this time").
+      let before: string | null = null;
+      try { before = await ledger.head(); } catch { /* a damaged tail is a chain failure below */ }
+      const chain = await ledger.verify();
+      const refuse = (reason: "chain-failed" | "empty-ledger" | "ledger-changed") => { deps.stdout(JSON.stringify({ anchored: false, reason, chain }) + "\n"); return 1; };
+      if (!chain.ok) return refuse("chain-failed");
+      if (before === null) throw new Error("Unable to capture ledger head");
+      if (before === "0") return refuse("empty-ledger");
+      if (await ledger.head() !== before) return refuse("ledger-changed");
+      const anchor = deps.createAnchor("file", anchorsPath);
+      const previous = await anchor.latest(); // a torn anchor file throws here (exit 1); the anchor module never truncates
+      const entry: AnchorEntry = { hash: before, at: new Date().toISOString() };
+      await anchor.write(entry);
+      deps.stdout(JSON.stringify({ anchored: true, entry, line: canonicalize(entry), previous, chain, path: anchorsPath, note: ANCHOR_NOTE }) + "\n");
+      return 0;
     }
     const raw = await deps.stdin();
     const ev = deps.hooks.parseHookInput(raw, agent);
-    if ((ev.hook_event_name === "PreToolUse") === post) throw new Error("Hook event mismatch");
+    if (!(HOOK_EVENT_FLAGS[event!] as readonly string[]).includes(ev.hook_event_name)) throw new Error("Hook event mismatch");
     const key = await privateFile(join(dir, "hmac.key"), 32);
     if (key.length !== 32) throw new Error("Invalid HMAC key");
     const value = (await privateFile(join(dir, "credential"), 256)).toString("utf8").trim();
@@ -177,30 +299,28 @@ export async function main(argv: string[] = process.argv.slice(2), overrides: Pa
       identity, registry, ledger, argsHmacKey: key, approvals: { kind: "hook-ask" as const }, hookAgent: agent,
       upstream: { async execute() { throw new Error("Decide-only CLI cannot execute tools"); }, async listTools() { throw new Error("Decide-only CLI cannot list tools"); }, async close() {} },
     } satisfies PipelineDeps;
-    // Coordinator decision (2026-09-30, review #3): retain this shim instead of changing
-    // the pipeline contract; the recordOutcome-only construction question stays open for Ryan.
-    // Post hooks run directly. Supply construction-only timing for the frozen pipeline init check;
-    // no pre decision is made here, and no watchdog enforcement is claimed for a post event.
-    const priorDeadline = process.env[hooks.WATCHDOG_DEADLINE_AT_ENV];
-    if (post) process.env[hooks.WATCHDOG_DEADLINE_AT_ENV] = String(Date.now() + hooks.DEFAULT_DEADLINE_MS);
-    let pipeline: ReturnType<typeof createPipeline>;
-    try { pipeline = deps.createPipeline(pipelineDeps); }
-    finally {
-      if (post) {
-        if (priorDeadline === undefined) delete process.env[hooks.WATCHDOG_DEADLINE_AT_ENV];
-        else process.env[hooks.WATCHDOG_DEADLINE_AT_ENV] = priorDeadline;
-      }
-    }
-    if (ev.hook_event_name !== "PreToolUse") await pipeline.recordOutcome(ev.tool_use_id, deps.hooks.toOutcome(ev, agent));
-    else {
-      const decision = await pipeline.decide(deps.hooks.toIncomingCall(ev, { kind: "local", value }, agent));
+    // ADR-011: construction reads no watchdog clock, so the record-only handlers (post, session-start, denied) need no
+    // deadline shim, and `pre` started outside the watchdog can only produce a deny line (decide() checks the deadline).
+    const pipeline = deps.createPipeline(pipelineDeps);
+    const credential = { kind: "local" as const, value };
+    if (event === "pre") {
+      const decision = await pipeline.decide(deps.hooks.toIncomingCall(ev as hooks.AnyPreToolUseEvent, credential, agent));
       deps.stdout(deps.hooks.formatPreToolUseOutput(decision, agent).trimEnd() + "\n");
+    } else if (event === "session-start") {
+      // Configuration is checked above BEFORE the probe spawns anything. Nothing is written to stdout on this path:
+      // Claude Code adds SessionStart stdout to Claude's context (hooks reference, read 2026-10-01).
+      const probe = await deps.heartbeatProbe(agent);
+      await pipeline.recordHeartbeat(deps.hooks.toHeartbeat(ev as hooks.AnySessionStartEvent, agent, probe), credential);
+    } else {
+      const out = ev as hooks.AnyOutcomeEvent;
+      await pipeline.recordOutcome(out.tool_use_id, deps.hooks.toOutcome(out, agent));
     }
     return 0;
   } catch (error) {
     // Do not echo parser/registry exceptions: they may contain raw tool args or credentials.
-    deps.stderr(error instanceof UsageError ? usage + "\n" : post ? "agent-ledger: post outcome was not recorded; check local configuration and ledger\n" : "agent-ledger: command failed; check local configuration, permissions, output paths and ledger\n");
-    return post ? 0 : error instanceof UsageError ? 2 : 1;
+    const recordOnly = event !== undefined && event !== "pre" ? event : undefined;
+    deps.stderr(error instanceof UsageError ? usage + "\n" : recordOnly ? RECORD_ONLY_FAILURE[recordOnly] : "agent-ledger: command failed; check local configuration, permissions, output paths and ledger\n");
+    return recordOnly ? 0 : error instanceof UsageError ? 2 : 1;
   }
 }
 

@@ -12,3 +12,32 @@ The frozen API has no deployment-mode or collector provenance field. Exports con
 local visibility/best-effort gating and explain conditional server enforcement; they never infer it
 from tool names. Handoff correlation uses non-handoff MCP intents; provenance attestation is a
 future coordinated contract change, not a claim made by this implementation.
+
+
+Slice 1c Package B (pin-7 fixtures, `test/report-slice-1c.test.ts`):
+- [x] ADR-010 optional report context and all five anchor statuses plus omitted context
+- [x] Six ordered sections in HTML/PDF; CC6.1 and CC8.1 tool tables; CC7.2 heartbeat table
+- [x] Session-without-heartbeat findings use all history; pre-1c records excluded; launch warnings and orphan intent gaps
+- [x] Heartbeats excluded from tool/no-outcome counts and map only to CC7.2
+- [x] Every pinned evidence class, exact manual-denial caveat, appended CSV columns
+- [x] New-table HTML/CSV/PDF escaping, withheld-digest labels, repeated PDF table headers and fitting record blocks kept together
+- [ ] Ryan independently spot-checks the AICPA page citations ([V] scope, [H] mapping remain distinct)
+- [x] Coordinator runs merged Slice 1c e2e steps 8–10 on a real CLI-generated sandbox pack after cross-review → `test/e2e-slice-1c.test.ts` steps 8-10 (test engineer, 2026-10-03): pack content, CSV columns, DEMO order on a second sandbox; revert-check: dropping the pin 6 context argument in `src/cli/main.ts` fails 8, 9 and 10 ("not supplied") while 0-7 stay green
+
+Test-first evidence: pre-implementation focused run had 27 failing / 53 passing tests across the
+new report and redaction cases; after implementation the report + redaction suite passed 101/101.
+
+
+Fable review fixes (2026-10-03):
+- [x] #1 denied policy/approval + ok outcome: amended class and summary/monitoring/CSV anomalies, including prior-range intent
+- [x] #2 handoff + outcome without proxy is not an orphan; later proxy supersedes handoff
+- [x] #4 unknown blocked cause keeps a blank class with an explicit Vocabulary explanation
+- [x] #5 Unicode escapes never split on wrapped PDF text/heading/table boundaries
+- [x] #6 reproduce the old split-block false positive; per-page record boundaries, xref/stream/page-reference checks
+- [x] #7 heartbeat tool/server/rule consistency and visible mismatch findings
+- [x] #8 DEMO lets report create its private output directory and moves saved anchor JSON afterward
+- [ ] #9 duplicate phase compilation retained intentionally; safety rationale in report README
+
+Reproduction: pre-fix `perl -e 'alarm shift; exec @ARGV' 900 npm run check` failed unit phase
+with 16 failures / 979 passed / 7 skipped; #6 gap demonstrated by a split-block fixture that
+passes the old assertion. #8 original mkdir reproduced as 0755 under umask 022. No finding disputed.

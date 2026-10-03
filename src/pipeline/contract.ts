@@ -1,5 +1,5 @@
-import type { ApprovalChannel, ApprovalResult, CallHandler, HookAgent, HookDecision, IncomingCall, LedgerRecord, Outcome, PolicyDecision, ToolCall, ToolResult, UnsealedRecord } from "../types/index.js";
-import { BUILTIN_SERVER_KEYS, CODEX_MCP_NOT_PROXIED_REASON, HANDOFF_TO_PROXY_REASON, HANDOFF_TO_PROXY_RULE_PREFIX } from "../types/index.js";
+import type { AgentCredential, ApprovalChannel, ApprovalResult, CallHandler, HookAgent, HookDecision, IncomingCall, LedgerRecord, Outcome, PolicyDecision, SessionHeartbeat, ToolCall, ToolResult, UnsealedRecord } from "../types/index.js";
+import { BUILTIN_SERVERS, BUILTIN_SERVER_KEYS, CODEX_MCP_NOT_PROXIED_REASON, HANDOFF_TO_PROXY_REASON, HANDOFF_TO_PROXY_RULE_PREFIX, HEARTBEAT_REASON, HEARTBEAT_RULE_ID, HEARTBEAT_TOOL, HOOK_AGENTS } from "../types/index.js";
 import type { IdentityService } from "../identity/contract.js";
 import type { ToolRegistry } from "../policy/contract.js";
 import { clearArgFields, evaluate } from "../policy/contract.js";
@@ -68,16 +68,38 @@ export interface Pipeline {
    *   answer `deny`. A registry row for that server name changes nothing: hook names are not identities under Codex.
    * Under Claude Code, MCP hook names are consulted against the registry as before (its `mcp_server.source`
    * provenance is the trust anchor there, per its docs).
+   * Decide-only mode ONLY: on a proxy-mode instance (no `hookAgent`) it throws, mirroring `handle` in decide-only
+   * mode, because the watchdog deadline gate does not apply there and the public method must not become a
+   * deadline-free `allow` (Astra 1c P2 #5, pre-existing). The proxy decides through `handle`.
    */
   decide(incoming: IncomingCall): Promise<HookDecision>;
   /**
-   * Decide-only mode, second half: PostToolUse (status ok) or PostToolUseFailure (status error) reports what
-   * happened; the pipeline appends the outcome record for `callId`. An unknown callId is an orphan outcome, kept.
+   * Decide-only mode, second half: PostToolUse (status ok), PostToolUseFailure (status error) or Claude Code's auto-mode
+   * PermissionDenied (status blocked, errorClass `permission-denied:auto-mode`, ADR-010) reports what happened; the
+   * pipeline appends the outcome record for `callId`. An unknown callId is an orphan outcome, kept.
    * A `governed-by-proxy` call's hook outcome chains to its `handoff-to-proxy` intent record; the decision and the
    * upstream outcome themselves arrive through the proxy's records for the same callId.
    */
   recordOutcome(callId: string, outcome: Outcome): Promise<void>;
+  /**
+   * Decide-only mode (ADR-010, Slice 1c pin 3): the SessionStart hook's heartbeat. `identity.resolveAgent(credential)`
+   * → `startSession` → ONE intent record encoded as pin 7: `call.callId = "heartbeat:<uuid>"`, `call.tool =
+   * HEARTBEAT_TOOL`, `call.server = BUILTIN_SERVERS[hb.hookAgent]`, `call.agentSessionId = hb.agentSessionId`,
+   * `call.args = hb` in the clear (our own observations, not tool arguments; the ledger redactor still runs on it),
+   * `policy = { verdict: "allow", risk: "read", ruleId: HEARTBEAT_RULE_ID, reason: HEARTBEAT_REASON }`. Never an outcome.
+   * Throws on an unknown agent (nothing to attribute; the handler exits 0 with a stderr line), a `hookAgent` that
+   * differs from the pipeline's, proxy mode (no hookAgent: no hook event exists there), a malformed heartbeat, or a
+   * failed append (the caller logs; SessionStart cannot block anything). It never consults the watchdog deadline.
+   * Signature: `(hb, credential)` per the ADR-010 amendment (proposed by the coordinator 2026-10-03, awaiting Ryan;
+   * pin 3 and ADR-010 item 3 originally read `(hb)`): the heartbeat is attributed through identity like every call, a
+   * credential-less heartbeat would be unattributable, and `SessionHeartbeat` is stored in the clear so it must never
+   * carry the credential itself (Astra 1c P2 #4).
+   */
+  recordHeartbeat(hb: SessionHeartbeat, credential: AgentCredential): Promise<void>;
 }
+
+/** The deny reason `decide()` answers when the watchdog's absolute deadline is absent, non-integer or past (ADR-011). */
+export const WATCHDOG_DEADLINE_DENY_REASON = "agent-ledger: watchdog deadline missing or past" as const;
 
 /** What an orphan outcome (no intent record for the callId in this ledger) is recorded against; never an authority. */
 export const ORPHAN_OUTCOME_RULE_PREFIX = "orphan-outcome:" as const;
@@ -118,12 +140,45 @@ function envInt(name: string): number | null {
   const n = Number(raw);
   return Number.isSafeInteger(n) && n > 0 ? n : null;
 }
-/** The stored call for a record: explicit projection of the authenticated call, never a spread of the IncomingCall. */
+/**
+ * The static Slack clock check against the watchdog deadline DURATION in the environment: `"missing"` when
+ * `AGENT_LEDGER_WATCHDOG_DEADLINE_MS` is absent, the joined `validateHookTiming` violations when `timeoutMs` does not
+ * fit under it, null when fine. The handler does not know the agent's hook timeout; a consistent one is derived so only
+ * the approval clock is judged here.
+ */
+function slackClockViolation(approvalTimeoutMs: number): string | null {
+  const deadlineMs = envInt(WATCHDOG_DEADLINE_ENV);
+  if (deadlineMs === null) return "missing";
+  const hookTimeoutS = Math.ceil((deadlineMs + WATCHDOG_MIN_MARGIN_MS) / 1000);
+  const violations = validateHookTiming({ approvalTimeoutMs, deadlineMs, hookTimeoutS });
+  return violations.length > 0 ? violations.join("; ") : null;
+}
+/**
+ * The stored call for a record: explicit projection of the authenticated call (`callId, sessionId, agentId,
+ * agentSessionId?, onBehalfOf?, declaredPlan?, server, tool, args, receivedAt`), never a spread of the IncomingCall.
+ * `agentSessionId` (ADR-010) is copied only when it is a non-empty string.
+ */
 function toolCall(incoming: IncomingCall, sessionId: string, agentId: string, args: Record<string, unknown>): ToolCall {
   const call: ToolCall = { callId: incoming.callId, sessionId, agentId, server: incoming.server, tool: incoming.tool, args, receivedAt: incoming.receivedAt };
+  if (typeof incoming.agentSessionId === "string" && incoming.agentSessionId.length > 0) call.agentSessionId = incoming.agentSessionId;
   if (incoming.onBehalfOf !== undefined) call.onBehalfOf = incoming.onBehalfOf;
   if (incoming.declaredPlan !== undefined) call.declaredPlan = incoming.declaredPlan;
   return call;
+}
+const WATCHDOG_CHECKS: readonly SessionHeartbeat["watchdogCheck"][] = ["ok", "missing", "failed"];
+/** A fresh, field-by-field copy of the heartbeat facts: only the pinned fields, `permissionMode` only when present. Throws on anything else. */
+function heartbeatArgs(hb: SessionHeartbeat): SessionHeartbeat {
+  if (typeof hb !== "object" || hb === null || Array.isArray(hb)) throw new Error("pipeline.recordHeartbeat: heartbeat must be an object");
+  const nonEmpty = (v: unknown, name: string): string => { if (typeof v !== "string" || v.length === 0) throw new Error(`pipeline.recordHeartbeat: ${name} must be a non-empty string`); return v; };
+  if (!(HOOK_AGENTS as readonly unknown[]).includes(hb.hookAgent)) throw new Error("pipeline.recordHeartbeat: unknown hookAgent");
+  if (typeof hb.nodeOptionsSet !== "boolean") throw new Error("pipeline.recordHeartbeat: nodeOptionsSet must be boolean");
+  if (!WATCHDOG_CHECKS.includes(hb.watchdogCheck)) throw new Error("pipeline.recordHeartbeat: watchdogCheck must be ok | missing | failed");
+  const out: SessionHeartbeat = {
+    agentSessionId: nonEmpty(hb.agentSessionId, "agentSessionId"), hookAgent: hb.hookAgent, source: nonEmpty(hb.source, "source"),
+    interpreter: nonEmpty(hb.interpreter, "interpreter"), nodeOptionsSet: hb.nodeOptionsSet, watchdogCheck: hb.watchdogCheck,
+  };
+  if (hb.permissionMode !== undefined) out.permissionMode = nonEmpty(hb.permissionMode, "permissionMode");
+  return out;
 }
 const intentRecord = (call: ToolCall, policy: PolicyDecision, approval?: ApprovalResult): UnsealedRecord => {
   const r: UnsealedRecord = { id: randomUUID(), phase: "intent", call, policy };
@@ -150,22 +205,10 @@ export function createPipeline(deps: PipelineDeps): Pipeline {
   const decideOnly = hookAgent !== undefined;
   if (!decideOnly && approvals.kind === "hook-ask") throw new Error("pipeline: hook-ask is not a channel proxy mode can use (no terminal to ask in); configure a slack channel");
 
-  // Decide-only mode: the watchdog's absolute deadline is mandatory, so a late start can never wait past it.
-  let deadlineAt: number | undefined;
-  if (decideOnly) {
-    const at = envInt(WATCHDOG_DEADLINE_AT_ENV);
-    if (at === null) throw new Error(`pipeline: ${WATCHDOG_DEADLINE_AT_ENV} must be a positive integer (epoch ms); the handler must run under the watchdog`);
-    if (at <= Date.now()) throw new Error(`pipeline: ${WATCHDOG_DEADLINE_AT_ENV} is already past`);
-    deadlineAt = at;
-    if (approvals.kind === "slack") {
-      const deadlineMs = envInt(WATCHDOG_DEADLINE_ENV);
-      if (deadlineMs === null) throw new Error(`pipeline: ${WATCHDOG_DEADLINE_ENV} must be a positive integer when a slack channel is configured`);
-      // The handler does not know the agent's hook timeout; a consistent one is derived so only the approval clock is judged here.
-      const hookTimeoutS = Math.ceil((deadlineMs + WATCHDOG_MIN_MARGIN_MS) / 1000);
-      const violations = validateHookTiming({ approvalTimeoutMs: approvals.timeoutMs, deadlineMs, hookTimeoutS });
-      if (violations.length > 0) throw new Error(`pipeline: slack timeoutMs breaks the hook clocks: ${violations.join("; ")}`);
-    }
-  }
+  // ADR-011: `createPipeline` reads NO watchdog clock, neither the absolute deadline nor the Slack duration. Both are
+  // judged in `decide()` on every call (`deadlineGate`), so the record-only handlers (post, session-start, denied)
+  // construct regardless of what the hook agent's environment inherited from a watchdog (Astra 1c P2 #3, 2026-10-03),
+  // and a `pre` whose clocks are wrong can only produce a deny line (under the watchdog: `handler-deny`, exit 2).
   // `createPipeline` is synchronous and the Slack validator is not: it starts here and its verdict gates every call.
   const slackProblems: Promise<string[]> = approvals.kind === "slack"
     ? Promise.resolve().then(() => validateSlackChannel(approvals)).catch((e: unknown) => [`validateSlackChannel failed: ${message(e)}`])
@@ -184,12 +227,33 @@ export function createPipeline(deps: PipelineDeps): Pipeline {
     try { await ledger.append(outcomeRecord(call, policy, { status: "blocked" })); } catch { /* deny stands */ }
   };
   const ledgerDenied = (callId: string, error: string) => deny(callId, `agent-ledger: denied: ledger unavailable (${error}); fail closed (spec §7)`);
+  /**
+   * ADR-011, decide-only mode: the watchdog's absolute deadline (`AGENT_LEDGER_WATCHDOG_DEADLINE_AT_MS`) is read on EVERY
+   * call, before any registry lookup or append; absent, non-integer or already past → deny. With a Slack channel the
+   * deadline DURATION (`AGENT_LEDGER_WATCHDOG_DEADLINE_MS`) must be present and `timeoutMs` must fit under it. A handler
+   * started outside the watchdog can therefore only ever produce a deny line (under the watchdog: `handler-deny`, exit 2).
+   * Proxy mode (`handle`) never consults it: there is no watchdog in front of the MCP front.
+   */
+  function deadlineGate(): { ok: true; deadlineAt: number | undefined } | { ok: false; reason: string } {
+    if (!decideOnly) return { ok: true, deadlineAt: undefined };
+    const at = envInt(WATCHDOG_DEADLINE_AT_ENV);
+    if (at === null || at <= Date.now()) return { ok: false, reason: `${WATCHDOG_DEADLINE_DENY_REASON} (${WATCHDOG_DEADLINE_AT_ENV} ${at === null ? "absent or not a positive integer" : "already past"}); the handler must run under the watchdog` };
+    if (approvals.kind === "slack") {
+      const violation = slackClockViolation(approvals.timeoutMs);
+      if (violation === "missing") return { ok: false, reason: `${WATCHDOG_DEADLINE_DENY_REASON} (${WATCHDOG_DEADLINE_ENV} absent with a slack channel configured)` };
+      if (violation !== null) return { ok: false, reason: `agent-ledger: denied: slack timeoutMs breaks the hook clocks (${violation})` };
+    }
+    return { ok: true, deadlineAt: at };
+  }
 
   async function decideInternal(incoming: IncomingCall): Promise<Decided> {
     const callId = typeof incoming?.callId === "string" ? incoming.callId : "";
     if (!callId || typeof incoming.server !== "string" || typeof incoming.tool !== "string" || typeof incoming.args !== "object" || incoming.args === null) {
       return { decision: deny(callId, "agent-ledger: denied: malformed call") };
     }
+    const gate = deadlineGate();
+    if (!gate.ok) return { decision: deny(callId, gate.reason) };
+    const deadlineAt = gate.deadlineAt;
     const problems = await slackProblems;
     if (problems.length > 0) return { decision: deny(callId, `agent-ledger: denied: slack channel misconfigured (${problems.join("; ")})`) };
 
@@ -290,6 +354,9 @@ export function createPipeline(deps: PipelineDeps): Pipeline {
 
   const pipeline: Pipeline = {
     async decide(incoming) {
+      // Proxy mode has no watchdog in front of it, so `deadlineGate` passes there by design; the public decide() must
+      // therefore not be reachable on such an instance (it would answer `allow` with no deadline). `handle` is its door.
+      if (!decideOnly) throw new Error("pipeline.decide: not available in proxy mode (no hookAgent; no hook event or watchdog exists there; use handle)");
       return (await decideInternal(incoming)).decision;
     },
     async recordOutcome(callId, outcome) {
@@ -304,6 +371,19 @@ export function createPipeline(deps: PipelineDeps): Pipeline {
       const call: ToolCall = { callId, sessionId: "unknown", agentId: "unknown", server: "unknown", tool: "unknown", args: {}, receivedAt: now() };
       const policy: PolicyDecision = { verdict: "require_approval", risk: "unreviewed", ruleId: `${ORPHAN_OUTCOME_RULE_PREFIX}${callId}`, reason: "outcome reported for a callId with no intent record in this ledger" };
       await ledger.append(outcomeRecord(call, policy, clean));
+    },
+    async recordHeartbeat(hb, credential) {
+      if (!decideOnly) throw new Error("pipeline.recordHeartbeat: not available in proxy mode (no hook event exists there)");
+      const args = heartbeatArgs(hb); // validated copy; the record carries exactly the pinned fields
+      if (args.hookAgent !== hookAgent) throw new Error(`pipeline.recordHeartbeat: heartbeat says ${args.hookAgent} but this pipeline is configured for ${hookAgent}`);
+      const agentId = await identity.resolveAgent(credential); // unknown agent → throws: nothing to attribute the heartbeat to
+      const sessionId = await identity.startSession(agentId);
+      const call: ToolCall = {
+        callId: `heartbeat:${randomUUID()}`, sessionId, agentId, agentSessionId: args.agentSessionId,
+        server: BUILTIN_SERVERS[args.hookAgent], tool: HEARTBEAT_TOOL, args: { ...args }, receivedAt: now(),
+      };
+      const policy: PolicyDecision = { verdict: "allow", risk: "read", ruleId: HEARTBEAT_RULE_ID, reason: HEARTBEAT_REASON };
+      await ledger.append(intentRecord(call, policy)); // a failed append throws to the caller; SessionStart cannot block anyway
     },
     async handle(incoming): Promise<ToolResult> {
       if (decideOnly) throw new Error("pipeline.handle: not available in decide-only mode (hookAgent set, hook-ask or hook clocks configured)");

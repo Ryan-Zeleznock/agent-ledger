@@ -1,12 +1,32 @@
 import { describe, it, expect } from "vitest";
 import {
   APPROVAL_DECISIONS, BUILTIN_CODEX_SERVER, BUILTIN_NAMESPACE, BUILTIN_SERVER, BUILTIN_SERVERS, BUILTIN_SERVER_KEYS, HANDOFF_TO_PROXY_REASON, HANDOFF_TO_PROXY_RULE_PREFIX, HOOK_AGENTS, HOOK_DECISIONS, HOOK_DECISION_KINDS,
+  HEARTBEAT_REASON, HEARTBEAT_RULE_ID, HEARTBEAT_TOOL, PERMISSION_DENIED_ERROR_CLASS,
   RESERVED_KEYS, RESERVED_SERVER_NAMES, RISKS, VERDICTS,
-  type ApprovalChannel, type ApprovalResult, type HookAgent, type HookDecision, type IncomingCall, type LedgerRecord, type ToolCall, type ToolInfo, type UnsealedRecord,
+  type ApprovalChannel, type ApprovalResult, type HookAgent, type HookDecision, type IncomingCall, type LedgerRecord, type Outcome, type SessionHeartbeat, type ToolCall, type ToolInfo, type UnsealedRecord,
 } from "../src/types/index.js";
 import { notImplemented } from "../src/types/not-implemented.js";
 
 describe("types", () => {
+  it("ADR-010 (Slice 1c pin 1): agentSessionId is optional on IncomingCall and ToolCall; the heartbeat shape and constants are exactly the pinned ones", () => {
+    const incoming: IncomingCall = { callId: "c1", credential: { kind: "local", value: "k" }, server: "builtin:claude-code", tool: "Bash", args: {}, receivedAt: "2026-10-01T00:00:00Z", agentSessionId: "abc123" };
+    const call: ToolCall = { callId: "c1", sessionId: "s1", agentId: "a1", agentSessionId: incoming.agentSessionId, server: "builtin:claude-code", tool: "Bash", args: {}, receivedAt: incoming.receivedAt };
+    const proxyCall: ToolCall = { callId: "c2", sessionId: "s1", agentId: "a1", server: "github", tool: "list_repos", args: {}, receivedAt: incoming.receivedAt };
+    expect(call.agentSessionId).toBe("abc123");
+    expect(proxyCall.agentSessionId).toBeUndefined();
+    const hb: SessionHeartbeat = { agentSessionId: "abc123", hookAgent: "claude-code", source: "startup", permissionMode: "default", interpreter: "/usr/local/bin/node", nodeOptionsSet: false, watchdogCheck: "ok" };
+    const minimal: SessionHeartbeat = { agentSessionId: "thr_123", hookAgent: "codex", source: "compact", interpreter: "/opt/node", nodeOptionsSet: true, watchdogCheck: "missing" };
+    // @ts-expect-error watchdogCheck is a closed set
+    const bad: SessionHeartbeat = { ...minimal, watchdogCheck: "unknown" };
+    expect([hb.permissionMode, minimal.permissionMode, bad.hookAgent]).toEqual(["default", undefined, "codex"]);
+    expect(Object.keys(hb).sort()).toEqual(["agentSessionId", "hookAgent", "interpreter", "nodeOptionsSet", "permissionMode", "source", "watchdogCheck"]);
+    expect(HEARTBEAT_TOOL).toBe("SessionStart");
+    expect(HEARTBEAT_RULE_ID).toBe("heartbeat:session-start");
+    expect(HEARTBEAT_REASON).toBe("agent-ledger: session heartbeat written by the SessionStart hook; a health record, not a tool decision");
+    expect(PERMISSION_DENIED_ERROR_CLASS).toBe("permission-denied:auto-mode");
+    const denied: Outcome = { status: "blocked", errorClass: PERMISSION_DENIED_ERROR_CLASS };
+    expect(denied.status).toBe("blocked"); // Outcome itself is untouched: blocked already existed
+  });
   it("exposes the three verdicts", () => {
     expect(VERDICTS).toEqual(["allow", "deny", "require_approval"]);
   });
