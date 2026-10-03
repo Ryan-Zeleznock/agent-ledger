@@ -157,6 +157,11 @@ export type SecretRef = { kind: "env"; name: string } | { kind: "file"; path: st
  *   as the outcome record (PostToolUse → ok, PostToolUseFailure → error, nothing → no outcome), never as `approved`.
  *   Codex cannot ask, so under Codex `hook-ask` resolves to `decision: "no-channel"` → deny, RECORDED as the final
  *   decision before anything is persisted (nothing is left as a dangling `delegated`).
+ * - `none` (ADR-012, Slice 2a): the proxy's explicit "nobody can approve" choice. Spec §6 step 3 refuses `hook-ask` in
+ *   proxy mode and `slack` is not built yet, so without this a server-mode pipeline could not be constructed at all.
+ *   `require_approval` + `none` → `decision: "no-channel"`, reason PROXY_NO_CHANNEL_REASON, written into the intent
+ *   record, a `blocked` outcome, and an `isError` result to the agent; upstream is never called. Refused in decide-only
+ *   mode (a `hookAgent` set): hooks keep `hook-ask`/`slack` this slice.
  * Absent is not a state: `PipelineDeps.approvals` is required, so "no channel" must be said out loud.
  */
 export type ApprovalChannel =
@@ -169,7 +174,12 @@ export type ApprovalChannel =
       appToken: SecretRef;          // xapp-…  connections:write
       approvers: readonly string[]; // Slack user ids allowed to approve or deny; must be non-empty
     }
-  | { kind: "hook-ask" };
+  | { kind: "hook-ask" }
+  | { kind: "none" };
+/** The ONE enum of channel kinds; the ledger validator (`src/ledger/validate.ts`) reads `ApprovalResult.channel` against it (ADR-012). */
+export const APPROVAL_CHANNEL_KINDS = ["slack", "hook-ask", "none"] as const;
+/** `ApprovalResult.reason` and the tail of the deny text when the proxy has no approval channel (ADR-012). */
+export const PROXY_NO_CHANNEL_REASON = "agent-ledger: no approval channel is configured for this proxy; risky and unreviewed calls are denied until a Slack channel (ADR-006) is configured" as const;
 /**
  * The FINAL decision on a require_approval verdict, as the intent record stores it. approved | denied come from a
  * human (with `approver`); timeout | unavailable mean deny; `no-channel` means deny because the agent cannot ask and

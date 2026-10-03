@@ -29,3 +29,10 @@ Converted to real tests on 2026-09-30 (Fable, Slice 1b step B) in `test/pipeline
 - [x] pin 4 round trip through the REAL jsonl ledger: heartbeat + tool intents with `agentSessionId` append, read back with the field present, `verify()` ok; a session with tool records and no heartbeat is visible to a reader
 - [x] `recordOutcome(tool_use_id, { status: "blocked", errorClass: "permission-denied:auto-mode" })` chains the auto-mode denial to its intent (carrying the intent's `agentSessionId`); unknown callId → orphan
 - [ ] B's half (report): "sessions without heartbeat" computed per `call.agentSessionId`; pre-1c records (no field) never flagged → `test/report*.test.ts`
+
+## Slice 2a (ADR-012 pin 2; Fable 2026-10-03), `test/pipeline.test.ts` "ADR-012: approvals { kind: none }"
+- [x] `createPipeline({ approvals: { kind: "none" } })` constructs in proxy mode; with a `hookAgent` (either agent) it throws ("decide-only mode uses hook-ask or slack"); an unknown kind or a missing channel still throws; `hook-ask` in proxy mode is still refused
+- [x] `handle` + `require_approval` (risky row and unreviewed tool): the intent record carries `approval: { callId, decision: "no-channel", reason: PROXY_NO_CHANNEL_REASON, decidedAt, channel: "none" }` FIRST, then a `blocked` outcome, then `{ content: [{ type: "text", text: "agent-ledger: denied (<risk>; <ruleId>): " + PROXY_NO_CHANNEL_REASON }], isError: true }`; upstream and `requestApproval` are never called; nothing says `delegated`
+- [x] allowed read/write rows are unaffected by the channel (intent + ok outcome, no `approval` field)
+- [x] a failed intent append is a `ledger unavailable` deny with no outcome record; a failed blocked-outcome append changes nothing
+- [x] round trip through the REAL jsonl ledger with `verify()` ok (channel `none`): written as a self-skipping test until B's pin 1 validator line (`APPROVAL_CHANNEL_KINDS` in `src/ledger/validate.ts`) is on the branch; the e2e (`test/e2e-slice-2a.test.ts`) has the same seam
