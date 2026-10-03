@@ -41,6 +41,7 @@ const vocabulary = [
   "CC7.2 monitoring: chain links, full-ledger verification and anomalies for investigation.",
   "CC8.1 change management: writes and risky/unknown actions, approval requests, approvals and denials. A shell call is not necessarily a production change.",
   "delegated = asked in the terminal; not a recorded human approval. An intent with no outcome means execution was not observed; denial, cancellation or lost telemetry cannot be distinguished.",
+  "An empty evidence_class identifies a heartbeat/handoff, an orphan without a classifiable cause, or a blocked outcome whose cause is not recorded; consult the raw outcome. It does not mean allowed or successful execution.",
   "Codex hook outcome ok means the tool ran and returned; it does not prove success.",
   "HMAC-SHA256 digest = argument withheld, not the clear argument. Keyed comparison requires the separately held per-ledger key; the pack never includes that key.",
   `Handoff matching uses callId and a non-handoff MCP intent; collector provenance is absent from the schema, so this is correlation, not proof of proxy identity. Grace: ${HANDOFF_RECONCILE_GRACE_MS} ms after range end.`,
@@ -53,7 +54,9 @@ const esc = (s: string) => s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt
 const csvCell = (s: string) => `"${(/^[\s]*[=+@-]|^[\t\r\n]/.test(s) ? "'" + s : s).replace(/"/g, '""')}"`;
 
 // Pin 7 literals keep B buildable against the frozen base; no dependency on A's implementation.
-const isHeartbeat = (r: LedgerRecord) => r.policy.ruleId === "heartbeat:session-start";
+const hasHeartbeatRule = (r: LedgerRecord) => r.policy.ruleId === "heartbeat:session-start";
+const hasHeartbeatCall = (r: LedgerRecord) => r.call.tool === "SessionStart" && r.call.server.startsWith("builtin:");
+const isHeartbeat = (r: LedgerRecord) => hasHeartbeatRule(r) && hasHeartbeatCall(r);
 const isToolIntent = (r: LedgerRecord) => r.phase === "intent" && !r.handoff && !isHeartbeat(r);
 const agentSession = (r: LedgerRecord): string | undefined =>
   "agentSessionId" in r.call && typeof r.call.agentSessionId === "string" ? r.call.agentSessionId : undefined;
@@ -70,6 +73,8 @@ function anchorLine(context?: ReportContext): string {
 function evidenceClass(intent: LedgerRecord, outcome?: LedgerRecord): string {
   if (intent.handoff || isHeartbeat(intent)) return "";
   const o = outcome?.outcome, a = intent.approval;
+  const denied = intent.policy.verdict === "deny" || (a !== undefined && ["denied", "timeout", "unavailable", "no-channel"].includes(a.decision));
+  if (o?.status === "ok" && denied) return "executed despite deny";
   if (o?.status === "ok") return intent.policy.verdict === "require_approval" ? "executed after ask" : "executed (allowed)";
   if (o?.status === "error") return "execution error";
   if (o?.status === "blocked" && o.errorClass === "permission-denied:auto-mode") return "denied: auto mode";
@@ -102,7 +107,7 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
   const orphanIds = new Set<string>();
   const precedingIntent = new Map<string, LedgerRecord>();
   for (const r of history) {
-    if (isToolIntent(r)) intents.set(r.call.callId, r);
+    if (r.phase === "intent" && !isHeartbeat(r)) intents.set(r.call.callId, r);
     else if (r.phase === "outcome") {
       const intent = intents.get(r.call.callId);
       if (!intent) orphanIds.add(r.id); else precedingIntent.set(r.id, intent);
@@ -118,6 +123,12 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
     const intent = precedingIntent.get(r.id);
     return intent ? evidenceClass(intent, r) : r.outcome?.status === "blocked" && r.outcome.errorClass === "permission-denied:auto-mode" ? "denied: auto mode" : "";
   };
+  const recordAnomalies = new Map<string, string[]>();
+  for (const r of records) {
+    const messages = [label(r) === "executed despite deny" ? "executed despite deny" : "",
+      hasHeartbeatRule(r) !== hasHeartbeatCall(r) ? "heartbeat discriminator mismatch" : ""].filter(Boolean);
+    if (messages.length) recordAnomalies.set(r.id, messages);
+  }
   const warnings: string[][] = [];
   for (const r of heartbeats) {
     const a = r.call.args;
@@ -127,6 +138,7 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
   const chain = `Chain verification: ${verify.ok ? "PASS" : "FAIL"}; checked ${verify.checked} records (whole ledger); brokenAt: ${verify.brokenAt ?? "none"}`;
   const findings = [
     ...(!verify.ok ? [chain] : []),
+    ...records.flatMap(r => (recordAnomalies.get(r.id) ?? []).map(message => `${message}: ${r.id}; call ${r.call.callId}`)),
     ...(context?.anchor && ["missing", "mismatch", "untrusted"].includes(context.anchor.status) ? [anchor] : []),
     ...missing.map(([s, rs]) => `session without heartbeat: ${s}; first tool record ${rs[0]!.id}; ${rs.length} tool records in range`),
     ...warnings.map(row => `Launch environment: ${row.join("; ")}`),
@@ -135,7 +147,7 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
     ...unobserved.map(r => `no outcome observed: ${r.id}; call ${r.call.callId}`),
   ];
   const causes = new Map<string, number>();
-  for (const r of tools) { const l = label(r); if (l.startsWith("denied")) causes.set(l, (causes.get(l) ?? 0) + 1); }
+  for (const r of tools) { const observed = label(r); const l = observed === "executed despite deny" ? evidenceClass(r) : observed; if (l.startsWith("denied")) causes.set(l, (causes.get(l) ?? 0) + 1); }
   // Explicit orphan auto-mode denials are evidence too; count once without an invented intent.
   for (const r of orphans) if (label(r) === "denied: auto mode") causes.set("denied: auto mode", (causes.get("denied: auto mode") ?? 0) + 1);
   const seen = new Set(records.map(agentSession).filter((s): s is string => s !== undefined));
@@ -148,7 +160,7 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
   const columns = ["record_id", "phase", "written_at", "call_id", "agent_id", "session_id", "server", "tool", "arguments_labeled", "policy", "approval", "outcome", "handoff", "parent_record_id", "prev_hash", "hash", "criteria", "anomalies", "on_behalf_of", "declared_plan", "received_at", "chain_verify", "chain_checked", "chain_broken_at", "trust_boundary", "agent_session_id", "evidence_class", "anchor_status"];
   const rows = records.map(r => {
     const criteria = r.handoff || isHeartbeat(r) ? ["CC7.2"] : ["CC6.1", "CC7.2", ...((r.policy.risk !== "read" || r.approval || r.policy.verdict !== "allow") ? ["CC8.1"] : [])];
-    const anomalies = [handoffIds.has(r.id) ? "unreconciled handoff" : "", orphanIds.has(r.id) ? (heartbeatSessions.has(agentSession(r) ?? "") ? "orphan outcome; intent gap" : "orphan outcome") : "", unobservedIds.has(r.id) ? "no outcome observed" : "", missingFirst.has(r.id) ? "session without heartbeat" : ""].filter(Boolean);
+    const anomalies = [...(recordAnomalies.get(r.id) ?? []), handoffIds.has(r.id) ? "unreconciled handoff" : "", orphanIds.has(r.id) ? (heartbeatSessions.has(agentSession(r) ?? "") ? "orphan outcome; intent gap" : "orphan outcome") : "", unobservedIds.has(r.id) ? "no outcome observed" : "", missingFirst.has(r.id) ? "session without heartbeat" : ""].filter(Boolean);
     return [r.id, r.phase, r.writtenAt, r.call.callId, r.call.agentId, r.call.sessionId, r.call.server, r.call.tool, json(r.call.args), json(r.policy), json(r.approval), json(r.outcome), json(r.handoff), r.parentRecordId ?? "", r.prevHash, r.hash, criteria.join("; "), anomalies.join("; "), r.call.onBehalfOf ?? "", r.call.declaredPlan ?? "", r.call.receivedAt, verify.ok ? "PASS" : "FAIL", String(verify.checked), verify.brokenAt ?? "", trust, sessionLabel(r), label(r), context?.anchor?.status ?? "not supplied"].map(display);
   });
   const pdf: PdfBlock[] = [];
@@ -163,6 +175,7 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
     section("summary", "Executive summary", () => text(summary) + heading("Findings") + (() => { pdf.push({ kind: "text", lines: (findings.length ? findings : ["No findings"]).map(display) }); return `<ul>${(findings.length ? findings : ["No findings"]).map(s => `<li>${esc(display(s))}</li>`).join("")}</ul>`; })()),
     section("cc6-1", "CC6.1 logical access", () => text(["[V] Scope: logical access protections (AICPA TSC, printed p. 33). [H] Mapping: recorded identities and policy decisions."]) + table(["written_at", "agent_session_id", "agent_id", "server/tool", "risk", "verdict", "rule_id"], tools.map(r => [r.writtenAt, sessionLabel(r), r.call.agentId, `${r.call.server}/${r.call.tool}`, r.policy.risk, r.policy.verdict, r.policy.ruleId]))),
     section("cc7-2", "CC7.2 monitoring", () => text(["[V] Scope: monitor operations and analyze anomalies (AICPA TSC, printed p. 39). [H] Mapping: chain, anchor, heartbeat and findings.", chain, anchor]) +
+      heading(`Record anomalies (${recordAnomalies.size})`) + table(["record_id", "call_id", "finding"], records.flatMap(r => (recordAnomalies.get(r.id) ?? []).map(message => [r.id, r.call.callId, message]))) +
       heading(`Heartbeats (${heartbeats.length})`) + table(["written_at", "agent_session_id", "source", "permission_mode", "watchdog_check", "node_options_set", "interpreter"], heartbeats.map(r => [r.writtenAt, sessionLabel(r), ...["source", "permissionMode", "watchdogCheck", "nodeOptionsSet", "interpreter"].map(k => String(r.call.args[k] ?? "not supplied"))])) +
       heading(`Sessions without heartbeat (${missing.length})`) + table(["agent_session_id", "first_tool_record", "tool_records"], missing.map(([s, rs]) => [s, rs[0]!.id, String(rs.length)])) +
       text(["Tool counts and first_tool_record are within the selected range; heartbeat coverage uses all available ledger history. Pre-1c records without an agent session id are not missing-heartbeat findings."]) +

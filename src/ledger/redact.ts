@@ -439,7 +439,7 @@ function redactArray(arr: unknown[], depth: number, seen: WeakSet<object>, decod
     if (redactNext > 0 && typeof x === "string") {
       redactNext--;
       const scheme = isScheme(x);
-      out.push(PLACEHOLDER_FULL.test(x) || scheme ? x : PLACEHOLDER("pair"));
+      out.push(isProtected(x) || scheme ? x : PLACEHOLDER("pair"));
       if (scheme) redactNext = 1;                                              // ["Authorization", "Bearer", "<credential>"]
       continue;
     }

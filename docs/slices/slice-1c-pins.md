@@ -191,7 +191,7 @@ replaces the local type with the import. B renders "Anchor: not supplied to this
   "policy": { "verdict": "allow", "risk": "read", "ruleId": "heartbeat:session-start", "reason": "<HEARTBEAT_REASON>" } }
 ```
 `args` is stored in the clear (not through `projectArgs`); the ledger redactor still runs on it (paths are not secrets;
-the NODE_OPTIONS value is never present). Discriminator for every consumer: `policy.ruleId === "heartbeat:session-start"`.
+the NODE_OPTIONS value is never present). Report discriminator (coordinator review fix #7, 2026-10-03): `policy.ruleId === "heartbeat:session-start"` plus `call.tool === "SessionStart"` and a `builtin:` server; disagreements remain tool evidence and are findings.
 
 **Tool records** gain `call.agentSessionId` (pin 1). Records written before 1c lack it → B labels them "pre-1c, no
 agent session id" and never counts them as a session without heartbeat.
@@ -200,6 +200,8 @@ agent session id" and never counts them as a session without heartbeat.
 chained to the intent with that callId (an unknown callId is an orphan outcome, as today).
 
 ## Pin 8: report sections, wording, CSV and PDF (B)
+
+amended 2026-10-03 (coordinator): add `executed despite deny` for an `ok` outcome after policy deny or denied/timeout/unavailable/no-channel approval; list every such record in summary findings and CC7.2 anomalies.
 
 HTML `<section id>`s and headings, in this order; the PDF carries the same titles in the same order; every claim maps to
 records, a cited criterion ([V] scope / [H] mapping, as today) or the chain/anchor result; no marketing copy:
@@ -220,7 +222,7 @@ records, a cited criterion ([V] scope / [H] mapping, as today) or the chain/anch
    a heartbeat), unreconciled handoffs (unchanged).
 4. `#cc8-1` **CC8.1 change management**: table over write/risky/unreviewed intents `written_at | agent_session_id |
    server/tool | risk | approval (decision, approver) | outcome (status, errorClass) | evidence_class` with exactly these
-   `evidence_class` labels: `executed after ask` · `executed (allowed)` · `execution error` · `denied by policy` ·
+   `evidence_class` labels: `executed despite deny` · `executed after ask` · `executed (allowed)` · `execution error` · `denied by policy` ·
    `denied: no channel` · `denied: Slack <approved|denied|timeout|unavailable>` · `denied: auto mode` ·
    `asked, no outcome observed` · `allowed, no outcome observed`. Directly under the table, verbatim: **"A manual denial
    at the Claude Code permission prompt fires no hook event (Claude Code hooks reference, read 2026-10-01), so 'asked, no

@@ -119,5 +119,65 @@ it("paginates aligned tables with repeated headers, larger titles, footers and u
   expect(p.pdf).toContain("Agent Ledger evidence pack \\267 page");
   pages.forEach((page, i) => expect(page).toContain(`Agent Ledger evidence pack · page ${i + 1} / ${pages.length} · chain PASS`));
   expect(pages.filter(page => page.includes("rule_id")).length).toBeGreaterThan(1);
-  for (const page of pages) if (page.includes("record_id: rec-")) expect(page).toContain("received_at:");
+  for (const page of pages) expect((page.match(/^record_id: rec-/gm) ?? []).length).toBe((page.match(/^received_at:/gm) ?? []).length);
+  expect(pages.flatMap(page => [...page.matchAll(/^record_id: (rec-\d+)$/gm)].map(m => m[1]))).toEqual(Array.from({ length: 45 }, (_, i) => `rec-${i}`));
+});
+
+it.each(["policy", "denied", "timeout", "unavailable", "no-channel"] as const)("review #1: execution after %s remains a denied execution and a finding", async cause => {
+  const r = rec(200);
+  if (cause === "policy") r.policy.verdict = "deny";
+  else approve(r, cause, cause === "no-channel" ? "hook-ask" : "slack");
+  const outcome = result(r, "ok");
+  const p = await pack([r, outcome]);
+  expect(section(p.html, "cc8-1")).toContain(">executed despite deny</td>");
+  for (const id of [r.id, outcome.id]) {
+    expect(section(p.html, "summary")).toContain(`executed despite deny: ${id};`);
+    expect(section(p.html, "cc7-2")).toContain(`<td>${id}</td>`);
+  }
+  expect(section(p.html, "cc7-2")).toContain("executed despite deny");
+  expect(p.csv.split("\r\n")[1]).toContain('"executed despite deny"');
+  expect(p.pdfText.replaceAll("\n", "")).toContain("executed despite deny");
+  const causeLabel = cause === "policy" ? "denied by policy" : cause === "no-channel" ? "denied: no channel" : `denied: Slack ${cause}`;
+  expect(section(p.html, "summary")).toContain(`${causeLabel}: 1`);
+});
+it("review #1: prior-range deny still flags every in-range execution outcome", async () => {
+  const r = rec(201); r.policy.verdict = "deny"; r.writtenAt = "2026-09-29T12:00:00Z";
+  const outcome = { ...result(r, "ok"), writtenAt: range.from };
+  const p = await pack([r, outcome]);
+  expect(section(p.html, "summary")).toContain(`executed despite deny: ${outcome.id};`);
+  expect(section(p.html, "cc7-2")).toContain(`<td>${outcome.id}</td>`);
+});
+it.each([false, true])("review #2: handoff outcome uses its preceding intent (proxy present: %s)", async withProxy => {
+  const h = rec(202); h.handoff = { kind: "to-proxy", proxyServerName: "agentledger_proxy_1234" };
+  h.call.server = h.handoff.proxyServerName; h.policy.ruleId = `handoff-to-proxy:${h.call.server}`;
+  const proxy = rec(203); proxy.call.callId = h.call.callId; proxy.call.server = "github";
+  const p = await pack([h, ...(withProxy ? [proxy] : []), result(h, "ok")]);
+  expect(section(p.html, "cc7-2")).toContain("Orphan outcomes (0)");
+  expect(section(p.html, "cc7-2")).toContain(`Unreconciled handoffs (${withProxy ? 0 : 1})`);
+  expect(section(p.html, "summary")).not.toContain("orphan outcome:");
+  if (withProxy) expect(section(p.html, "cc8-1")).toContain("executed (allowed)");
+  else {
+    expect((section(p.html, "summary").match(/<li>/g) ?? []).length).toBe(1);
+    expect(p.csv.split("\r\n")[2]).not.toContain("executed");
+  }
+});
+it("review #4: a blank class for an unexplained blocked outcome is explained in the legend", async () => {
+  const r = rec(204); const p = await pack([r, result(r, "blocked", "unknown-cause")]);
+  expect(p.csv.split("\r\n")[1]).toMatch(/,"","not supplied"$/);
+  expect(section(p.html, "legend")).toContain("blocked outcome whose cause is not recorded");
+});
+it.each(["tool", "server", "rule"] as const)("review #7: heartbeat %s mismatch stays visible as tool evidence and a finding", async field => {
+  const h = heartbeat(205, "not-covered");
+  if (field === "tool") h.call.tool = "Bash";
+  if (field === "server") h.call.server = "github";
+  if (field === "rule") h.policy.ruleId = "other-rule";
+  h.policy.risk = "risky";
+  const p = await pack([h, rec(206, "not-covered")]);
+  expect(section(p.html, "cc7-2")).toContain("Heartbeats (0)");
+  expect(section(p.html, "cc7-2")).toContain("Sessions without heartbeat (1)");
+  expect(section(p.html, "cc6-1")).toContain(h.call.tool);
+  expect(section(p.html, "cc8-1")).toContain(h.call.tool);
+  expect(section(p.html, "summary")).toContain(`heartbeat discriminator mismatch: ${h.id};`);
+  expect(section(p.html, "cc7-2")).toContain("heartbeat discriminator mismatch");
+  expect(p.csv.split("\r\n")[1]).toContain("heartbeat discriminator mismatch");
 });

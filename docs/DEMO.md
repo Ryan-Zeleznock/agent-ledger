@@ -112,12 +112,11 @@ new hook records arrive during verify/report.
 ## 6. Anchor, verify and export the evidence pack
 
 Exit Claude first so no new hook records arrive during anchoring/export. In the original setup
-shell, create the pack directory and preserve the command's printed JSON alongside the pack:
+shell, preserve the command's printed JSON in the private sandbox until the pack is generated:
 
 ```sh
-mkdir -p "$LEDGER_DEMO_DIR/evidence-pack"
-"$LEDGER_DEMO_NODE" "$LEDGER_DEMO_REPO/dist/cli/main.js" anchor > "$LEDGER_DEMO_DIR/evidence-pack/anchor-result.json"
-cat "$LEDGER_DEMO_DIR/evidence-pack/anchor-result.json"
+"$LEDGER_DEMO_NODE" "$LEDGER_DEMO_REPO/dist/cli/main.js" anchor > "$LEDGER_DEMO_DIR/anchor-result.json"
+cat "$LEDGER_DEMO_DIR/anchor-result.json"
 "$LEDGER_DEMO_NODE" "$LEDGER_DEMO_REPO/dist/cli/main.js" verify
 LEDGER_DEMO_VERIFY_CODE=$?
 printf 'verify exit code: %s\n' "$LEDGER_DEMO_VERIFY_CODE"
@@ -141,9 +140,13 @@ Choose UTC boundaries covering the session. For a demo on the task date:
 ```sh
 "$LEDGER_DEMO_NODE" "$LEDGER_DEMO_REPO/dist/cli/main.js" report \
   --from 2026-10-01T00:00:00Z --to 2026-10-02T00:00:00Z \
-  --out "$LEDGER_DEMO_DIR/evidence-pack"
+  --out "$LEDGER_DEMO_DIR/evidence-pack" &&
+mv "$LEDGER_DEMO_DIR/anchor-result.json" "$LEDGER_DEMO_DIR/evidence-pack/anchor-result.json"
 open "$LEDGER_DEMO_DIR/evidence-pack/report.html"
 ```
+
+Let `report` create the pack directory with mode 0700; do not pre-create it with `mkdir -p`.
+Move the saved anchor result into that directory only after export succeeds.
 
 Use the actual dates if running later. Report stdout includes `chain` and `anchor`; exit 1
 with `chain.ok: false` means a diagnostic pack was written. `open` is the macOS opener;

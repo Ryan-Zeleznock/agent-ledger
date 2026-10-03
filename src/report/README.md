@@ -74,7 +74,7 @@ quotes, and prefixes formula-leading cells with an apostrophe; that presentation
 of the original value. Exported text is evidence presentation, not a byte-for-byte rehashable ledger.
 
 PDF is a dependency-free, paginated PDF 1.4 text document using Courier. Non-ASCII characters are
-shown as reversible `\uXXXX` UTF-16 escapes; HTML/CSV retain Unicode. It wraps long text without
+shown as reversible `\uXXXX` UTF-16 escapes, each kept whole when wrapping; HTML/CSV retain Unicode. It wraps long text without
 truncating records, uses larger section headings and landscape aligned tables with repeated headers,
 and keeps each record block together when it fits on a page. Each page footer includes the chain result. No PDF/A, embedded fonts or signatures are claimed. Output files use exclusive
 creation with mode 0600; use a fresh output directory for each pack. HTML is written last. I/O errors
@@ -93,8 +93,10 @@ all their fields. CSV retains its original 25 columns, then appends `agent_sessi
 `evidence_class`, `anchor_status` in that order. Missing session ids display as
 "pre-1c, no agent session id"; missing anchor context displays "not supplied" in CSV.
 
-Pin-7 fixtures are the integration boundary: heartbeat discrimination is exactly
-`policy.ruleId === "heartbeat:session-start"`; auto-mode denial is outcome `blocked` with
+Pin-7 fixtures are the integration boundary: heartbeat discrimination requires
+`policy.ruleId === "heartbeat:session-start"`, `call.tool === "SessionStart"` and a `builtin:`
+server (coordinator review fix #7, 2026-10-03). Disagreements stay visible as tool evidence and
+are findings in the summary, CC7.2 and CSV. Auto-mode denial is outcome `blocked` with
 `errorClass === "permission-denied:auto-mode"`. The additive session id is read structurally
 until Package A's type amendment is integrated; no other module is imported at runtime.
 Heartbeats map only to CC7.2, never to access/change decisions or missing-outcome counts.
@@ -124,3 +126,27 @@ mapping and auditor acceptance remain hypotheses; Ryan's page-citation spot-chec
 Tests: `test/report-slice-1c.test.ts` exercises the pin-7 fixtures, all anchor statuses,
 section order, evidence classes, history boundaries, escaping and PDF pagination. Package A's
 CLI and merged e2e seams require coordinator integration and independent review.
+
+
+## Review fixes and remaining P3 (2026-10-03)
+
+- #1: the coordinator amended pin 8 with `executed despite deny`. An `ok` outcome after a policy
+  deny or denied/timeout/unavailable/no-channel approval uses that class. Every in-range record
+  with that class is a summary/CC7.2/CSV anomaly, including outcomes whose intent precedes the
+  range. Denial counts retain the recorded cause; the observed execution never converts it to allow.
+- #2: handoff intents participate in preceding-intent lookup. A hook outcome with only its
+  handoff is not an orphan; the missing proxy is an unreconciled-handoff finding. A later proxy
+  intent for the call supersedes the handoff for outcome classification.
+- #4: unclassified blocked outcomes still have a blank evidence class because the amended label
+  set does not name that cause. Vocabulary now explains the blank cell and directs readers to
+  the raw outcome; it never implies allowance or execution. No extra class was invented.
+- #5/#6: PDF wrapping keeps UTF-16 escape tokens whole. Tests compare record starts/ends per page,
+  match record ids, validate xref offsets, stream lengths, page counts/references and reject a
+  corrupted xref. The old presence-only assertion's false positive is reproduced in a test.
+- #9 residual: `npm test` deliberately runs two Vitest processes, so globalSetup compiles
+  `.test-build` twice (unit, then timing). Removing that duplicate safely needs coordinated
+  build invalidation: each phase must also work standalone without stale child-process fixtures.
+  Retained for scoped review; keep the phases isolated when addressing this compile cost.
+
+Regression tests: `test/report-slice-1c.test.ts`, `test/report-pdf.test.ts`. Fable's full review
+is retained at `docs/reviews/2026-10-03-fable-slice-1c-pack-review.md`; fixes need his scoped verification.

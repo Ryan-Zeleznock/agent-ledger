@@ -2,7 +2,18 @@
 export type PdfBlock = { kind: "heading" | "text" | "record"; lines: string[] } |
   { kind: "table"; headers: string[]; rows: string[][] };
 const ascii = (s: string) => s.replace(/[^\x20-\x7e]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
-const wrap = (s: string, width: number): string[] => ascii(s).match(new RegExp(`.{1,${width}}`, "g")) ?? [""];
+// Expand each original UTF-16 unit before fitting it, so a displayed \uXXXX escape
+// is indivisible even in a narrow table cell. Plain ASCII retains its original width.
+const wrap = (s: string, width: number): string[] => {
+  const lines: string[] = []; let line = "";
+  for (let i = 0; i < s.length; i++) {
+    const token = ascii(s[i]!);
+    if (line.length + token.length > width && line.length) { lines.push(line); line = ""; }
+    line += token;
+  }
+  lines.push(line);
+  return lines;
+};
 
 export function textPdf(blocks: PdfBlock[], chain: "PASS" | "FAIL"): Buffer {
   type Line = { text: string; size: number; height: number };

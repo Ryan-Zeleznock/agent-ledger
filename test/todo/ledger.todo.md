@@ -86,3 +86,10 @@ case in `test/timing/hooks-watchdog.test.ts` and its existing `test/helpers/hook
 fixture assert constructor-time clock rejection on B's pinned base. After A's deadline amendment,
 update that fixture to exercise `decide()` and assert a deny decision instead. The shared helper
 is outside Package B ownership; these standalone 3/3 results do not establish merged-tree parity.
+
+
+Fable review 2026-10-03:
+- [x] #3 array-pair exemptions now preserve only exact lowercase digests, alongside structural auth-scheme tokens;
+  placeholder/inexact/uppercase values normalize to `[REDACTED:pair]`, including nested arrays and header triples.
+- [ ] #9 two independent Vitest phases each run globalSetup; retain fresh child builds until safe shared-build
+  invalidation exists (residual documented in `src/report/README.md`).

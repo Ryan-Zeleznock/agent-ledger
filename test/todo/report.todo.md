@@ -26,3 +26,18 @@ Slice 1c Package B (pin-7 fixtures, `test/report-slice-1c.test.ts`):
 
 Test-first evidence: pre-implementation focused run had 27 failing / 53 passing tests across the
 new report and redaction cases; after implementation the report + redaction suite passed 101/101.
+
+
+Fable review fixes (2026-10-03):
+- [x] #1 denied policy/approval + ok outcome: amended class and summary/monitoring/CSV anomalies, including prior-range intent
+- [x] #2 handoff + outcome without proxy is not an orphan; later proxy supersedes handoff
+- [x] #4 unknown blocked cause keeps a blank class with an explicit Vocabulary explanation
+- [x] #5 Unicode escapes never split on wrapped PDF text/heading/table boundaries
+- [x] #6 reproduce the old split-block false positive; per-page record boundaries, xref/stream/page-reference checks
+- [x] #7 heartbeat tool/server/rule consistency and visible mismatch findings
+- [x] #8 DEMO lets report create its private output directory and moves saved anchor JSON afterward
+- [ ] #9 duplicate phase compilation retained intentionally; safety rationale in report README
+
+Reproduction: pre-fix `perl -e 'alarm shift; exec @ARGV' 900 npm run check` failed unit phase
+with 16 failures / 979 passed / 7 skipped; #6 gap demonstrated by a split-block fixture that
+passes the old assertion. #8 original mkdir reproduced as 0755 under umask 022. No finding disputed.
