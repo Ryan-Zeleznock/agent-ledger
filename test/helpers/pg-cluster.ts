@@ -71,7 +71,7 @@ export async function startPgCluster() {
       async reset() {
         await pool.query("ALTER TABLE ledger.records DISABLE TRIGGER USER");
         try { await pool.query("TRUNCATE ledger.records RESTART IDENTITY"); }
-        finally { await pool.query("ALTER TABLE ledger.records ENABLE TRIGGER USER"); }
+        finally { await pool.query("ALTER TABLE ledger.records ENABLE ALWAYS TRIGGER records_append_only; ALTER TABLE ledger.records ENABLE ALWAYS TRIGGER records_no_truncate"); }
       },
       async stop() {
         try { await Promise.all([pool.end(), control.end()]); }

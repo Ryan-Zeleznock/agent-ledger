@@ -57,13 +57,34 @@ describe.skipIf(!!pgSkipReason)("real Postgres ledger", () => {
     finally { await app.end(); }
   });
 
+  it.each(["UPDATE ledger.records SET call_id='replica-edit'", "DELETE FROM ledger.records", "TRUNCATE ledger.records"])(
+    "superuser in replica mode is still stopped: %s", async sql => {
+      const ledger = store();
+      const record = await ledger.append(unsealed(1));
+      // Model a populated pre-fix schema, then prove the init SQL itself upgrades the firing mode.
+      // This prevents the harness's reset/restore code from masking a reverted SQL change.
+      await cluster.admin.query("ALTER TABLE ledger.records ENABLE TRIGGER USER");
+      await cluster.migrate();
+      const client = await cluster.admin.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query("SET LOCAL session_replication_role = replica");
+        expect((await client.query("SHOW session_replication_role")).rows[0].session_replication_role).toBe("replica");
+        await expect(client.query(sql)).rejects.toThrow("ledger.records is append-only");
+      } finally {
+        try { await client.query("ROLLBACK"); } finally { client.release(); }
+      }
+      expect(await drain(ledger)).toEqual([record]);
+      expect(await ledger.verify()).toEqual({ ok: true, checked: 1 });
+    });
+
   it.each(["line", "written_at", "id", "hash", "prev_hash", "call_id", "phase"])("reports a superuser alteration of middle-row %s", async column => {
     const ledger = store(); for (let i = 1; i <= 3; i++) await ledger.append(unsealed(i));
     const values: Record<string, string> = { line: '{}', written_at: '2030-01-01T00:00:00Z', id: 'edited', hash: 'a'.repeat(64),
       prev_hash: 'f'.repeat(64), call_id: 'edited-call', phase: 'outcome' };
     await cluster.admin.query("ALTER TABLE ledger.records DISABLE TRIGGER USER");
     try { await cluster.admin.query(`UPDATE ledger.records SET ${column}=$1 WHERE seq=2`, [values[column]]); }
-    finally { await cluster.admin.query("ALTER TABLE ledger.records ENABLE TRIGGER USER"); }
+    finally { await cluster.admin.query("ALTER TABLE ledger.records ENABLE ALWAYS TRIGGER records_append_only; ALTER TABLE ledger.records ENABLE ALWAYS TRIGGER records_no_truncate"); }
     expect(await ledger.verify()).toEqual({ ok: false, checked: 2, brokenAt: column === "id" ? "edited" : "rec-2" });
     await expect(drain(ledger)).rejects.toThrow(/ledger.postgres.read/);
   });
@@ -72,7 +93,7 @@ describe.skipIf(!!pgSkipReason)("real Postgres ledger", () => {
     const ledger = store(); await ledger.append(unsealed(1));
     await cluster.admin.query("ALTER TABLE ledger.records DISABLE TRIGGER USER");
     try { await cluster.admin.query("UPDATE ledger.records SET call_id='canary-secret'"); }
-    finally { await cluster.admin.query("ALTER TABLE ledger.records ENABLE TRIGGER USER"); }
+    finally { await cluster.admin.query("ALTER TABLE ledger.records ENABLE ALWAYS TRIGGER records_append_only; ALTER TABLE ledger.records ENABLE ALWAYS TRIGGER records_no_truncate"); }
     await expect(ledger.head()).rejects.toThrow(/^ledger.postgres.head: failed; run verify\(\)$/);
     await expect(ledger.append(unsealed(2))).rejects.toThrow(/^ledger.postgres.append: failed; run verify\(\)$/);
     expect((await cluster.admin.query("SELECT count(*) FROM ledger.records")).rows[0].count).toBe("1");
@@ -82,7 +103,7 @@ describe.skipIf(!!pgSkipReason)("real Postgres ledger", () => {
     const ledger = store(); await ledger.append(unsealed(1));
     await cluster.admin.query("ALTER TABLE ledger.records DISABLE TRIGGER USER");
     try { await cluster.admin.query("UPDATE ledger.records SET written_at=written_at + interval '1 microsecond'"); }
-    finally { await cluster.admin.query("ALTER TABLE ledger.records ENABLE TRIGGER USER"); }
+    finally { await cluster.admin.query("ALTER TABLE ledger.records ENABLE ALWAYS TRIGGER records_append_only; ALTER TABLE ledger.records ENABLE ALWAYS TRIGGER records_no_truncate"); }
     expect(await ledger.verify()).toEqual({ ok: false, checked: 1, brokenAt: "rec-1" });
     await expect(drain(ledger)).rejects.toThrow("ledger.postgres.read");
   });

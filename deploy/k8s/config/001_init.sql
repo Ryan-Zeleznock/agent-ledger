@@ -26,6 +26,9 @@ DO $$ BEGIN
       EXECUTE FUNCTION ledger.refuse_mutation();
   END IF;
 END $$;
+-- Fire even when the superuser sets session_replication_role=replica; explicit disable/drop remains an admin power.
+ALTER TABLE ledger.records ENABLE ALWAYS TRIGGER records_append_only;
+ALTER TABLE ledger.records ENABLE ALWAYS TRIGGER records_no_truncate;
 -- psql quotes password literals; reruns deliberately do not rotate existing role passwords.
 SELECT format('CREATE ROLE ledger_app LOGIN PASSWORD %L', :'app_pw')
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ledger_app') \gexec
