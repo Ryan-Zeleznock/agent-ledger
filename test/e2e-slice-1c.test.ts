@@ -9,11 +9,13 @@ import { HEARTBEAT_REASON, HEARTBEAT_RULE_ID, HEARTBEAT_TOOL, PERMISSION_DENIED_
 import { DEFAULT_DEADLINE_MS, HOOK_TIMEOUT_S, WATCHDOG_DEADLINE_AT_ENV, WATCHDOG_DEADLINE_ENV } from "../src/hooks/contract.js";
 import { ORPHAN_OUTCOME_RULE_PREFIX } from "../src/pipeline/contract.js";
 import { ANCHOR_NOTE } from "../src/cli/main.js";
-import { createRunner, pdfText, readJsonl, shellWords, type Run } from "./helpers/e2e-demo.js";
+import { createRunner, parseCsv, pdfText, readJsonl, shellWords, type Run } from "./helpers/e2e-demo.js";
 
 /**
- * Slice 1c end to end, Package A's half (docs/slices/slice-1c-pins.md "Integration seams" steps 1-7; the coordinator
- * adds the pack-content steps 8-10 at integration). REAL processes and the BUILT artifacts, no mocks, no Claude Code:
+ * Slice 1c end to end (docs/slices/slice-1c-pins.md "Integration seams"): Package A's steps 0-7, then the integration
+ * steps 8-10 added at integration (test engineer, 2026-10-03): the pack produced by the REAL CLI in step 5 is read back
+ * (HTML, PDF, CSV) and checked against the records the hooks really wrote, and the DEMO order (exit Claude → anchor →
+ * verify exit 0 → report) runs end to end in a second sandbox. REAL processes and the BUILT artifacts, no mocks, no Claude Code:
  * the printed hook commands run through /bin/sh with fixture events on stdin, exactly as Claude Code would run them.
  * Sequential on purpose: one sandbox, one ledger, so each step is checked against what the earlier ones really wrote.
  *
@@ -64,6 +66,24 @@ let preCommand = ""; let postCommand = ""; let sessionStartCommand = ""; let den
 let ledgerPath = ""; let anchorsPath = "";
 let anchorEntry: { hash: string; at: string } | undefined;
 let pack: { htmlPath: string; pdfPath: string; csvPath: string } | undefined;
+let packRecords: LedgerRecord[] = [];                     // the ledger exactly as it was when step 5's pack was generated
+
+const SECTION_IDS = ["summary", "cc6-1", "cc7-2", "cc8-1", "records", "legend"] as const;
+const SECTION_TITLES = ["Executive summary", "CC6.1 logical access", "CC7.2 monitoring", "CC8.1 change management", "Record evidence", "Vocabulary"] as const;
+const DENIAL_SENTENCE = "A manual denial at the Claude Code permission prompt fires no hook event (Claude Code hooks reference, read 2026-10-01), so 'asked, no outcome observed' cannot distinguish a user's denial from a cancelled call, an interrupted session or lost telemetry. Only auto-mode denials are recorded (`permission-denied:auto-mode`).";
+const ANCHOR_SUFFIX = "; local file anchor, editable by this machine's owner";
+const unesc = (s: string) => s.replace(/&(amp|lt|gt|quot|#39);/g, (_, e: string) => ({ amp: "&", lt: "<", gt: ">", quot: '"', "#39": "'" })[e]!);
+/** The HTML of one `<section id>` (pin 8), with entities decoded so pinned sentences can be matched verbatim. */
+const section = (html: string, id: string) => { const body = html.split(`<section id="${id}">`)[1]?.split("</section>")[0]; expect(body, `section #${id}`).toBeDefined(); return unesc(body!); };
+/** The HTML that follows one `<h3>` heading up to the next heading (the table that belongs to that heading). */
+const under = (sectionHtml: string, heading: string) => { const body = sectionHtml.split(`<h3>${heading}</h3>`)[1]?.split("<h3>")[0]; expect(body, `heading ${heading}`).toBeDefined(); return body!; };
+/** Body rows of the first table in `html`, as cell texts; an empty table renders one `None` cell and yields []. */
+const tableRows = (html: string): string[][] => {
+  const tbody = html.split("<tbody>")[1]?.split("</tbody>")[0] ?? "";
+  return [...tbody.matchAll(/<tr>(.*?)<\/tr>/gs)].map((m) => [...m[1]!.matchAll(/<td(?: colspan="\d+")?>(.*?)<\/td>/gs)].map((c) => c[1]!)).filter((row) => !(row.length === 1 && row[0] === "None"));
+};
+const listItems = (html: string): string[] => [...html.matchAll(/<li>(.*?)<\/li>/gs)].map((m) => m[1]!);
+const packRange = () => ({ from: new Date(startedAt - 60_000).toISOString(), to: new Date(Date.now() + 60_000).toISOString() });
 
 const records = () => readJsonl<LedgerRecord>(ledgerPath);
 const byCall = (callId: string, phase: LedgerRecord["phase"]) => records().filter((r) => r.call.callId === callId && r.phase === phase);
@@ -111,7 +131,7 @@ beforeAll(() => {
 }, 120_000);
 afterAll(() => { if (root) rmSync(root, { recursive: true, force: true }); });
 
-describe.sequential("Slice 1c demo path (Package A half), real processes, built artifacts", () => {
+describe.sequential("Slice 1c demo path (collector, pack and DEMO order), real processes, built artifacts", () => {
   it("0. init; the sandbox registry; anchor refuses an empty ledger with exit 1 and writes no anchor file", async () => {
     const init = await agentLedger(["init", "--dir", ledgerDir]);
     expect(init.code, init.stderr).toBe(0);
@@ -256,7 +276,7 @@ describe.sequential("Slice 1c demo path (Package A half), real processes, built 
     expect(out.chain).toEqual({ ok: true, checked: records().length });
     expect(out.anchor).toEqual({ status: "ancestor", latest: anchorEntry });
     for (const p of [out.htmlPath, out.pdfPath, out.csvPath]) { expect(existsSync(p), p).toBe(true); expect(statSync(p).mode & 0o777).toBe(0o600); }
-    pack = out;
+    pack = out; packRecords = records();
     expect(readFileSync(out.htmlPath, "utf8")).toContain("Chain verification: PASS");
   }, HOOK_TIMEOUT_MS);
 
@@ -325,6 +345,207 @@ describe.sequential("Slice 1c demo path (Package A half), real processes, built 
     // Every SessionStart hook run in this file produced zero stdout bytes (step 1 and the three broken-config runs).
     expect(heartbeats()).toHaveLength(1);
   });
+
+  // Integration seams 8-10 (test engineer, 2026-10-03). The pack under test is the one the REAL CLI wrote in step 5, read
+  // back here against `packRecords` (the ledger as it stood at that moment: 7 records; step 6 appended one more later).
+  it("8. pack content: the six sections in order in HTML and PDF; the anchor line says ancestor (pin 6 seam, not 'not supplied'); the heartbeat table has the step-1 row; sessions without heartbeat names exactly the step-3 session; CC8.1 shows denied: auto mode and asked, no outcome observed; the verbatim denial sentence is present", () => {
+    expect(pack, "step 5 produced a pack").toBeDefined();
+    expect(anchorEntry, "step 4 anchored").toBeDefined();
+    expect(packRecords).toHaveLength(7);
+    const html = readFileSync(pack!.htmlPath, "utf8");
+    const pdf = pdfText(readFileSync(pack!.pdfPath));
+    const hb = packRecords[0]!; const bashA = byCall(BASH_A_ID, "intent")[0]!; const bashB = byCall(BASH_B_ID, "intent")[0]!; const readA2 = byCall(READ_A2_ID, "intent")[0]!;
+    expect(hb.policy.ruleId).toBe(HEARTBEAT_RULE_ID);
+
+    // Section order, HTML ids and PDF titles (pin 8).
+    let h = -1; let p = -1;
+    SECTION_IDS.forEach((id, i) => {
+      const nextH = html.indexOf(`<section id="${id}"><h2>${SECTION_TITLES[i]}</h2>`); expect(nextH, `#${id}`).toBeGreaterThan(h); h = nextH;
+      const nextP = pdf.indexOf(SECTION_TITLES[i]!); expect(nextP, `pdf ${SECTION_TITLES[i]}`).toBeGreaterThan(p); p = nextP;
+    });
+    expect(pdf).toContain("page 1 /"); expect(pdf).toContain("chain PASS");
+
+    // Anchor line: the CLI's anchor state reached B's renderer through the pin 6 context (the drift the seams list catches).
+    const anchorLine = `Anchor: ancestor anchored at ${anchorEntry!.at}: records after it are unprotected${ANCHOR_SUFFIX}`;
+    const summary = section(html, "summary"); const monitoring = section(html, "cc7-2"); const change = section(html, "cc8-1"); const access = section(html, "cc6-1");
+    expect(summary).toContain(anchorLine); expect(monitoring).toContain(anchorLine); expect(pdf).toContain(anchorLine);
+    for (const text of [html, pdf]) expect(text).not.toContain("not supplied to this report");
+    expect(summary).toContain("Chain verification: PASS; checked 7 records (whole ledger); brokenAt: none");
+    expect(summary).toContain(`Observed ledger head: ${packRecords.at(-1)!.hash}`);
+    expect(summary).toContain("Agent sessions seen: 2; heartbeats: 1");
+    expect(summary).toContain("Tool intents by risk: read: 2; write: 0; risky: 2; unreviewed: 0");
+    expect(summary).toContain("Asks: 2; recorded approvals: 0");
+    expect(summary).toContain("Recorded denials by cause: denied: auto mode: 1");
+    expect(summary).toContain("Outcomes ok: 1; error: 0; no outcome observed: 2");
+    const findings = listItems(under(summary, "Findings"));
+    expect(findings).toEqual([
+      `session without heartbeat: ${SESSION_B}; first tool record ${bashB.id}; 1 tool records in range`,
+      `Launch environment: ${hb.id}; ${SESSION_A}; nodeOptionsSet: true; informational`,
+      `no outcome observed: ${bashA.id}; call ${BASH_A_ID}`,
+      `no outcome observed: ${readA2.id}; call ${READ_A2_ID}`,
+    ]);
+
+    // CC6.1: the four tool intents, never the heartbeat.
+    const accessRows = tableRows(access);
+    expect(accessRows.map((r) => [r[1], r[3], r[4], r[5]])).toEqual([
+      [SESSION_A, "builtin:claude-code/Bash", "risky", "require_approval"],
+      [SESSION_A, "builtin:claude-code/Read", "read", "allow"],
+      [SESSION_B, "builtin:claude-code/Bash", "risky", "require_approval"],
+      [SESSION_A, "builtin:claude-code/Read", "read", "allow"],
+    ]);
+    expect(access).not.toContain(HEARTBEAT_TOOL);
+
+    // CC7.2: the heartbeat table carries the step-1 record (real session-start event) and nothing from the broken-config runs.
+    expect(monitoring).toContain("Heartbeats (1)");
+    expect(tableRows(under(monitoring, "Heartbeats (1)"))).toEqual([[hb.writtenAt, SESSION_A, "startup", "not supplied", "ok", "true", realpathSync(process.execPath)]]);
+    expect(monitoring).not.toContain("e2e-sess-broken");
+    expect(monitoring).toContain("Sessions without heartbeat (1)");
+    expect(tableRows(under(monitoring, "Sessions without heartbeat (1)"))).toEqual([[SESSION_B, bashB.id, "1"]]);
+    expect(tableRows(under(monitoring, "Launch-environment warnings (1)"))).toEqual([[hb.id, SESSION_A, "nodeOptionsSet: true", "informational"]]);
+    for (const empty of ["Record anomalies (0)", "Orphan outcomes (0)", "Unreconciled handoffs (0)"]) expect(monitoring).toContain(empty);
+    expect(tableRows(under(monitoring, "Intents with no outcome observed (2)"))).toEqual([[bashA.id, BASH_A_ID], [readA2.id, READ_A2_ID]]);
+    expect(pdf).toContain("Heartbeats (1)"); expect(pdf).toContain("Sessions without heartbeat (1)"); expect(pdf).toContain(SESSION_B);
+
+    // CC8.1: the two risky Bash intents with their evidence classes; the denial sentence directly under the table, verbatim.
+    const changeRows = tableRows(change);
+    expect(changeRows).toHaveLength(2);
+    expect(changeRows[0]).toEqual([bashA.writtenAt, SESSION_A, "builtin:claude-code/Bash", "risky", "delegated, not recorded", "no outcome observed", "asked, no outcome observed"]);
+    expect(changeRows[1]!.filter((_, i) => i !== 5)).toEqual([bashB.writtenAt, SESSION_B, "builtin:claude-code/Bash", "risky", "delegated, not recorded", "denied: auto mode"]);
+    expect(JSON.parse(changeRows[1]![5]!)).toEqual({ status: "blocked", errorClass: PERMISSION_DENIED_ERROR_CLASS });
+    expect(change.split("</table>")[1]).toContain(`<p>${DENIAL_SENTENCE}</p>`);
+    expect(section(html, "legend")).toContain(DENIAL_SENTENCE);
+    expect(section(html, "legend")).toContain("heartbeat = the SessionStart hook ran and could reach the ledger; it does not prove every later call was hooked");
+    expect(pdf).toContain(DENIAL_SENTENCE); expect(pdf).toContain("denied: auto mode");
+    expect(html).not.toContain("<script>");
+  });
+
+  it("9. CSV: the three appended columns are last and in order; the heartbeat row maps to CC7.2 only; evidence_class and agent_session_id match the HTML tables; anchor_status is ancestor on every row", () => {
+    expect(pack, "step 5 produced a pack").toBeDefined();
+    const rows = parseCsv(readFileSync(pack!.csvPath, "utf8"));
+    const header = rows[0]!; const data = rows.slice(1);
+    expect(header.slice(-4)).toEqual(["trust_boundary", "agent_session_id", "evidence_class", "anchor_status"]);
+    const col = (name: string) => { const i = header.indexOf(name); expect(i, `csv column ${name}`).toBeGreaterThanOrEqual(0); return i; };
+    expect(data.map((r) => r[col("record_id")])).toEqual(packRecords.map((r) => r.id));
+    for (const row of data) { expect(row).toHaveLength(header.length); expect(row[col("anchor_status")]).toBe("ancestor"); expect(row[col("chain_verify")]).toBe("PASS"); }
+    expect(data.map((r) => r[col("agent_session_id")])).toEqual(packRecords.map((r) => r.call.agentSessionId));
+    const byId = (id: string) => data.find((r) => r[col("record_id")] === id)!;
+    const hbRow = byId(packRecords[0]!.id);
+    expect(hbRow[col("criteria")]).toBe("CC7.2"); expect(hbRow[col("evidence_class")]).toBe(""); expect(hbRow[col("anomalies")]).toBe("");
+    expect(hbRow[col("tool")]).toBe(HEARTBEAT_TOOL);
+    // evidence_class per record, matching the HTML CC8.1 cells for the two risky intents and their causes for the rest.
+    const expected: [string, LedgerRecord["phase"], string, string, string][] = [
+      [BASH_A_ID, "intent", "asked, no outcome observed", "CC6.1; CC7.2; CC8.1", "no outcome observed"],
+      [READ_A_ID, "intent", "executed (allowed)", "CC6.1; CC7.2", ""],
+      [READ_A_ID, "outcome", "executed (allowed)", "CC6.1; CC7.2", ""],
+      [BASH_B_ID, "intent", "denied: auto mode", "CC6.1; CC7.2; CC8.1", "session without heartbeat"],
+      [BASH_B_ID, "outcome", "denied: auto mode", "CC6.1; CC7.2; CC8.1", ""],
+      [READ_A2_ID, "intent", "allowed, no outcome observed", "CC6.1; CC7.2", "no outcome observed"],
+    ];
+    for (const [callId, phase, label, criteria, anomalies] of expected) {
+      const row = data.find((r) => r[col("call_id")] === callId && r[col("phase")] === phase)!;
+      expect(row, `${callId} ${phase}`).toBeDefined();
+      expect(row[col("evidence_class")], `${callId} ${phase}`).toBe(label);
+      expect(row[col("criteria")], `${callId} ${phase}`).toBe(criteria);
+      expect(row[col("anomalies")], `${callId} ${phase}`).toBe(anomalies);
+    }
+    const html = readFileSync(pack!.htmlPath, "utf8");
+    for (const row of tableRows(section(html, "cc8-1"))) {
+      const csvRow = data.find((r) => r[col("written_at")] === row[0] && r[col("phase")] === "intent")!;
+      expect(csvRow[col("evidence_class")]).toBe(row[6]); expect(csvRow[col("agent_session_id")]).toBe(row[1]);
+    }
+    const bashB = byId(byCall(BASH_B_ID, "outcome")[0]!.id);
+    expect(JSON.parse(bashB[col("outcome")]!)).toEqual({ status: "blocked", errorClass: PERMISSION_DENIED_ERROR_CLASS });
+    for (const row of data) { expect(row[col("arguments_labeled")]).not.toContain("hmac-sha256:"); }
+  });
+
+  it("10. DEMO order in a fresh sandbox: heartbeat (zero stdout) → approved Bash → manually denied Bash → exit 7 → exit Claude → anchor → verify exit 0 head → report says head anchored, executed after ask, asked, no outcome observed, execution error, no findings about heartbeats", async () => {
+    // docs/DEMO.md steps 1-6 as Claude Code would drive them, in a second project under the same private build root.
+    // The npm-level half of seam 10 (`npm test` 3/3 under a concurrent run, `npm run check`) is run by the harness, not here.
+    const demo = join(root, "demo-project"); mkdirSync(demo);
+    const demoLedgerDir = join(demo, ".agent-ledger"); const demoLedger = join(demoLedgerDir, "ledger", "records.jsonl");
+    const demoSession = "e2e-demo-sess-5a9e"; const ERROR_CANARY = "e2e-error-canary-c0ffee";
+    const approvedId = "toolu_demo_bash_approved"; const deniedId = "toolu_demo_bash_denied"; const exit7Id = "toolu_demo_bash_exit7";
+    const demoCli = (args: string[]) => run(process.execPath, [cli, ...args], { cwd: demo, env });
+    const demoSh = (command: string, event: unknown) => run("/bin/sh", ["-c", command], { cwd: demo, env, input: JSON.stringify(event), timeoutMs: HOOK_TIMEOUT_MS });
+    const demoRecords = () => readJsonl<LedgerRecord>(demoLedger);
+
+    const init = await demoCli(["init"]); expect(init.code, init.stderr).toBe(0);          // DEMO 1 (default --dir from the project cwd)
+    writeFileSync(join(demoLedgerDir, "registry.yaml"), JSON.stringify(REGISTRY, null, 2) + "\n", { mode: 0o600 });
+    const printed = await demoCli(["install-hooks", "--print"]); expect(printed.code, printed.stderr).toBe(0); // DEMO 2
+    const demoSnippet = JSON.parse(printed.stdout) as HookSnippet;
+    expect(Object.keys(demoSnippet.hooks)).toHaveLength(5);
+    const cmd = (event: string) => demoSnippet.hooks[event]![0]!.hooks[0]!.command;
+    expect(shellWords(cmd("SessionStart")).slice(-2)).toEqual(["--dir", demoLedgerDir]);
+
+    // DEMO 3: the heartbeat lands before the first prompt; the handler prints nothing (it would become Claude's context).
+    const hb = await demoSh(cmd("SessionStart"), { ...fixture("sessionstart"), session_id: demoSession, cwd: demo, source: "startup", permission_mode: "default" });
+    timings["demo-session-start"] = hb.ms;
+    expectSilent(hb, "demo session-start"); expect(hb.stderr).toBe(""); expect(Buffer.byteLength(hb.stdout)).toBe(0);
+    expect(demoRecords()).toHaveLength(1); expect(demoRecords()[0]!.call.args).toMatchObject({ permissionMode: "default", watchdogCheck: "ok", nodeOptionsSet: false });
+    // DEMO 4: approve one harmless Bash → ask, then PostToolUse ok.
+    const approvedInput = { command: "printf 'approved sandbox demo\\n'" };
+    const ask1 = await demoSh(cmd("PreToolUse"), { ...fixture("pretooluse"), session_id: demoSession, cwd: demo, tool_name: "Bash", tool_use_id: approvedId, tool_input: approvedInput });
+    expect(ask1.code, ask1.stderr).toBe(0); expect(oneLine(ask1).hookSpecificOutput.permissionDecision).toBe("ask");
+    const post = await demoSh(cmd("PostToolUse"), { ...fixture("posttooluse"), session_id: demoSession, cwd: demo, tool_name: "Bash", tool_use_id: approvedId, tool_input: approvedInput, tool_response: "approved sandbox demo\n" });
+    expectSilent(post, "demo post");
+    // DEMO 5: deny the second Bash at the prompt: no hook event follows, so the ledger keeps the ask and nothing else.
+    const ask2 = await demoSh(cmd("PreToolUse"), { ...fixture("pretooluse"), session_id: demoSession, cwd: demo, tool_name: "Bash", tool_use_id: deniedId, tool_input: { command: "printf 'denied sandbox demo\\n'" } });
+    expect(ask2.code, ask2.stderr).toBe(0); expect(oneLine(ask2).hookSpecificOutput.permissionDecision).toBe("ask");
+    // DEMO 5 optional: approve `exit 7` → PostToolUseFailure records an error outcome (the error text is never stored).
+    const ask3 = await demoSh(cmd("PreToolUse"), { ...fixture("pretooluse"), session_id: demoSession, cwd: demo, tool_name: "Bash", tool_use_id: exit7Id, tool_input: { command: "exit 7" } });
+    expect(ask3.code, ask3.stderr).toBe(0); expect(oneLine(ask3).hookSpecificOutput.permissionDecision).toBe("ask");
+    const failure = await demoSh(cmd("PostToolUseFailure"), { ...fixture("posttoolusefailure"), session_id: demoSession, cwd: demo, tool_name: "Bash", tool_use_id: exit7Id, tool_input: { command: "exit 7" }, error: `Exit code 7\nError: ${ERROR_CANARY}`, is_interrupt: false, duration_ms: 12 });
+    expectSilent(failure, "demo post-failure");
+    const all = demoRecords(); expect(all).toHaveLength(6); assertChainLinks(all);
+    expect(all.filter((r) => r.phase === "outcome").map((r) => [r.call.callId, r.outcome!.status])).toEqual([[approvedId, "ok"], [exit7Id, "error"]]);
+
+    // DEMO 6: Claude has exited; anchor → verify exit 0 head → report; the saved anchor JSON moves into the pack afterwards.
+    const anchored = await demoCli(["anchor"]); timings["demo-anchor"] = anchored.ms;
+    expect(anchored.code, anchored.stderr).toBe(0);
+    const anchorOut = JSON.parse(anchored.stdout) as AnchorOut;
+    expect(anchorOut.anchored).toBe(true); expect(anchorOut.entry!.hash).toBe(all.at(-1)!.hash); expect(anchorOut.chain).toEqual({ ok: true, checked: 6 });
+    const savedAnchor = join(demo, "anchor-result.json"); writeFileSync(savedAnchor, anchored.stdout, { mode: 0o600 });
+    const verified = await demoCli(["verify"]); timings["demo-verify"] = verified.ms;
+    expect(verified.code, verified.stderr).toBe(0);
+    const v = JSON.parse(verified.stdout) as VerifyOut;
+    expect(v.chain).toEqual({ ok: true, checked: 6 }); expect(v.anchor).toEqual({ status: "head", latest: anchorOut.entry });
+    const { from, to } = packRange(); const outDir = join(demo, "evidence-pack");
+    expect(existsSync(outDir)).toBe(false);                                                  // report creates it (0700), never mkdir -p
+    const reported = await demoCli(["report", "--from", from, "--to", to, "--out", outDir]); timings["demo-report"] = reported.ms;
+    expect(reported.code, reported.stderr).toBe(0);
+    const out = JSON.parse(reported.stdout) as { htmlPath: string; pdfPath: string; csvPath: string; chain: { ok: boolean; checked: number }; anchor: { status: string; latest: unknown } };
+    expect(out.chain).toEqual({ ok: true, checked: 6 }); expect(out.anchor).toEqual({ status: "head", latest: anchorOut.entry });
+    expect(statSync(outDir).mode & 0o777).toBe(0o700);
+    renameSync(savedAnchor, join(outDir, "anchor-result.json"));
+    expect(JSON.parse(readFileSync(join(outDir, "anchor-result.json"), "utf8"))).toEqual(anchorOut);
+
+    // The walk-through (DEMO 6, sections 1-4) on the real pack.
+    const html = readFileSync(out.htmlPath, "utf8"); const pdf = pdfText(readFileSync(out.pdfPath));
+    const summary = section(html, "summary"); const monitoring = section(html, "cc7-2"); const change = section(html, "cc8-1");
+    const headLine = `Anchor: head anchored at ${anchorOut.entry!.at}${ANCHOR_SUFFIX}`;
+    expect(summary).toContain(headLine); expect(monitoring).toContain(headLine); expect(pdf).toContain(headLine);
+    expect(summary).toContain("Chain verification: PASS; checked 6 records (whole ledger); brokenAt: none");
+    expect(summary).toContain("Agent sessions seen: 1; heartbeats: 1");
+    expect(summary).toContain("Asks: 3; recorded approvals: 0");
+    expect(summary).toContain("Recorded denials by cause: none");
+    expect(summary).toContain("Outcomes ok: 1; error: 1; no outcome observed: 1");
+    const deniedIntent = all.find((r) => r.call.callId === deniedId)!;
+    expect(listItems(under(summary, "Findings"))).toEqual([`no outcome observed: ${deniedIntent.id}; call ${deniedId}`]);
+    expect(tableRows(under(monitoring, "Heartbeats (1)")).map((r) => r.slice(1, 6))).toEqual([[demoSession, "startup", "default", "ok", "false"]]);
+    for (const empty of ["Sessions without heartbeat (0)", "Launch-environment warnings (0)", "Orphan outcomes (0)", "Unreconciled handoffs (0)"]) expect(monitoring).toContain(empty);
+    expect(tableRows(change).map((r) => [r[1], r[4], r[6]])).toEqual([
+      [demoSession, "delegated, not recorded", "executed after ask"],
+      [demoSession, "delegated, not recorded", "asked, no outcome observed"],
+      [demoSession, "delegated, not recorded", "execution error"],
+    ]);
+    expect(change).toContain(DENIAL_SENTENCE);
+    const csv = parseCsv(readFileSync(out.csvPath, "utf8"));
+    expect(csv.slice(1).map((r) => r.at(-1))).toEqual(Array(6).fill("head"));
+    for (const text of [html, pdf, readFileSync(out.csvPath, "utf8"), readFileSync(demoLedger, "utf8"), transcript.join("\n")]) {
+      expect(text).not.toContain(ERROR_CANARY);
+      expect(text).not.toContain("approved sandbox demo");                                  // Bash storeArgs []: command text withheld
+    }
+  }, HOOK_TIMEOUT_MS * 3);
 });
 
 afterAll(() => {

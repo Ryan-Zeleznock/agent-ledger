@@ -22,7 +22,7 @@ Slice 1c Package B (pin-7 fixtures, `test/report-slice-1c.test.ts`):
 - [x] Every pinned evidence class, exact manual-denial caveat, appended CSV columns
 - [x] New-table HTML/CSV/PDF escaping, withheld-digest labels, repeated PDF table headers and fitting record blocks kept together
 - [ ] Ryan independently spot-checks the AICPA page citations ([V] scope, [H] mapping remain distinct)
-- [ ] Coordinator runs merged Slice 1c e2e steps 8–10 on a real CLI-generated sandbox pack after cross-review
+- [x] Coordinator runs merged Slice 1c e2e steps 8–10 on a real CLI-generated sandbox pack after cross-review → `test/e2e-slice-1c.test.ts` steps 8-10 (test engineer, 2026-10-03): pack content, CSV columns, DEMO order on a second sandbox; revert-check: dropping the pin 6 context argument in `src/cli/main.ts` fails 8, 9 and 10 ("not supplied") while 0-7 stay green
 
 Test-first evidence: pre-implementation focused run had 27 failing / 53 passing tests across the
 new report and redaction cases; after implementation the report + redaction suite passed 101/101.
