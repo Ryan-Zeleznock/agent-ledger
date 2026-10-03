@@ -4,8 +4,8 @@ import type { AddressInfo } from "node:net";
 import type { ToolCall, ToolInfo } from "../src/types/index.js";
 import type { SecretsProvider } from "../src/secrets/contract.js";
 import {
-  UPSTREAM_INPUT_REQUIRED_TEXT, UPSTREAM_MAX_LIST_PAGES, UPSTREAM_MAX_RESPONSE_BYTES, UPSTREAM_PROTOCOL_VERSION, UPSTREAM_TIMEOUT_MS,
-  UpstreamClosed, UpstreamError, UpstreamTimeout, connectUpstreams, encodeHeaderValue, sseResponse,
+  SseParser, UPSTREAM_INPUT_REQUIRED_TEXT, UPSTREAM_MAX_LIST_PAGES, UPSTREAM_MAX_RESPONSE_BYTES, UPSTREAM_PROTOCOL_VERSION, UPSTREAM_TIMEOUT_MS,
+  UpstreamClosed, UpstreamError, UpstreamTimeout, connectUpstreams, encodeHeaderValue, headerParams,
 } from "../src/upstream/contract.js";
 
 // Slice 2a pin 4: a REAL node:http fake upstream speaking MCP 2026-07-28 (headers + _meta re-read from the spec on 2026-10-03).
@@ -103,7 +103,7 @@ describe("upstream: connectUpstreams over Streamable HTTP 2026-07-28", () => {
     expect(b.seen.every((s) => s.headers.authorization === undefined)).toBe(true);
     expect((a.seen.at(-1)!.body["params"] as Record<string, unknown>)["arguments"]).toEqual({ message: "hi" });
     // the token is held in a closure: not on the object, not serialisable, not in any own property descriptor
-    expect(JSON.stringify(up)).toBe("{}"); expect(JSON.stringify(Object.getOwnPropertyDescriptors(up))).not.toContain(TOKEN_A);
+    expect(JSON.stringify(up)).toBe('{"rejectedTools":[]}'); expect(JSON.stringify(Object.getOwnPropertyDescriptors(up))).not.toContain(TOKEN_A);
     expect(JSON.stringify(await up.listTools())).not.toContain(TOKEN_A);
     await up.close();
   });
@@ -200,13 +200,14 @@ describe("upstream: connectUpstreams over Streamable HTTP 2026-07-28", () => {
       return ok(res, id, { resultType: "complete", content: [] });
     } });
     const up = await connectUpstreams([{ name: "demo", transport: "http", url: a.url }], secrets({ demo: { bearerToken: TOKEN_A } }));
-    const expectations: [number, RegExp][] = [[1, /HTTP 500 on tools\/call \(.*server exploded/], [2, /tools\/call failed: .*Unknown tool: echo/], [3, /response id does not match/], [4, /content-type "text\/html"/]];
+    // F1 (Astra review): diagnostics carry the error CLASS, the upstream name and validated status/code only, never upstream text
+    const expectations: [number, RegExp][] = [[1, /^upstream demo: HTTP 500 on tools\/call$/], [2, /^upstream demo: tools\/call failed \(JSON-RPC error -32602\)$/], [3, /response id does not match/], [4, /^upstream demo: tools\/call response has an unsupported content-type$/]];
     for (const [m, re] of expectations) {
       mode = m;
       let err: unknown; try { await up.execute(call("demo", "echo")); } catch (e) { err = e; }
       expect(err, String(m)).toBeInstanceOf(UpstreamError);
       expect((err as Error).message, String(m)).toMatch(re);
-      expect((err as Error).message).not.toContain(TOKEN_A);
+      expect((err as Error).message).not.toContain(TOKEN_A); expect((err as Error).message).not.toMatch(/exploded|Unknown tool|html/);
     }
     // a wrong bearer at connect time: the 401 is reported without the token
     const b = await fake({ bearer: "something-else" });
@@ -240,7 +241,7 @@ describe("upstream: connectUpstreams over Streamable HTTP 2026-07-28", () => {
   });
   it("tool-name refusals: a name outside [A-Za-z0-9_.-]{1,128}, a duplicate, a non-array tools field and an unbounded cursor chain refuse the upstream", async () => {
     const a = await fake({ pages: [[{ name: "bad name!" }]] });
-    await expect(connectUpstreams([{ name: "demo", transport: "http", url: a.url }], noSecrets)).rejects.toThrow(/tool name "bad name!" is outside/);
+    await expect(connectUpstreams([{ name: "demo", transport: "http", url: a.url }], noSecrets)).rejects.toThrow(/tools\/list page 0 tool #0 has a name outside/); // by index, never echoing the name (F1)
     const b = await fake({ pages: [[TOOL_ECHO, TOOL_ECHO]] });
     await expect(connectUpstreams([{ name: "demo", transport: "http", url: b.url }], noSecrets)).rejects.toThrow(/duplicate tool name echo/);
     const c = await fake({ rawResponse: (req, res) => { if (req.headers["mcp-method"] !== "tools/list") return false; json(res, 200, { jsonrpc: "2.0", id: 2, result: { resultType: "complete", tools: "nope" } }); return true; } });
@@ -256,13 +257,188 @@ describe("upstream: connectUpstreams over Streamable HTTP 2026-07-28", () => {
     expect(encodeHeaderValue("line1\nline2")).toBe("=?base64?bGluZTEKbGluZTI=?=");
     expect(encodeHeaderValue("=?base64?literal?=")).toBe("=?base64?PT9iYXNlNjQ/bGl0ZXJhbD89?=");
   });
-  it("sseResponse: CR, LF and CRLF line endings, a BOM, comments, multi-line data, unknown fields; returns the response with the wanted id", () => {
+  it("SseParser (F7): incremental across arbitrary chunk boundaries; CR, LF, CRLF, BOM, comments, multi-line data, unknown fields; an unterminated event at EOF is DISCARDED (WHATWG)", () => {
     const want = { jsonrpc: "2.0", id: 7, result: { resultType: "complete", content: [] } };
-    const stream = `﻿: comment\r\nevent: message\rid: 1\nretry: 10\ndata: {"jsonrpc":"2.0","method":"notifications/progress"}\n\ndata: {"jsonrpc":"2.0",\rdata: "id":7,"result":{"resultType":"complete","content":[]}}\r\n\r\n`;
-    expect(sseResponse(stream, 7)).toEqual(want);
-    expect(sseResponse(stream, 8)).toBeUndefined();
-    expect(sseResponse(`data: {"jsonrpc":"2.0","id":7,"result":{}}`, 7)).toEqual({ jsonrpc: "2.0", id: 7, result: {} }); // no trailing blank line: dispatched at end of stream
-    expect(sseResponse("data:\n\n", 7)).toBeUndefined();
-    expect(sseResponse("data: not json\n\n", 7)).toBeUndefined();
+    const stream = `\ufeff: comment\r\nevent: message\rid: 1\nretry: 10\ndata: {"jsonrpc":"2.0","method":"notifications/progress"}\n\ndata: {"jsonrpc":"2.0",\rdata: "id":7,"result":{"resultType":"complete","content":[]}}\r\n\r\n`;
+    const bytes = Buffer.from(stream, "utf8");
+    for (const size of [1, 2, 3, 7, 64, bytes.length]) {
+      const p = new SseParser(); const got: unknown[] = [];
+      for (let i = 0; i < bytes.length; i += size) got.push(...p.push(bytes.subarray(i, i + size)));
+      got.push(...p.end());
+      expect(got, `chunk size ${size}`).toEqual([{ jsonrpc: "2.0", method: "notifications/progress" }, want]);
+    }
+    const partial = new SseParser();
+    expect(partial.push(Buffer.from(`data: {"jsonrpc":"2.0","id":7,"result":{}}`))).toEqual([]);
+    expect(partial.end()).toEqual([]); // no terminating blank line: not an event (the old behaviour dispatched it; Astra F7)
+    const empty = new SseParser(); expect([...empty.push(Buffer.from("data:\n\n")), ...empty.end()]).toEqual([]);
+    const junk = new SseParser(); expect([...junk.push(Buffer.from("data: not json\n\n")), ...junk.end()]).toEqual([]);
+  });
+});
+
+// ---------- Fix round after Astra's review (docs/reviews/2026-10-03-astra-slice-2a-proxy-review.md) ----------
+const ARG_CANARY = "raw-argument-canary-0d3e7b";
+const rawErrorFake = (status: number, body: (id: unknown, req: IncomingMessage, params: Record<string, unknown>) => unknown) =>
+  fake({ bearer: TOKEN_A, call: (params, id, res) => json(res, status, body(id, (res.req as IncomingMessage), params)) });
+
+describe("upstream F1: diagnostics are value-free (error class + upstream name + validated status/code; never upstream text, headers or arguments)", () => {
+  const reflect = (id: unknown, req: IncomingMessage, params: Record<string, unknown>) => ({ jsonrpc: "2.0", id, error: { code: -32000, message: `saw ${String(req.headers.authorization)} and ${JSON.stringify(params["arguments"])}`, data: { authorization: req.headers.authorization, args: params["arguments"] } } });
+  it.each([[200, "HTTP 200 JSON-RPC error", /tools\/call failed \(JSON-RPC error -32000\)/], [500, "HTTP 500 JSON-RPC error", /HTTP 500 on tools\/call/]])("status %i (%s): the reflected token and argument reach neither the exception nor its name", async (status, _label, re) => {
+    const a = await rawErrorFake(status, reflect);
+    const up = await connectUpstreams([{ name: "demo", transport: "http", url: a.url }], secrets({ demo: { bearerToken: TOKEN_A } }));
+    let err: unknown; try { await up.execute(call("demo", "echo", { message: ARG_CANARY })); } catch (e) { err = e; }
+    expect(err).toBeInstanceOf(UpstreamError);
+    const text = `${(err as Error).name} ${(err as Error).message} ${JSON.stringify(err)} ${String((err as Error).stack)}`;
+    expect(text).not.toContain(TOKEN_A); expect(text).not.toContain(ARG_CANARY); expect(text).not.toContain("saw ");
+    expect((err as Error).message).toMatch(re);
+    await up.close();
+  });
+  it("an SSE error event is as value-free as a JSON one; a non-integer error code is reported as malformed, not echoed", async () => {
+    let mode: "sse" | "badcode" = "sse";
+    const a = await fake({ bearer: TOKEN_A, call: (params, id, res) => {
+      if (mode === "badcode") return json(res, 200, { jsonrpc: "2.0", id, error: { code: `code-${TOKEN_A}`, message: ARG_CANARY } });
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(`data: ${JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32603, message: `${TOKEN_A} ${JSON.stringify(params["arguments"])}` } })}\n\n`);
+    } });
+    const up = await connectUpstreams([{ name: "demo", transport: "http", url: a.url }], secrets({ demo: { bearerToken: TOKEN_A } }));
+    for (const m of ["sse", "badcode"] as const) {
+      mode = m;
+      let err: unknown; try { await up.execute(call("demo", "echo", { message: ARG_CANARY })); } catch (e) { err = e; }
+      expect(err, m).toBeInstanceOf(UpstreamError);
+      expect((err as Error).message, m).not.toContain(TOKEN_A); expect((err as Error).message, m).not.toContain(ARG_CANARY);
+      expect((err as Error).message, m).toMatch(m === "sse" ? /failed \(JSON-RPC error -32603\)/ : /failed \(malformed JSON-RPC error\)/);
+    }
+    await up.close();
+  });
+  it("connect time: a discover failure that echoes the Authorization header, and a supportedVersions list carrying junk, are reported without the values", async () => {
+    const echo = await fake({ rawResponse: (req, res) => { json(res, 500, { jsonrpc: "2.0", id: 1, error: { code: -32603, message: `auth was ${String(req.headers.authorization)}` } }); return true; } });
+    let err: unknown; try { await connectUpstreams([{ name: "demo", transport: "http", url: echo.url }], secrets({ demo: { bearerToken: TOKEN_A } })); } catch (e) { err = e; }
+    expect((err as Error).message).toBe("upstream demo: HTTP 500 on server/discover"); expect((err as Error).message).not.toContain(TOKEN_A);
+    const junk = await fake({ supportedVersions: ["2025-11-25", `v-${TOKEN_A}`, "x".repeat(500)] });
+    try { await connectUpstreams([{ name: "demo", transport: "http", url: junk.url }], secrets({ demo: { bearerToken: TOKEN_A } })); } catch (e) { err = e; }
+    expect((err as Error).message).toBe('upstream demo does not support MCP 2026-07-28 (supportedVersions: ["2025-11-25"] and 2 unparseable entries)');
+    const notArray = await fake({ supportedVersions: TOKEN_A as unknown as string[] });
+    try { await connectUpstreams([{ name: "demo", transport: "http", url: notArray.url }], secrets({ demo: { bearerToken: TOKEN_A } })); } catch (e) { err = e; }
+    expect((err as Error).message).toMatch(/server\/discover result has no supportedVersions array/); expect((err as Error).message).not.toContain(TOKEN_A);
+  });
+  it("a tool whose name fails the pattern is refused by INDEX, not by echoing the name", async () => {
+    const a = await fake({ pages: [[TOOL_ECHO, { name: `bad name ${TOKEN_A}` }]] });
+    let err: unknown; try { await connectUpstreams([{ name: "demo", transport: "http", url: a.url }], noSecrets); } catch (e) { err = e; }
+    expect((err as Error).message).toBe("upstream demo: tools/list page 0 tool #1 has a name outside [A-Za-z0-9_.-]{1,128}");
+  });
+});
+
+describe("upstream F2: the JSON-RPC envelope and the tools/call result are validated; malformed = UpstreamError, never a success", () => {
+  const malformed: [string, (id: unknown) => unknown, RegExp][] = [
+    ["result shape: content not an array, isError a string", (id) => ({ jsonrpc: "2.0", id, result: { resultType: "complete", content: "not-content", isError: "true" } }), /tools\/call result is malformed \(content\)/],
+    ["jsonrpc 1.0 envelope", (id) => ({ jsonrpc: "1.0", id, result: { resultType: "complete", content: [] } }), /response is not a JSON-RPC 2\.0 message/],
+    ["content: [null]", (id) => ({ jsonrpc: "2.0", id, result: { resultType: "complete", content: [null] } }), /result is malformed \(content\[0\]\)/],
+    ["text block without text", (id) => ({ jsonrpc: "2.0", id, result: { resultType: "complete", content: [{ type: "text" }] } }), /result is malformed \(content\[0\]\)/],
+    ["unknown block type", (id) => ({ jsonrpc: "2.0", id, result: { resultType: "complete", content: [{ type: "video", data: "x" }] } }), /result is malformed \(content\[0\]\)/],
+    ["resource_link without uri", (id) => ({ jsonrpc: "2.0", id, result: { resultType: "complete", content: [{ type: "resource_link", name: "x" }] } }), /result is malformed \(content\[0\]\)/],
+    ["isError not boolean", (id) => ({ jsonrpc: "2.0", id, result: { resultType: "complete", content: [], isError: 1 } }), /result is malformed \(isError\)/],
+    ["resultType not a string", (id) => ({ jsonrpc: "2.0", id, result: { resultType: 7, content: [] } }), /result is malformed \(resultType\)/],
+    ["unrecognised resultType", (id) => ({ jsonrpc: "2.0", id, result: { resultType: "partial", content: [] } }), /result is malformed \(resultType\)/],
+    ["both result and error", (id) => ({ jsonrpc: "2.0", id, result: { resultType: "complete", content: [] }, error: { code: 1, message: "x" } }), /carries both result and error/],
+    ["result not an object", (id) => ({ jsonrpc: "2.0", id, result: "ok" }), /tools\/call result is not an object/],
+    ["error not an object", (id) => ({ jsonrpc: "2.0", id, error: "boom" }), /failed \(malformed JSON-RPC error\)/],
+  ];
+  it.each(malformed)("%s → UpstreamError", async (_label, body, re) => {
+    const a = await fake({ call: (_p, id, res) => json(res, 200, body(id)) });
+    const up = await connectUpstreams([{ name: "demo", transport: "http", url: a.url }], noSecrets);
+    let err: unknown; try { await up.execute(call("demo", "echo")); } catch (e) { err = e; }
+    expect(err).toBeInstanceOf(UpstreamError); expect((err as Error).message).toMatch(re);
+    await up.close();
+  });
+  it("valid shapes pass: every content block type with its required fields; absent resultType is `complete` (base protocol MUST); isError absent → false; extra result members are dropped", async () => {
+    const content = [
+      { type: "text", text: "t", annotations: { audience: ["user"] } },
+      { type: "image", data: "aGk=", mimeType: "image/png" },
+      { type: "audio", data: "aGk=", mimeType: "audio/wav" },
+      { type: "resource_link", uri: "file:///x", name: "x", description: "d" },
+      { type: "resource", resource: { uri: "file:///x", text: "body" } },
+      { type: "resource", resource: { uri: "file:///y", blob: "aGk=", mimeType: "application/octet-stream" } },
+    ];
+    let withType = true;
+    const a = await fake({ call: (_p, id, res) => json(res, 200, { jsonrpc: "2.0", id, result: { ...(withType ? { resultType: "complete" } : {}), content, structuredContent: { a: 1 }, extra: "dropped" } }) });
+    const up = await connectUpstreams([{ name: "demo", transport: "http", url: a.url }], noSecrets);
+    expect(await up.execute(call("demo", "echo"))).toEqual({ content, isError: false });
+    withType = false;
+    expect(await up.execute(call("demo", "echo"))).toEqual({ content, isError: false });
+    await up.close();
+  });
+  it("discover and list envelopes are validated too: a non-complete discover result, a tools entry that is not an object, a non-string nextCursor", async () => {
+    const d = await fake({ rawResponse: (req, res) => { if (req.headers["mcp-method"] !== "server/discover") return false; json(res, 200, { jsonrpc: "2.0", id: 1, result: { resultType: "input_required", supportedVersions: ["2026-07-28"] } }); return true; } });
+    await expect(connectUpstreams([{ name: "demo", transport: "http", url: d.url }], noSecrets)).rejects.toThrow(/server\/discover result is malformed \(resultType\)/);
+    const t = await fake({ pages: [["nope" as unknown as Record<string, unknown>]] });
+    await expect(connectUpstreams([{ name: "demo", transport: "http", url: t.url }], noSecrets)).rejects.toThrow(/tools\/list page 0 tool #0 is not an object/);
+  });
+});
+
+describe("upstream F4 (client side): x-mcp-header parameters are mirrored into Mcp-Param-* headers; invalid annotations exclude the tool", () => {
+  const TOOL_HDR = { name: "query", inputSchema: { type: "object", properties: {
+    tenant: { type: "string", "x-mcp-header": "Tenant" }, count: { type: "integer", "x-mcp-header": "Count" }, flag: { type: "boolean", "x-mcp-header": "Flag" },
+    nested: { type: "object", properties: { region: { type: "string", "x-mcp-header": "Region" }, "x-mcp-header": { type: "string" } } },
+    plain: { type: "string" },
+  }, required: ["tenant"] } };
+  it("string/integer/boolean and nested values are sent, encoded per Value Encoding; null and absent values omit the header; a property NAMED x-mcp-header is not an annotation", async () => {
+    const a = await fake({ pages: [[TOOL_HDR]] });
+    const up = await connectUpstreams([{ name: "demo", transport: "http", url: a.url }], noSecrets);
+    expect((await up.listTools()).map((t) => t.name)).toEqual(["query"]);
+    await up.execute(call("demo", "query", { tenant: "Hello, 世界", count: 42, flag: true, nested: { region: "us-west1", "x-mcp-header": "literal" }, plain: "p" }));
+    const h = a.seen.at(-1)!.headers;
+    expect(h["mcp-param-tenant"]).toBe("=?base64?SGVsbG8sIOS4lueVjA==?="); expect(h["mcp-param-count"]).toBe("42"); expect(h["mcp-param-flag"]).toBe("true"); expect(h["mcp-param-region"]).toBe("us-west1");
+    expect(Object.keys(h).filter((k) => k.startsWith("mcp-param-")).sort()).toEqual(["mcp-param-count", "mcp-param-flag", "mcp-param-region", "mcp-param-tenant"]);
+    await up.execute(call("demo", "query", { tenant: "t", count: null, nested: {} }));
+    expect(Object.keys(a.seen.at(-1)!.headers).filter((k) => k.startsWith("mcp-param-"))).toEqual(["mcp-param-tenant"]);
+    await expect(up.execute(call("demo", "query", { tenant: "t", count: 1.5 }))).rejects.toThrow(/argument for header parameter Count is not mirrorable/);
+    await expect(up.execute(call("demo", "query", { tenant: { nested: true } }))).rejects.toThrow(/argument for header parameter Tenant is not mirrorable/);
+    await up.close();
+  });
+  it("tool definitions with an invalid x-mcp-header (number type, under items/oneOf/$ref, empty, non-token, duplicate case-insensitively, non-string) are excluded from listTools() and reported on rejectedTools with tool name + reason only", async () => {
+    const bad = [
+      { name: "num", inputSchema: { type: "object", properties: { n: { type: "number", "x-mcp-header": "N" } } } },
+      { name: "items", inputSchema: { type: "object", properties: { l: { type: "array", items: { type: "string", "x-mcp-header": "L" } } } } },
+      { name: "oneof", inputSchema: { type: "object", oneOf: [{ properties: { a: { type: "string", "x-mcp-header": "A" } } }] } },
+      { name: "ref", inputSchema: { type: "object", properties: { a: { $ref: "#/$defs/x" } }, $defs: { x: { type: "string", "x-mcp-header": `A${TOKEN_B}` } } } },
+      { name: "empty", inputSchema: { type: "object", properties: { a: { type: "string", "x-mcp-header": "" } } } },
+      { name: "token", inputSchema: { type: "object", properties: { a: { type: "string", "x-mcp-header": "Bad Name" } } } },
+      { name: "dup", inputSchema: { type: "object", properties: { a: { type: "string", "x-mcp-header": "Tenant" }, b: { type: "integer", "x-mcp-header": "TENANT" } } } },
+      { name: "notstring", inputSchema: { type: "object", properties: { a: { type: "string", "x-mcp-header": 7 } } } },
+      { name: "untyped", inputSchema: { type: "object", properties: { a: { "x-mcp-header": "A" } } } },
+    ];
+    const a = await fake({ pages: [[TOOL_ECHO, ...bad, TOOL_HDR]] });
+    const up = await connectUpstreams([{ name: "demo", transport: "http", url: a.url }], noSecrets);
+    expect((await up.listTools()).map((t) => t.name)).toEqual(["echo", "query"]);
+    expect(up.rejectedTools!.map((r) => r.tool)).toEqual(bad.map((b) => b.name));
+    expect(up.rejectedTools!.every((r) => r.server === "demo" && /^x-mcp-header: /.test(r.reason))).toBe(true);
+    expect(JSON.stringify(up.rejectedTools)).not.toContain(TOKEN_B);
+    expect(headerParams(TOOL_HDR.inputSchema)).toEqual([
+      { path: ["tenant"], name: "Tenant", type: "string" }, { path: ["count"], name: "Count", type: "integer" }, { path: ["flag"], name: "Flag", type: "boolean" }, { path: ["nested", "region"], name: "Region", type: "string" },
+    ]);
+    expect(headerParams({ type: "object" })).toEqual([]); expect(headerParams(undefined)).toEqual([]);
+    expect(() => headerParams(bad[1]!.inputSchema)).toThrow(/x-mcp-header: not statically reachable/);
+    await up.close();
+  });
+});
+
+describe("upstream F7: SSE responses settle on the framed terminal event and release the stream", () => {
+  it("a complete terminal event on a stream that stays OPEN resolves the call; the response reader is cancelled; an unterminated final event at EOF is not a response", async () => {
+    let mode: "open" | "unterminated" = "open";
+    const a = await fake({ call: (_p, id, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      const terminal = JSON.stringify({ jsonrpc: "2.0", id, result: { resultType: "complete", content: [{ type: "text", text: "streamed" }], isError: false } });
+      if (mode === "unterminated") { res.end(`data: ${terminal}`); return; }
+      res.write(`: hello\n\ndata: ${terminal.slice(0, 10)}`);
+      setTimeout(() => res.write(`${terminal.slice(10)}\r\n\r\n`), 20); // the event is split across chunks and the stream never ends
+    } });
+    const up = await connectUpstreams([{ name: "demo", transport: "http", url: a.url }], noSecrets);
+    const started = Date.now();
+    expect(await up.execute(call("demo", "echo"))).toEqual({ content: [{ type: "text", text: "streamed" }], isError: false });
+    expect(Date.now() - started).toBeLessThan(5_000);
+    await vi.waitFor(() => expect(a.pending[0]!.destroyed || a.pending[0]!.writableEnded || !a.pending[0]!.socket?.writable).toBe(true)); // reader cancelled → server side closed
+    mode = "unterminated";
+    await expect(up.execute(call("demo", "echo"))).rejects.toThrow(/SSE stream ended without a response/);
+    for (const res of a.pending) res.destroy();
+    await up.close();
   });
 });

@@ -5,7 +5,13 @@ import type { SecretsProvider } from "../secrets/contract.js";
 import { notImplemented } from "../types/not-implemented.js";
 
 export interface UpstreamConfig { name: string; transport: "stdio" | "http"; command?: string; args?: string[]; url?: string; }
-export interface Upstream { listTools(): Promise<ToolInfo[]>; execute(call: ToolCall): Promise<ToolResult>; close(): Promise<void>; }
+/** A tool definition the client refused per the transport's `x-mcp-header` rules (excluded from `listTools()`); `reason` is value-free. */
+export interface RejectedTool { server: string; tool: string; reason: string; }
+export interface Upstream {
+  listTools(): Promise<ToolInfo[]>; execute(call: ToolCall): Promise<ToolResult>; close(): Promise<void>;
+  /** Additive (Slice 2a fix round, F4): tools excluded at connect time, so the composition root can log the spec's SHOULD warning. */
+  readonly rejectedTools?: readonly RejectedTool[];
+}
 
 // ---------- MCP 2026-07-28 client constants (Slice 2a pin 4; re-read 2026-10-03, see README) ----------
 export const UPSTREAM_PROTOCOL_VERSION = "2026-07-28" as const;
@@ -18,8 +24,10 @@ export const UPSTREAM_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 export const UPSTREAM_MAX_LIST_PAGES = 64;
 /** Tool names we accept from an upstream (spec: SHOULD be 1-128 of [A-Za-z0-9_.-]); the registry loader has the same rule. */
 export const UPSTREAM_TOOL_NAME_RE = /^[A-Za-z0-9_.-]{1,128}$/;
-/** What `execute` answers for a `resultType !== "complete"` (MRTR `input_required`) result: never forwarded (pin 4). */
+/** What `execute` answers for a `resultType === "input_required"` (MRTR) result: never forwarded (pin 4). */
 export const UPSTREAM_INPUT_REQUIRED_TEXT = "upstream requires interactive input; not supported by the proxy" as const;
+/** A protocol version as the versioning page writes it; anything else in `supportedVersions` is counted, never echoed (F1). */
+const VERSION_RE = /^\d{4}-\d{2}-\d{2}$/;
 const META_VERSION = "io.modelcontextprotocol/protocolVersion";
 const META_CAPS = "io.modelcontextprotocol/clientCapabilities";
 const META_CLIENT = "io.modelcontextprotocol/clientInfo";
@@ -28,19 +36,26 @@ const META_CLIENT = "io.modelcontextprotocol/clientInfo";
 export class UpstreamTimeout extends Error { override name = "UpstreamTimeout"; }
 /** `close()` aborted the request. */
 export class UpstreamClosed extends Error { override name = "UpstreamClosed"; }
-/** The upstream answered, but not with a usable 2026-07-28 response (HTTP status, JSON-RPC error, framing, size). */
+/**
+ * The upstream answered, but not with a usable 2026-07-28 response (HTTP status, JSON-RPC error, framing, size, shape).
+ * The message is value-free: error class, upstream name, method, and a validated status or integer error code; never
+ * upstream text, headers or arguments (Astra review F1).
+ */
 export class UpstreamError extends Error { override name = "UpstreamError"; }
 
 const clientVersion = (() => { try { return String((createRequire(import.meta.url)("../../package.json") as { version?: unknown }).version ?? "0.0.0"); } catch { return "0.0.0"; } })();
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
 /**
  * Pin 4. `transport: "http"` only (`stdio` → notImplemented, 2b). At construction, per upstream: `secrets.get(name)`
  * (a `bearerToken` entry becomes `Authorization: Bearer …` on every request to THAT upstream; the value is closed over,
  * never on the returned object or in an error) → `server/discover` (must list 2026-07-28) → `tools/list` (every page).
  * Every request carries `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` (tools/call; Base64 sentinel when needed),
- * `Accept: application/json, text/event-stream`, and `_meta` { protocolVersion, clientCapabilities: {}, clientInfo }.
- * `application/json` and `text/event-stream` responses are both accepted; an SSE stream is read to the JSON-RPC
- * response with the request's id (notifications ignored); no terminal response → throw. Bodies over 4 MiB → throw.
+ * `Mcp-Param-*` for the tool's valid `x-mcp-header` parameters, `Accept: application/json, text/event-stream`, and
+ * `_meta` { protocolVersion, clientCapabilities: {}, clientInfo }. `application/json` and `text/event-stream` responses
+ * are both accepted; an SSE stream is parsed incrementally and settles on the JSON-RPC response with the request's id
+ * (notifications ignored); no terminal response → throw. Bodies over 4 MiB → throw. Every envelope and result is
+ * validated before it becomes a ToolResult (F2).
  */
 export async function connectUpstreams(config: UpstreamConfig[], secrets: SecretsProvider): Promise<Upstream> {
   if (!Array.isArray(config)) throw new Error("upstream: config must be an array");
@@ -51,7 +66,7 @@ export async function connectUpstreams(config: UpstreamConfig[], secrets: Secret
   let closed = false;
   for (const u of config) {
     if (!u || typeof u !== "object") throw new Error("upstream: each entry must be an object");
-    if (typeof u.name !== "string" || !MCP_SERVER_NAME_RE.test(u.name)) throw new Error(`upstream: ${JSON.stringify(String(u.name))} is not an MCP server name`);
+    if (typeof u.name !== "string" || !MCP_SERVER_NAME_RE.test(u.name)) throw new Error(`upstream: ${JSON.stringify(String(u.name)).slice(0, 80)} is not an MCP server name`);
     if ((RESERVED_SERVER_NAMES as readonly string[]).includes(u.name.toLowerCase().replace(/[^a-z0-9]/g, ""))) throw new Error(`upstream: ${u.name} impersonates a builtin namespace`);
     if (seen.has(u.name)) throw new Error(`upstream: duplicate upstream name ${u.name}`);
     seen.add(u.name);
@@ -67,28 +82,39 @@ export async function connectUpstreams(config: UpstreamConfig[], secrets: Secret
     clients.set(u.name, new HttpClient(u.name, url.toString(), bearer, inflight, () => closed));
   }
   const tools: ToolInfo[] = [];
+  const rejected: RejectedTool[] = [];
+  const params = new Map<string, HeaderParam[]>(); // `${server}\0${tool}` → the tool's validated x-mcp-header parameters
   for (const [name, client] of clients) {
-    const discover = asRecord(await client.request("server/discover", {}, undefined, UPSTREAM_TIMEOUT_MS), name, "server/discover result");
-    const versions = Array.isArray(discover["supportedVersions"]) ? (discover["supportedVersions"] as unknown[]).map(String) : [];
-    if (!versions.includes(UPSTREAM_PROTOCOL_VERSION)) throw new UpstreamError(`upstream ${name} does not support MCP ${UPSTREAM_PROTOCOL_VERSION} (supportedVersions: ${JSON.stringify(versions)})`);
+    const discover = await client.request("server/discover", {}, undefined, UPSTREAM_TIMEOUT_MS, false);
+    const sv = discover["supportedVersions"];
+    if (!Array.isArray(sv)) throw new UpstreamError(`upstream ${name}: server/discover result has no supportedVersions array`);
+    const versions = sv.filter((v): v is string => typeof v === "string" && VERSION_RE.test(v));
+    if (!versions.includes(UPSTREAM_PROTOCOL_VERSION)) {
+      const bad = sv.length - versions.length;
+      throw new UpstreamError(`upstream ${name} does not support MCP ${UPSTREAM_PROTOCOL_VERSION} (supportedVersions: ${JSON.stringify(versions)}${bad > 0 ? ` and ${bad} unparseable entries` : ""})`);
+    }
     const names = new Set<string>();
     let cursor: string | undefined;
     for (let page = 0; ; page++) {
       if (page >= UPSTREAM_MAX_LIST_PAGES) throw new UpstreamError(`upstream ${name}: tools/list did not end within ${UPSTREAM_MAX_LIST_PAGES} pages`);
-      const result = asRecord(await client.request("tools/list", cursor === undefined ? {} : { cursor }, undefined, UPSTREAM_TIMEOUT_MS), name, "tools/list result");
+      const result = await client.request("tools/list", cursor === undefined ? {} : { cursor }, undefined, UPSTREAM_TIMEOUT_MS, false);
       if (!Array.isArray(result["tools"])) throw new UpstreamError(`upstream ${name}: tools/list result has no tools array`);
-      for (const raw of result["tools"] as unknown[]) {
-        const t = asRecord(raw, name, "tool");
-        const toolName = t["name"];
-        if (typeof toolName !== "string" || !UPSTREAM_TOOL_NAME_RE.test(toolName)) throw new UpstreamError(`upstream ${name}: tool name ${JSON.stringify(String(toolName)).slice(0, 160)} is outside [A-Za-z0-9_.-]{1,128}`);
+      (result["tools"] as unknown[]).forEach((raw, i) => {
+        if (!isRecord(raw)) throw new UpstreamError(`upstream ${name}: tools/list page ${page} tool #${i} is not an object`);
+        const toolName = raw["name"];
+        if (typeof toolName !== "string" || !UPSTREAM_TOOL_NAME_RE.test(toolName)) throw new UpstreamError(`upstream ${name}: tools/list page ${page} tool #${i} has a name outside [A-Za-z0-9_.-]{1,128}`);
         if (names.has(toolName)) throw new UpstreamError(`upstream ${name}: duplicate tool name ${toolName}`);
         names.add(toolName);
+        let hp: HeaderParam[];
+        try { hp = headerParams(raw["inputSchema"]); }
+        catch (e) { rejected.push({ server: name, tool: toolName, reason: e instanceof Error ? e.message : "x-mcp-header: invalid" }); return; } // transport: the client MUST exclude the tool
+        params.set(`${name}\0${toolName}`, hp);
         const info: ToolInfo = { server: name, name: toolName };
-        if (typeof t["description"] === "string") info.description = t["description"];
-        if (t["inputSchema"] !== undefined) info.inputSchema = t["inputSchema"];
-        if (t["annotations"] !== undefined && typeof t["annotations"] === "object" && t["annotations"] !== null) info.annotations = t["annotations"] as ToolAnnotations;
+        if (typeof raw["description"] === "string") info.description = raw["description"];
+        if (raw["inputSchema"] !== undefined) info.inputSchema = raw["inputSchema"];
+        if (isRecord(raw["annotations"])) info.annotations = raw["annotations"] as ToolAnnotations;
         tools.push(info);
-      }
+      });
       const next = result["nextCursor"];
       if (next === undefined || next === null) break;
       if (typeof next !== "string" || next.length === 0) throw new UpstreamError(`upstream ${name}: tools/list nextCursor is not a string`);
@@ -96,15 +122,27 @@ export async function connectUpstreams(config: UpstreamConfig[], secrets: Secret
     }
   }
   return {
+    rejectedTools: Object.freeze(rejected.map((r) => ({ ...r }))),
     async listTools() { return structuredClone(tools); },
     async execute(call) {
       if (!call || typeof call.server !== "string" || typeof call.tool !== "string") throw new Error("upstream: malformed call");
       const client = clients.get(call.server);
       if (!client) throw new Error(`upstream: unknown upstream ${call.server}`);
-      const args = typeof call.args === "object" && call.args !== null && !Array.isArray(call.args) ? call.args : {};
-      const result = asRecord(await client.request("tools/call", { name: call.tool, arguments: args }, call.tool, UPSTREAM_TIMEOUT_MS), call.server, "tools/call result");
-      if (result["resultType"] !== "complete") return { content: [{ type: "text", text: UPSTREAM_INPUT_REQUIRED_TEXT }], isError: true };
-      return { content: Array.isArray(result["content"]) ? result["content"] : [], isError: result["isError"] === true };
+      const args = isRecord(call.args) ? call.args : {};
+      const extra: Record<string, string> = {};
+      for (const p of params.get(`${call.server}\0${call.tool}`) ?? []) {
+        const v = mirrorValue(valueAt(args, p.path));
+        if (v === null) throw new UpstreamError(`upstream ${call.server}: argument for header parameter ${p.name} is not mirrorable`);
+        if (v !== undefined) extra[`mcp-param-${p.name.toLowerCase()}`] = encodeHeaderValue(v);
+      }
+      const result = await client.request("tools/call", { name: call.tool, arguments: args }, call.tool, UPSTREAM_TIMEOUT_MS, true, extra);
+      if (result["resultType"] === "input_required") return { content: [{ type: "text", text: UPSTREAM_INPUT_REQUIRED_TEXT }], isError: true };
+      const content = result["content"];
+      if (!Array.isArray(content)) throw new UpstreamError(`upstream ${call.server}: tools/call result is malformed (content)`);
+      content.forEach((b, i) => { if (!validContentBlock(b)) throw new UpstreamError(`upstream ${call.server}: tools/call result is malformed (content[${i}])`); });
+      const isError = result["isError"];
+      if (isError !== undefined && typeof isError !== "boolean") throw new UpstreamError(`upstream ${call.server}: tools/call result is malformed (isError)`);
+      return { content: structuredClone(content), isError: isError === true };
     },
     async close() {
       closed = true;
@@ -114,11 +152,71 @@ export async function connectUpstreams(config: UpstreamConfig[], secrets: Secret
   };
 }
 
-function asRecord(v: unknown, name: string, what: string): Record<string, unknown> {
-  if (typeof v !== "object" || v === null || Array.isArray(v)) throw new UpstreamError(`upstream ${name}: ${what} is not an object`);
-  return v as Record<string, unknown>;
+/** Tools page "Tool Result": the five content block types and the fields each one requires (re-read 2026-10-03). */
+function validContentBlock(b: unknown): boolean {
+  if (!isRecord(b) || typeof b["type"] !== "string") return false;
+  switch (b["type"]) {
+    case "text": return typeof b["text"] === "string";
+    case "image": case "audio": return typeof b["data"] === "string" && typeof b["mimeType"] === "string";
+    case "resource_link": return typeof b["uri"] === "string" && typeof b["name"] === "string";
+    case "resource": { const r = b["resource"]; return isRecord(r) && typeof r["uri"] === "string" && (typeof r["text"] === "string" || typeof r["blob"] === "string"); }
+    default: return false;
+  }
 }
 
+// ---------- x-mcp-header (transport §Custom Headers from Tool Parameters, re-read 2026-10-03) ----------
+export interface HeaderParam { path: string[]; name: string; type: "string" | "integer" | "boolean"; }
+/** RFC 9110 §5.6.2 token. */
+const TCHAR_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+const SCHEMA_MAP_KEYWORDS = new Set(["properties", "patternProperties", "$defs", "definitions", "dependentSchemas"]);
+/**
+ * The valid `x-mcp-header` parameters of an `inputSchema`, in schema order, or a thrown `Error("x-mcp-header: <reason>")`
+ * when ANY annotation violates the transport's constraints (non-empty tchar token, case-insensitively unique, on a
+ * string/integer/boolean parameter, reachable from the root through `properties` keys only: not through `items`,
+ * composition or conditional keywords, `$ref`, or map keywords other than `properties`). The walk is bounded.
+ * The front has the same function (modules do not import each other); keep them identical.
+ */
+export function headerParams(schema: unknown): HeaderParam[] {
+  if (schema === undefined || schema === null) return [];
+  const out: HeaderParam[] = []; const seen = new Set<string>(); let nodes = 0;
+  const walk = (node: unknown, path: string[] | undefined, depth: number): void => {
+    if (++nodes > 4096 || depth > 32) throw new Error("x-mcp-header: schema too large to validate");
+    if (Array.isArray(node)) { for (const n of node) walk(n, undefined, depth + 1); return; }
+    if (!isRecord(node)) return;
+    if (Object.hasOwn(node, "x-mcp-header")) {
+      if (path === undefined || path.length === 0) throw new Error("x-mcp-header: not statically reachable (only a chain of `properties` keys may lead to it)");
+      const name = node["x-mcp-header"];
+      if (typeof name !== "string" || name.length === 0) throw new Error("x-mcp-header: value must be a non-empty string");
+      if (!TCHAR_RE.test(name)) throw new Error("x-mcp-header: value is not an HTTP field-name token");
+      const type = node["type"];
+      if (type !== "string" && type !== "integer" && type !== "boolean") throw new Error("x-mcp-header: only string, integer and boolean parameters may be mirrored");
+      if (seen.has(name.toLowerCase())) throw new Error("x-mcp-header: duplicate header name (case-insensitive)");
+      seen.add(name.toLowerCase());
+      out.push({ path, name, type });
+    }
+    for (const [k, v] of Object.entries(node)) {
+      if (k === "x-mcp-header") continue;
+      if (SCHEMA_MAP_KEYWORDS.has(k) && isRecord(v)) { for (const [prop, sub] of Object.entries(v)) walk(sub, k === "properties" && path !== undefined ? [...path, prop] : undefined, depth + 1); }
+      else walk(v, undefined, depth + 1);
+    }
+  };
+  walk(schema, [], 0);
+  return out;
+}
+/** The instance value at an exact `properties` path, or undefined (transport: "If no value is present at that path … the header is omitted"). */
+export function valueAt(args: Record<string, unknown>, path: string[]): unknown {
+  let cur: unknown = args;
+  for (const k of path) { if (!isRecord(cur) || !Object.hasOwn(cur, k)) return undefined; cur = cur[k]; }
+  return cur;
+}
+/** Transport §Value Encoding type conversion; `undefined` = omit the header (absent or null), `null` = not a mirrorable primitive. */
+export function mirrorValue(v: unknown): string | undefined | null {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v === "string") return v;
+  if (typeof v === "boolean") return v ? "true" : "false";
+  if (typeof v === "number" && Number.isSafeInteger(v)) return String(v);
+  return null;
+}
 /** RFC 9110 field values are visible ASCII, space and tab; the transport's Base64 sentinel carries anything else (and anything that looks like the sentinel). */
 export function encodeHeaderValue(value: string): string {
   const plain = /^[\x21-\x7e]([\x20-\x7e\t]*[\x21-\x7e])?$/.test(value);
@@ -132,10 +230,12 @@ class HttpClient {
   #id = 0;
   constructor(private readonly name: string, private readonly url: string, bearer: string | undefined, private readonly inflight: Set<AbortController>, private readonly isClosed: () => boolean) { this.#bearer = bearer; }
 
-  async request(method: string, params: Record<string, unknown>, mcpName: string | undefined, timeoutMs: number): Promise<unknown> {
+  /** One JSON-RPC request; resolves to the validated `result` object (`resultType` absent or `complete`, or `input_required` when `allowInputRequired`). */
+  async request(method: string, params: Record<string, unknown>, mcpName: string | undefined, timeoutMs: number, allowInputRequired: boolean, extraHeaders: Record<string, string> = {}): Promise<Record<string, unknown>> {
     if (this.isClosed()) throw new UpstreamClosed("upstream: closed");
     const id = ++this.#id;
     const headers: Record<string, string> = {
+      ...extraHeaders,
       "content-type": "application/json", accept: "application/json, text/event-stream",
       "mcp-protocol-version": UPSTREAM_PROTOCOL_VERSION, "mcp-method": method,
     };
@@ -150,22 +250,37 @@ class HttpClient {
       let res: Response;
       try { res = await fetch(this.url, { method: "POST", headers, body, signal: controller.signal, redirect: "error" }); }
       catch (e) { throw this.abortReason(controller, timedOut, e, method); }
-      const text = await this.readBody(res, controller, timedOut, method);
-      if (res.status !== 200) {
-        const rpc = tryJson(text);
-        const detail = rpc && typeof rpc === "object" && "error" in rpc ? ` (${clip(JSON.stringify((rpc as { error: unknown }).error))})` : "";
-        throw new UpstreamError(`upstream ${this.name}: HTTP ${res.status} on ${method}${detail}`);
-      }
+      if (res.status !== 200) { await res.body?.cancel().catch(() => undefined); throw new UpstreamError(`upstream ${this.name}: HTTP ${res.status} on ${method}`); }
       const ct = (res.headers.get("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
       let message: unknown;
-      if (ct === "application/json") message = tryJson(text) ?? (() => { throw new UpstreamError(`upstream ${this.name}: ${method} response is not JSON`); })();
-      else if (ct === "text/event-stream") message = sseResponse(text, id) ?? (() => { throw new UpstreamError(`upstream ${this.name}: ${method} SSE stream ended without a response`); })();
-      else throw new UpstreamError(`upstream ${this.name}: ${method} response has content-type ${JSON.stringify(ct)}`);
-      const m = asRecord(message, this.name, `${method} response`);
-      if (m["id"] !== id) throw new UpstreamError(`upstream ${this.name}: ${method} response id does not match`);
-      if ("error" in m) throw new UpstreamError(`upstream ${this.name}: ${method} failed: ${clip(JSON.stringify(m["error"]))}`);
-      if (!("result" in m)) throw new UpstreamError(`upstream ${this.name}: ${method} response has neither result nor error`);
-      return m["result"];
+      if (ct === "application/json") {
+        const chunks: Uint8Array[] = [];
+        await this.readBody(res, controller, timedOut, method, (c) => { chunks.push(c); return false; });
+        message = tryJson(Buffer.concat(chunks).toString("utf8"));
+        if (message === undefined) throw new UpstreamError(`upstream ${this.name}: ${method} response is not JSON`);
+      } else if (ct === "text/event-stream") {
+        const parser = new SseParser();
+        const take = (msgs: unknown[]) => { for (const m of msgs) if (message === undefined && isRecord(m) && m["id"] === id && ("result" in m || "error" in m)) message = m; return message !== undefined; };
+        await this.readBody(res, controller, timedOut, method, (c) => take(parser.push(c)));
+        if (message === undefined) take(parser.end());
+        if (message === undefined) throw new UpstreamError(`upstream ${this.name}: ${method} SSE stream ended without a response`);
+      } else { await res.body?.cancel().catch(() => undefined); throw new UpstreamError(`upstream ${this.name}: ${method} response has an unsupported content-type`); }
+      // JSON-RPC envelope (base protocol "Responses", re-read 2026-10-03): 2.0, same id, exactly one of result/error (F2)
+      if (!isRecord(message) || message["jsonrpc"] !== "2.0") throw new UpstreamError(`upstream ${this.name}: ${method} response is not a JSON-RPC 2.0 message`);
+      if (message["id"] !== id) throw new UpstreamError(`upstream ${this.name}: ${method} response id does not match`);
+      const hasResult = "result" in message, hasError = "error" in message;
+      if (hasResult && hasError) throw new UpstreamError(`upstream ${this.name}: ${method} response carries both result and error`);
+      if (hasError) {
+        const err = message["error"];
+        const code = isRecord(err) && Number.isInteger(err["code"]) ? (err["code"] as number) : undefined;
+        throw new UpstreamError(`upstream ${this.name}: ${method} failed (${code === undefined ? "malformed JSON-RPC error" : `JSON-RPC error ${code}`})`);
+      }
+      if (!hasResult) throw new UpstreamError(`upstream ${this.name}: ${method} response has neither result nor error`);
+      const result = message["result"];
+      if (!isRecord(result)) throw new UpstreamError(`upstream ${this.name}: ${method} result is not an object`);
+      const rt = result["resultType"]; // absent = complete (base protocol MUST, for servers of earlier revisions); any unrecognised value is invalid
+      if (!(rt === undefined || rt === "complete" || (allowInputRequired && rt === "input_required"))) throw new UpstreamError(`upstream ${this.name}: ${method} result is malformed (resultType)`);
+      return result;
     } finally { clearTimeout(timer); this.inflight.delete(controller); }
   }
 
@@ -178,59 +293,69 @@ class HttpClient {
     return new UpstreamError(`upstream ${this.name}: ${method} request failed (${e instanceof Error ? e.name : "error"})`);
   }
 
-  /** Reads at most UPSTREAM_MAX_RESPONSE_BYTES; a longer body aborts the request and throws. */
-  private async readBody(res: Response, controller: AbortController, timedOut: boolean, method: string): Promise<string> {
+  /** Streams the body through `sink` under the UPSTREAM_MAX_RESPONSE_BYTES cap; a `true` from the sink stops reading and cancels the stream (F7). */
+  private async readBody(res: Response, controller: AbortController, timedOut: boolean, method: string, sink: (chunk: Uint8Array) => boolean): Promise<void> {
     const declared = Number(res.headers.get("content-length") ?? "0");
     if (Number.isFinite(declared) && declared > UPSTREAM_MAX_RESPONSE_BYTES) { controller.abort(); throw new UpstreamError(`upstream ${this.name}: ${method} response exceeds ${UPSTREAM_MAX_RESPONSE_BYTES} bytes`); }
-    if (!res.body) return "";
+    if (!res.body) return;
     const reader = res.body.getReader();
-    const chunks: Uint8Array[] = []; let size = 0;
+    let size = 0;
     try {
       for (;;) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) return;
         size += value.byteLength;
         if (size > UPSTREAM_MAX_RESPONSE_BYTES) { await reader.cancel().catch(() => undefined); throw new UpstreamError(`upstream ${this.name}: ${method} response exceeds ${UPSTREAM_MAX_RESPONSE_BYTES} bytes`); }
-        chunks.push(value);
+        if (sink(value)) { await reader.cancel().catch(() => undefined); return; }
       }
     } catch (e) {
       if (e instanceof UpstreamError) throw e;
       throw this.abortReason(controller, timedOut, e, method);
     }
-    return Buffer.concat(chunks).toString("utf8");
   }
 }
 
-const clip = (s: string) => (s.length > 200 ? `${s.slice(0, 199)}…` : s);
 function tryJson(text: string): unknown { try { return JSON.parse(text) as unknown; } catch { return undefined; } }
 
 /**
- * WHATWG HTML "Interpreting an event stream" (https://html.spec.whatwg.org/multipage/server-sent-events.html, read
- * 2026-10-03): lines end with CRLF, LF or CR; a line starting with `:` is a comment; field = text before the first `:`,
- * value = text after it minus one leading space; `data` appends value + LF to the buffer; a blank line dispatches (trailing
- * LF removed; empty buffer = no event); other fields (`event`, `id`, `retry`) are ignored here. Returns the JSON-RPC
- * message whose `id` is `wantId` and that carries `result` or `error`, or undefined when the stream had none.
+ * Incremental WHATWG event-stream parser (https://html.spec.whatwg.org/multipage/server-sent-events.html, "Interpreting an
+ * event stream", read 2026-10-03): lines end with CRLF, LF or CR (a trailing CR waits for the next byte so CRLF is not two
+ * lines); a leading BOM is dropped once; `:` lines are comments; field = text before the first `:`, value = the rest minus
+ * one leading space; `data` appends value + LF; a blank line dispatches (trailing LF removed; empty buffer = no event);
+ * `event`/`id`/`retry` are ignored. `push(chunk)` returns the JSON objects dispatched so far; `end()` processes a final
+ * unterminated line and then DISCARDS any pending event data, as the spec requires at EOF (Astra F7).
  */
-export function sseResponse(stream: string, wantId: number): unknown {
-  const text = stream.startsWith("﻿") ? stream.slice(1) : stream;
-  const lines = text.split(/\r\n|\n|\r/);
-  let data = ""; let found: unknown;
-  const dispatch = () => {
-    if (data.length === 0) return;
-    const payload = data.endsWith("\n") ? data.slice(0, -1) : data;
-    data = "";
-    const msg = tryJson(payload);
-    if (found === undefined && typeof msg === "object" && msg !== null && !Array.isArray(msg) && (msg as { id?: unknown }).id === wantId && ("result" in msg || "error" in msg)) found = msg;
-  };
-  for (const line of lines) {
-    if (line.length === 0) { dispatch(); continue; }
-    if (line.startsWith(":")) continue;
+export class SseParser {
+  #decoder = new TextDecoder("utf-8");
+  #buf = ""; #data = ""; #start = true;
+  push(chunk: Uint8Array): unknown[] { this.#buf += this.#decoder.decode(chunk, { stream: true }); return this.#drain(false); }
+  end(): unknown[] { this.#buf += this.#decoder.decode(); const out = this.#drain(true); this.#data = ""; return out; }
+  #drain(eof: boolean): unknown[] {
+    const out: unknown[] = [];
+    if (this.#start && this.#buf.length > 0) { if (this.#buf.startsWith("﻿")) this.#buf = this.#buf.slice(1); this.#start = false; }
+    for (;;) {
+      const i = this.#buf.search(/[\r\n]/);
+      if (i === -1) { if (eof && this.#buf.length > 0) { this.#line(this.#buf, out); this.#buf = ""; } return out; }
+      if (this.#buf[i] === "\r" && i + 1 === this.#buf.length && !eof) return out; // CR at the edge: CRLF may be split across chunks
+      const line = this.#buf.slice(0, i);
+      this.#buf = this.#buf.slice(this.#buf[i] === "\r" && this.#buf[i + 1] === "\n" ? i + 2 : i + 1);
+      this.#line(line, out);
+    }
+  }
+  #line(line: string, out: unknown[]): void {
+    if (line.length === 0) {
+      if (this.#data.length === 0) return;
+      const payload = this.#data.endsWith("\n") ? this.#data.slice(0, -1) : this.#data;
+      this.#data = "";
+      const msg = tryJson(payload);
+      if (isRecord(msg)) out.push(msg);
+      return;
+    }
+    if (line.startsWith(":")) return;
     const colon = line.indexOf(":");
     const field = colon === -1 ? line : line.slice(0, colon);
     let value = colon === -1 ? "" : line.slice(colon + 1);
     if (value.startsWith(" ")) value = value.slice(1);
-    if (field === "data") data += `${value}\n`;
+    if (field === "data") this.#data += `${value}\n`;
   }
-  dispatch();
-  return found;
 }
