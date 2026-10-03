@@ -447,8 +447,8 @@ describe("watchdog + real handler (what Astra's `hook` command does), spec §7 t
     expectDeny(r, /^watchdog:init:exit-1$/);
     expect(r.stderr).toMatch(/impersonates a builtin namespace/);
   }, 15_000);
-  it("createPipeline under the watchdog: a Slack timeoutMs that breaks the clocks fails init → init:exit-1; hook-ask constructs (deadline env present)", async () => {
-    expectDeny(await watchdog(["pipeline-init", "slack-timeout"], { deadline: 3_000, timeoutS: 6 }), /^watchdog:init:exit-1$/);
+  it("createPipeline under the watchdog: a Slack timeoutMs that breaks the clocks constructs and is DENIED by decide() → handler-deny, exit 2 (ADR-011; Astra 1c P2 #3); hook-ask allows (deadline env present)", async () => {
+    expectDeny(await watchdog(["pipeline-init", "slack-timeout"], { deadline: 3_000, timeoutS: 6 }), /slack timeoutMs breaks the hook clocks.*approval-not-below-deadline/, /^watchdog:handler-deny$/);
     const ok = await watchdog(["pipeline-init", "hook-ask"], { deadline: 3_000, timeoutS: 6 });
     expect(ok.code).toBe(0);
   }, 15_000);
