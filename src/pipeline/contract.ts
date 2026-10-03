@@ -68,6 +68,9 @@ export interface Pipeline {
    *   answer `deny`. A registry row for that server name changes nothing: hook names are not identities under Codex.
    * Under Claude Code, MCP hook names are consulted against the registry as before (its `mcp_server.source`
    * provenance is the trust anchor there, per its docs).
+   * Decide-only mode ONLY: on a proxy-mode instance (no `hookAgent`) it throws, mirroring `handle` in decide-only
+   * mode, because the watchdog deadline gate does not apply there and the public method must not become a
+   * deadline-free `allow` (Astra 1c P2 #5, pre-existing). The proxy decides through `handle`.
    */
   decide(incoming: IncomingCall): Promise<HookDecision>;
   /**
@@ -87,7 +90,10 @@ export interface Pipeline {
    * Throws on an unknown agent (nothing to attribute; the handler exits 0 with a stderr line), a `hookAgent` that
    * differs from the pipeline's, proxy mode (no hookAgent: no hook event exists there), a malformed heartbeat, or a
    * failed append (the caller logs; SessionStart cannot block anything). It never consults the watchdog deadline.
-   * The credential is a parameter because `SessionHeartbeat` is stored in the clear and must never carry it.
+   * Signature: `(hb, credential)` per the ADR-010 amendment (proposed by the coordinator 2026-10-03, awaiting Ryan;
+   * pin 3 and ADR-010 item 3 originally read `(hb)`): the heartbeat is attributed through identity like every call, a
+   * credential-less heartbeat would be unattributable, and `SessionHeartbeat` is stored in the clear so it must never
+   * carry the credential itself (Astra 1c P2 #4).
    */
   recordHeartbeat(hb: SessionHeartbeat, credential: AgentCredential): Promise<void>;
 }
@@ -199,15 +205,10 @@ export function createPipeline(deps: PipelineDeps): Pipeline {
   const decideOnly = hookAgent !== undefined;
   if (!decideOnly && approvals.kind === "hook-ask") throw new Error("pipeline: hook-ask is not a channel proxy mode can use (no terminal to ask in); configure a slack channel");
 
-  // ADR-011: `createPipeline` no longer reads the watchdog's ABSOLUTE deadline; `decide()` reads it on every call and
-  // denies when it is missing or past, so the record-only handlers (post, session-start, denied) construct without a
-  // shim. The STATIC Slack clock check (`timeoutMs` against the deadline DURATION) still runs at construction when the
-  // duration is present, because a visibly wrong configuration should fail at init (watchdog `init:exit-1`); when the
-  // duration is absent, `decide()` denies instead. Both checks are repeated inside `decide()` (`deadlineGate`).
-  if (decideOnly && approvals.kind === "slack") {
-    const violation = slackClockViolation(approvals.timeoutMs);
-    if (violation !== null && violation !== "missing") throw new Error(`pipeline: slack timeoutMs breaks the hook clocks: ${violation}`);
-  }
+  // ADR-011: `createPipeline` reads NO watchdog clock, neither the absolute deadline nor the Slack duration. Both are
+  // judged in `decide()` on every call (`deadlineGate`), so the record-only handlers (post, session-start, denied)
+  // construct regardless of what the hook agent's environment inherited from a watchdog (Astra 1c P2 #3, 2026-10-03),
+  // and a `pre` whose clocks are wrong can only produce a deny line (under the watchdog: `handler-deny`, exit 2).
   // `createPipeline` is synchronous and the Slack validator is not: it starts here and its verdict gates every call.
   const slackProblems: Promise<string[]> = approvals.kind === "slack"
     ? Promise.resolve().then(() => validateSlackChannel(approvals)).catch((e: unknown) => [`validateSlackChannel failed: ${message(e)}`])
@@ -353,6 +354,9 @@ export function createPipeline(deps: PipelineDeps): Pipeline {
 
   const pipeline: Pipeline = {
     async decide(incoming) {
+      // Proxy mode has no watchdog in front of it, so `deadlineGate` passes there by design; the public decide() must
+      // therefore not be reachable on such an instance (it would answer `allow` with no deadline). `handle` is its door.
+      if (!decideOnly) throw new Error("pipeline.decide: not available in proxy mode (no hookAgent; no hook event or watchdog exists there; use handle)");
       return (await decideInternal(incoming)).decision;
     },
     async recordOutcome(callId, outcome) {

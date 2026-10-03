@@ -105,8 +105,9 @@ switch (mode) {
   case "pgid": { err(`pid:${process.pid}\n`); spin(); }
   // falls through (never)
   case "pipeline-init": { // Astra pin 4 shape, updated for ADR-011 (Slice 1c): construct the pipeline, then DECIDE one reviewed read.
-    // A construction throw is still a non-zero exit, never a decision (`slack-timeout` with the deadline DURATION present →
-    // init:exit-1). With `hook-ask` the printed line is the REAL `decide()` answer, so the watchdog's absolute deadline is
+    // A construction throw is still a non-zero exit, never a decision; but no watchdog clock is read at construction any
+    // more (ADR-011), so `slack-timeout` constructs and `decide()` prints a deny carrying the `validateHookTiming` violation
+    // (handler-deny, exit 2). With `hook-ask` the printed line is the REAL `decide()` answer, so the watchdog's absolute deadline is
     // exercised: under the watchdog (deadline env present) it is `allow` → exit 0; started without that env the same
     // handler prints a deny carrying WATCHDOG_DEADLINE_DENY_REASON (the integration assertion for the moved watchdog test).
     const { createPipeline } = await import("../../src/pipeline/contract.js");

@@ -130,26 +130,50 @@ describe("createPipeline: construction-time refusals", () => {
     expect(ledger.records.map((r) => r.phase)).toEqual(["outcome", "intent"]);
     expect(ledger.records[1]!.policy.ruleId).toBe(HEARTBEAT_RULE_ID);
   });
-  it("Slack clocks: a timeoutMs that does not fit under AGENT_LEDGER_WATCHDOG_DEADLINE_MS still throws at construction when the duration is PRESENT (init:exit-1 under the watchdog); absent → constructs, decide() denies", async () => {
-    process.env[WATCHDOG_DEADLINE_ENV] = "25000";
-    expect(() => createPipeline(deps({ hookAgent: "codex", approvals: slack }))).toThrow(/approval-not-below-deadline/);
-    expect(() => createPipeline(deps({ hookAgent: "claude-code", approvals: slack }))).toThrow(/approval-not-below-deadline/);
-    expect(() => createPipeline(deps({ hookAgent: "codex", approvals: { ...slack, timeoutMs: 25_000 - APPROVAL_MIN_MARGIN_MS + 1 } }))).toThrow(/approval-not-below-deadline/);
-    expect(() => createPipeline(deps({ hookAgent: "codex", approvals: { ...slack, timeoutMs: 25_000 - APPROVAL_MIN_MARGIN_MS } }))).not.toThrow();
-    process.env[WATCHDOG_DEADLINE_ENV] = String(SLACK_HOOK_TIMING.deadlineMs);
-    expect(() => createPipeline(deps({ hookAgent: "codex", approvals: { ...slack, timeoutMs: SLACK_HOOK_TIMING.approvalTimeoutMs! } }))).not.toThrow();
-    // decide() re-checks on every call: the duration vanishing or shrinking after construction is a deny, never a wait past the deadline
+  it("ADR-011 (Astra 1c P2 #3): construction reads NO watchdog clock, Slack included: an inherited duration that is missing, incompatible or past never blocks record-only use (both agents, both channels); decide() alone judges the clocks", async () => {
+    // The watchdog's variables are inherited by anything the hook agent spawns; a record-only handler must not care what they say.
+    const durations: (string | undefined)[] = [undefined, "25000", "1", "0", "soon"];
+    for (const hookAgent of ["codex", "claude-code"] as const) for (const approvals of [slack, { kind: "hook-ask" as const }]) for (const duration of durations) {
+      const label = `${hookAgent}/${approvals.kind}/${String(duration)}`;
+      if (duration === undefined) delete process.env[WATCHDOG_DEADLINE_ENV]; else process.env[WATCHDOG_DEADLINE_ENV] = duration;
+      process.env[WATCHDOG_DEADLINE_AT_ENV] = String(Date.now() - 1); // and the absolute deadline is already past
+      const l = fakeLedger();
+      let p!: ReturnType<typeof createPipeline>;
+      expect(() => { p = createPipeline(deps({ hookAgent, approvals, ledger: l as never })); }, label).not.toThrow();
+      await p.recordOutcome(`orphan-${label}`, { status: "ok" });
+      await p.recordHeartbeat(heartbeat({ hookAgent }), CRED);
+      expect(l.records.map((r) => r.phase), label).toEqual(["outcome", "intent"]);
+      // `pre` on the same instance still fails closed: decide() denies before identity or append
+      identity.resolveAgent.mockClear();
+      const d = await p.decide(call(hookAgent === "codex" ? "builtin:codex" : "builtin:claude-code", "Bash", {}, `sc-${label}`));
+      expect(d.decision, label).toBe("deny"); expect(d.reason, label).toContain(WATCHDOG_DEADLINE_DENY_REASON);
+      expect(identity.resolveAgent, label).not.toHaveBeenCalled(); expect(l.records.length, label).toBe(2);
+    }
+    expect(requestApproval).not.toHaveBeenCalled();
+  });
+  it("Slack clocks are judged in decide() on EVERY call: a timeoutMs that does not fit under AGENT_LEDGER_WATCHDOG_DEADLINE_MS, or a missing duration, is a deny (never a wait past the deadline); a fitting one reaches the approval step", async () => {
+    process.env[WATCHDOG_DEADLINE_AT_ENV] = String(Date.now() + 400_000);
     const p = createPipeline(deps({ hookAgent: "codex", approvals: slack, ledger: ledger as never }));
     delete process.env[WATCHDOG_DEADLINE_ENV];
     const missing = await p.decide(call("builtin:codex", "Bash", {}, "sc1"));
     expect(missing.decision).toBe("deny");
     expect(missing.reason).toContain(WATCHDOG_DEADLINE_ENV);
-    process.env[WATCHDOG_DEADLINE_ENV] = "25000";
-    const broken = await p.decide(call("builtin:codex", "Bash", {}, "sc2"));
-    expect(broken.decision).toBe("deny");
-    expect(broken.reason).toMatch(/approval-not-below-deadline/);
+    for (const duration of ["25000", String(300_000 + APPROVAL_MIN_MARGIN_MS - 1)]) {
+      process.env[WATCHDOG_DEADLINE_ENV] = duration;
+      const broken = await p.decide(call("builtin:codex", "Bash", {}, `sc2-${duration}`));
+      expect(broken.decision, duration).toBe("deny");
+      expect(broken.reason, duration).toMatch(/approval-not-below-deadline/);
+    }
     expect(ledger.records).toEqual([]);
     expect(requestApproval).not.toHaveBeenCalled();
+    // the shipped consistent set (SLACK_HOOK_TIMING) fits: the call reaches requestApproval
+    requestApproval.mockImplementation(async (c) => approval("timeout")(c.callId));
+    process.env[WATCHDOG_DEADLINE_ENV] = String(SLACK_HOOK_TIMING.deadlineMs);
+    const fitting = createPipeline(deps({ hookAgent: "codex", approvals: { ...slack, timeoutMs: SLACK_HOOK_TIMING.approvalTimeoutMs! }, ledger: ledger as never }));
+    const asked = await fitting.decide(call("builtin:codex", "Bash", {}, "sc3"));
+    expect(requestApproval).toHaveBeenCalledOnce();
+    expect(asked.decision).toBe("deny"); expect(asked.reason).toMatch(/approval timeout/);
+    expect(ledger.records.map((r) => r.phase)).toEqual(["intent", "outcome"]);
   });
   it("a Slack channel that fails validateSlackChannel makes every decide a deny (the sync constructor cannot await it)", async () => {
     validateSlackChannel.mockResolvedValue(["approvers: must be non-empty"]);
@@ -335,7 +359,7 @@ describe("decide(): Slack approvals (module mocked; the pipeline's contract with
     await codexSlack().decide(call("builtin:codex", "Bash"));
     expect(requestApproval.mock.calls[0]![3]).toBe(4_102_444_800_000);
     const proxy = createPipeline(deps({ hookAgent: undefined, approvals: slack, ledger: ledger as never }));
-    await proxy.decide(call("github", "delete_repo"));
+    await proxy.handle(call("github", "delete_repo")); // proxy mode decides through handle(); public decide() is not exposed there (Astra 1c P2 #5)
     expect(requestApproval.mock.calls[1]![3]).toBeUndefined();
   });
 });
@@ -377,9 +401,8 @@ describe("recordOutcome()", () => {
     try {
       const real = createLedger("jsonl", join(dir, "ledger.jsonl"));
       await createPipeline(deps({ hookAgent: "codex", ledger: real })).decide(call(PROXY, "list_repos", { owner: "acme" }, "C"));
-      const proxyPipe = createPipeline(deps({ hookAgent: undefined, approvals: slack, ledger: real }));
-      await proxyPipe.decide(call("github", "list_repos", { owner: "acme", page: 1 }, "C"));
-      await createPipeline(deps({ hookAgent: undefined, approvals: slack, ledger: real })).recordOutcome("C", { status: "ok", durationMs: 12 });
+      // the proxy's own intent + ok outcome for the same callId come from handle() (its public decide() is not exposed; Astra 1c P2 #5)
+      await createPipeline(deps({ hookAgent: undefined, approvals: slack, ledger: real })).handle(call("github", "list_repos", { owner: "acme", page: 1 }, "C"));
       await createPipeline(deps({ hookAgent: "codex", ledger: real })).recordOutcome("C", { status: "ok" });
       await createPipeline(deps({ hookAgent: "codex", ledger: real })).recordOutcome("nobody", { status: "ok" });
       const recs: LedgerRecord[] = [];
@@ -452,6 +475,14 @@ describe("ADR-010: agentSessionId projection and recordHeartbeat (Slice 1c pins 
     expect(ledger.records[1]!.call.args).toEqual({ agentSessionId: "thr_123", hookAgent: "codex", source: "compact", interpreter: "/usr/local/bin/node", nodeOptionsSet: true, watchdogCheck: "missing" });
     expect("permissionMode" in ledger.records[1]!.call.args).toBe(false);
   });
+  it("ADR-010 amendment (proposed 2026-10-03; Astra 1c P2 #4): the public signature is recordHeartbeat(hb, credential): a one-argument call is a compile error, and at runtime it attributes nothing (no record)", async () => {
+    const p = createPipeline(deps({ ledger: ledger as never }));
+    // @ts-expect-error the credential is a required second parameter (it is never carried inside the stored SessionHeartbeat)
+    await expect(p.recordHeartbeat(heartbeat())).rejects.toThrow(); // identity gets `undefined` and rejects it: nothing to attribute
+    expect(ledger.records).toEqual([]);
+    expect(Object.keys(heartbeat())).not.toContain("credential");
+    expect(p.recordHeartbeat.length).toBe(2);
+  });
   it("recordHeartbeat throws (no record) on: unknown agent, proxy mode, a hookAgent that differs from the pipeline's, a malformed heartbeat, and a failed append", async () => {
     const p = createPipeline(deps({ ledger: ledger as never }));
     await expect(p.recordHeartbeat(heartbeat(), { kind: "local", value: "wrong" })).rejects.toThrow(/Unknown agent/);
@@ -504,6 +535,20 @@ describe("ADR-010: agentSessionId projection and recordHeartbeat (Slice 1c pins 
 
 describe("handle(): proxy mode", () => {
   const proxy = () => createPipeline(deps({ hookAgent: undefined, approvals: slack, ledger: ledger as never }));
+  it("Astra 1c P2 #5 (pre-existing): public decide() is NOT exposed in proxy mode: it throws before identity, approval or append, even with the absolute deadline absent or past and a validator that answers clean; handle() needs no watchdog clock", async () => {
+    for (const at of [undefined, String(Date.now() - 1)]) {
+      if (at === undefined) delete process.env[WATCHDOG_DEADLINE_AT_ENV]; else process.env[WATCHDOG_DEADLINE_AT_ENV] = at;
+      delete process.env[WATCHDOG_DEADLINE_ENV];
+      identity.resolveAgent.mockClear();
+      await expect(proxy().decide(call("github", "list_repos", { owner: "acme" }, `pd-${String(at)}`)), String(at)).rejects.toThrow(/proxy mode/);
+      expect(identity.resolveAgent).not.toHaveBeenCalled(); expect(requestApproval).not.toHaveBeenCalled(); expect(ledger.records).toEqual([]);
+    }
+    // control: the same construction serves MCP calls through handle() with neither watchdog variable set (there is no watchdog in front of the proxy)
+    const res = await proxy().handle(call("github", "list_repos", { owner: "acme" }, "ph1"));
+    expect(res).toEqual({ content: "ok", isError: false });
+    expect(upstream.execute).toHaveBeenCalledOnce();
+    expect(ledger.records.map((r) => r.phase)).toEqual(["intent", "outcome"]);
+  });
   it("allowed call: intent record BEFORE upstream, then an ok outcome with durationMs; the ToolCall carries no credential", async () => {
     const order: string[] = [];
     ledger.append.mockImplementation(async (r: UnsealedRecord) => { order.push(`append:${r.phase}`); ledger.records.push(r); return r as never; });
