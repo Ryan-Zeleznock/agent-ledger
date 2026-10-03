@@ -232,8 +232,18 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(text);
 }
 function drain(req: IncomingMessage): void { req.resume(); }
+/** Over this, an oversized request is cut instead of drained (draining exists so the client reads the 413 rather than EPIPE). */
+export const DRAIN_LIMIT_BYTES = 16 * 1024 * 1024;
 function tooLarge(req: IncomingMessage, res: ServerResponse): void {
-  res.writeHead(413, { connection: "close" }); res.end();
+  res.writeHead(413, { connection: "close" });
+  const declared = Number(req.headers["content-length"] ?? "0");
+  if (!Number.isFinite(declared) || declared > DRAIN_LIMIT_BYTES) { res.end(); req.destroy(); return; }
+  let drained = 0;
+  const cut = () => { clearTimeout(timer); res.end(); req.destroy(); };
+  const timer = setTimeout(cut, 5_000);
+  req.on("data", (c: Buffer) => { drained += c.length; if (drained > DRAIN_LIMIT_BYTES) cut(); });
+  req.on("end", () => { clearTimeout(timer); res.end(); });
+  req.on("error", () => { clearTimeout(timer); res.destroy(); });
   req.resume();
 }
 /** Reads at most MAX_BODY_BYTES; over that, answers 413 and resolves undefined. */
