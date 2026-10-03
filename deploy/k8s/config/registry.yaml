@@ -1,0 +1,26 @@
+# Ryan: review all five tool identities and update reviewedAt before applying.
+# whoami is deliberately absent: unreviewed must deny. Four reviewed rows, five exposed tools.
+version: 1
+servers:
+  demo:
+    trusted: false
+    tools:
+      echo:
+        class: read
+        reviewedBy: ryan
+        reviewedAt: 2026-10-03
+        storeArgs: [message]
+      now:
+        class: read
+        reviewedBy: ryan
+        reviewedAt: 2026-10-03
+      add:
+        class: write
+        reviewedBy: ryan
+        reviewedAt: 2026-10-03
+        storeArgs: [a, b]
+      wipe:
+        class: risky
+        reviewedBy: ryan
+        reviewedAt: 2026-10-03
+        storeArgs: []

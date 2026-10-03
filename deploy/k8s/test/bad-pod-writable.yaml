@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bad-pod-writable
+  namespace: agent-ledger
+  labels: {}
+spec:
+  serviceAccountName: integration
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  imagePullSecrets:
+    - name: ghcr-pull
+  restartPolicy: Never
+  containers:
+    - name: test
+      image: ghcr.io/ryan-zeleznock/agent-ledger:slice-2a@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      args:
+        - -e
+        - process.exit(0)
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: false
+        capabilities:
+          drop:
+            - ALL
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 256Mi

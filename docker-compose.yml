@@ -1,19 +1,64 @@
-# NOT RUNNABLE YET (ADR-002): the proxy image is built after Gate 2.
-# Server mode = proxy (HTTP) + Postgres ledger. Local mode needs no compose at all.
+# Optional local server-mode lab. Kubernetes in docs/HOMELAB.md is the reference deployment.
+# Build only after A+B integration. CONFIG_DIR is absolute and files belong to LOCAL_UID (nonzero).
+# upstreams.yaml for Compose must use http://demo-upstream:3001/mcp.
 services:
   proxy:
     build: .
-    command: ["node", "dist/main.js", "--mode", "http", "--port", "8787"]
-    ports: ["8787:8787"]
+    image: agent-ledger:slice-2a
+    user: "${LOCAL_UID:?set the nonroot config owner uid}:${LOCAL_GID:?set the config owner gid}"
+    command: [dist/server/main.js]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    ports: ["127.0.0.1:8787:8787"]
     environment:
-      LEDGER_KIND: postgres
-      LEDGER_TARGET: postgres://ledger:ledger@db:5432/ledger
-      REGISTRY_PATH: /app/policies/tools.yaml
-      SUGGESTIONS_PATH: /app/policies/suggestions.yaml
-    depends_on: [db]
-  db:
-    image: postgres:17
-    environment: { POSTGRES_USER: ledger, POSTGRES_PASSWORD: ledger, POSTGRES_DB: ledger }
-    volumes: ["ledger-data:/var/lib/postgresql/data"]
+      AGENT_LEDGER_CONFIG_DIR: /run/agent-ledger
+      AGENT_LEDGER_LEDGER_URL: postgres://ledger_app@postgres:5432/ledger
+      AGENT_LEDGER_PORT: "8787"
+      AGENT_LEDGER_BIND_HOST: 0.0.0.0
+      AGENT_LEDGER_ALLOWED_ORIGINS: ""
+      AGENT_LEDGER_APPROVALS: none
+    volumes: ["${CONFIG_DIR:?absolute staged config dir}:/run/agent-ledger:ro"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      demo-upstream: {condition: service_started}
+    networks: [ledger-internal]
+  demo-upstream:
+    image: agent-ledger:slice-2a
+    user: "${LOCAL_UID:?}:${LOCAL_GID:?}"
+    command: [dist/server/demo-upstream.js]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      AGENT_LEDGER_DEMO_PORT: "3001"
+      AGENT_LEDGER_DEMO_TOKEN_FILE: /run/token
+    volumes: ["${CONFIG_DIR:?}/secrets/demo.bearerToken:/run/token:ro"]
+    networks: [ledger-internal]
+  postgres:
+    image: docker.io/library/postgres:17.11-alpine3.24
+    user: "70:70"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      POSTGRES_DB: ledger
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?}"
+      LEDGER_APP_PASSWORD: "${LEDGER_APP_PASSWORD:?must match CONFIG_DIR/ledger.password}"
+      LEDGER_READER_PASSWORD: "${LEDGER_READER_PASSWORD:?}"
+      PGDATA: /var/lib/postgresql/data/pgdata
+    tmpfs: [/tmp, /var/run/postgresql:uid=70,gid=70,mode=0770]
+    volumes:
+      - ledger-data:/var/lib/postgresql/data
+      - ./deploy/k8s/config/001_init.sh:/docker-entrypoint-initdb.d/001_init.sh:ro
+      - ./deploy/sql/001_init.sql:/etc/agent-ledger-init/001_init.sql:ro
+    healthcheck:
+      test: [CMD, pg_isready, -U, postgres, -d, ledger]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [ledger-internal]
+networks:
+  ledger-internal: {internal: true}
 volumes:
   ledger-data: {}

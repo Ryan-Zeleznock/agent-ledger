@@ -1,0 +1,79 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: integration
+  namespace: agent-ledger
+  labels:
+    app: integration
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app: integration
+    spec:
+      serviceAccountName: integration
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: ghcr-pull
+      restartPolicy: Never
+      containers:
+        - name: integration
+          image: ghcr.io/ryan-zeleznock/agent-ledger:slice-2a
+          args:
+            - -e
+            - |-
+              const {spawnSync}=require('node:child_process'); const fs=require('node:fs');
+              function run(args){const r=spawnSync(process.execPath,args,{encoding:'utf8',timeout:120000}); if(r.stdout)process.stdout.write(r.stdout); if(r.stderr)process.stderr.write(r.stderr); if(r.error || r.status!==0)process.exit(1); return r.stdout;}
+              run(['dist/server/smoke.js','--url','http://proxy:8787/mcp','--key-file','/mnt/key/api-key','--expect-upstream-401','http://demo-upstream:3001/mcp']);
+              const args=['--ledger','postgres://ledger_reader@postgres:5432/ledger','--dir','/work'];
+              run(['dist/cli/main.js','anchor',...args]);
+              const verified=run(['dist/cli/main.js','verify',...args]);
+              let state; try { state=JSON.parse(verified); } catch { process.exit(1); }
+              if(state.anchor?.status!=="head")process.exit(1);
+              for(const line of fs.readFileSync('/work/anchors.jsonl','utf8').trim().split('\n'))console.log('ANCHOR '+line);
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: LEDGER_READER_PASSWORD
+          volumeMounts:
+            - name: work
+              mountPath: /work
+              readOnly: false
+            - name: key
+              mountPath: /mnt/key
+              readOnly: true
+      volumes:
+        - name: work
+          emptyDir: {}
+        - name: key
+          secret:
+            secretName: proxy-config
+            defaultMode: 288
+            items:
+              - key: api-key
+                path: api-key
