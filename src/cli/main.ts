@@ -13,14 +13,12 @@ import { createLedger, type LedgerStore } from "../ledger/contract.js";
 import { createIdentity } from "../identity/contract.js";
 import { loadRegistry } from "../policy/contract.js";
 import { createAnchor, type Anchor, type AnchorEntry } from "../anchor/contract.js";
-import { generateReport, HANDOFF_RECONCILE_GRACE_MS, type ReportFiles } from "../report/contract.js";
+import { generateReport, HANDOFF_RECONCILE_GRACE_MS, type AnchorStatus, type ReportContext, type ReportFiles } from "../report/contract.js";
 import { checkedRange } from "../report/render.js";
 import type { DateRange, HookAgent, SessionHeartbeat, VerifyResult } from "../types/index.js";
 
-// pin 6 (Slice 1c): structurally identical to `ReportContext` in src/report/contract.ts (B's file). The 4th parameter is
-// optional, so the 3-parameter implementation on this branch is assignable; integration replaces this with the import.
-export type AnchorStatus = "head" | "ancestor" | "missing" | "mismatch" | "untrusted";
-export interface ReportContext { anchor?: { status: AnchorStatus; latest: AnchorEntry | null } }
+// pin 6 (Slice 1c): the report context is defined once, in src/report/contract.ts.
+export type { AnchorStatus, ReportContext };
 
 /** The CLI is the process composition root; ordering inside a call belongs to the pipeline. */
 export interface CliDeps {
