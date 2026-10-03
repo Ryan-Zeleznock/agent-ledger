@@ -121,7 +121,7 @@ const defaults: CliDeps = {
   registryExamplePath: resolve(here, "../../policies/tools.example.yaml"),
 };
 class UsageError extends Error {}
-const usage = "Usage: agent-ledger init [--dir d] | hook --agent claude-code|codex --event pre|post|session-start|denied [--dir d] | anchor [--dir d] | verify [--dir d] | report --from RFC3339 --to RFC3339 --out d [--dir d] | install-hooks --print [--dir d]";
+const usage = "Usage: agent-ledger init [--dir d] | hook --agent claude-code|codex --event pre|post|session-start|denied [--dir d] | anchor [--dir d] [--ledger postgres://user@host:port/db] | verify [--dir d] [--ledger url] | report --from RFC3339 --to RFC3339 --out d [--dir d] [--ledger url] | install-hooks --print [--dir d]";
 // POSIX shell quoting is required: hook commands are shell strings, not argv arrays.
 const quote = (value: string) => "'" + value.replace(/'/g, "'\\''") + "'";
 const command = (args: string[]) => args.map((v, i) => i > 0 && /^[a-zA-Z0-9_-]+$/.test(v) ? v : quote(v)).join(" ");
@@ -204,6 +204,8 @@ export async function main(argv: string[] = process.argv.slice(2), overrides: Pa
     else if (name === "report") Object.assign(options, { from: { type: "string" }, to: { type: "string" }, out: { type: "string" } });
     else if (name === "install-hooks") options.print = { type: "boolean" };
     else if (name !== "init" && name !== "verify" && name !== "anchor") throw new UsageError(usage);
+    // Slice 2a pin 7: only anchor | verify | report take --ledger; strict parsing makes it a usage error (exit 2) elsewhere.
+    if (name === "anchor" || name === "verify" || name === "report") options.ledger = { type: "string" };
     let values: ReturnType<typeof parseArgs>["values"];
     try {
       const parsed = parseArgs({ args: argv.slice(1), options, strict: true, allowPositionals: false, tokens: true });
@@ -237,8 +239,19 @@ export async function main(argv: string[] = process.argv.slice(2), overrides: Pa
     if (range) {
       try { checkedRange(range, HANDOFF_RECONCILE_GRACE_MS); } catch { throw new UsageError(usage); }
     }
-    if (!(await stat(join(dir, "ledger"))).isDirectory()) throw new Error("Initialize first");
-    const ledger = deps.createLedger("jsonl", join(dir, "ledger", "records.jsonl"));
+    // Slice 2a pin 7: `--ledger postgres://user@host:port/db` reads the server-mode ledger instead of the jsonl file. The
+    // password is never on the command line (`pg` reads PGPASSWORD / libpq variables); the URL is never printed. `--dir`
+    // still holds anchors.jsonl (the Mac-side, off-machine anchor) and is created when absent; the `<dir>/ledger` check is skipped.
+    let ledger: LedgerStore;
+    if (values.ledger !== undefined) {
+      const url = string("ledger");
+      if (!/^postgres(ql)?:\/\//.test(url)) throw new UsageError(usage);
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+      ledger = deps.createLedger("postgres", url);
+    } else {
+      if (!(await stat(join(dir, "ledger"))).isDirectory()) throw new Error("Initialize first");
+      ledger = deps.createLedger("jsonl", join(dir, "ledger", "records.jsonl"));
+    }
     const anchorsPath = join(dir, "anchors.jsonl");
     if (name === "report") {
       // The anchor status is computed exactly as `verify` does (own head + own chain pass) and handed to the report

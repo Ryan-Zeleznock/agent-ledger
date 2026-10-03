@@ -321,3 +321,76 @@ it("places pinned yaml in runtime dependencies and the production lock graph", a
   expect(lock.packages["node_modules/yaml"].dev).toBeUndefined();
   expect(lock.packages["node_modules/yaml"].version).toBe("2.9.1");
 });
+
+describe("--ledger <postgres url> (Slice 2a pin 7; createLedger injected through CliDeps)", () => {
+  const URL_PG = "postgres://ledger_reader@127.0.0.1:15432/ledger";
+  const HEAD = "c".repeat(64);
+  const fakes = () => {
+    const ledger: LedgerStore = { append: vi.fn(), verify: vi.fn(async () => ({ ok: true, checked: 3 })), head: vi.fn(async () => HEAD), async *read() {} };
+    const createLedger = vi.fn<CliDeps["createLedger"]>(() => ledger);
+    const write = vi.fn(async () => {});
+    const createAnchor = vi.fn((_k: "file" | "s3", _t: string) => ({ latest: async () => ({ hash: HEAD, at: "2026-10-03T12:00:00.000Z" }), write }));
+    return { ledger, createLedger, createAnchor, write };
+  };
+  it.each(["postgres://u@h:5432/db", "postgresql://u@h/db"])("verify --ledger %s uses createLedger('postgres', url) with no <dir>/ledger directory; --dir still holds anchors.jsonl", async url => {
+    const dir = join(await sandbox(), "lab-not-initialized");
+    const f = fakes();
+    const r = run(["verify", "--dir", dir, "--ledger", url], { createLedger: f.createLedger, createAnchor: f.createAnchor });
+    expect(await r.result).toBe(0);
+    expect(f.createLedger).toHaveBeenCalledWith("postgres", url);
+    expect(f.createAnchor).toHaveBeenCalledWith("file", join(dir, "anchors.jsonl"));
+    expect((await stat(dir)).isDirectory()).toBe(true);
+    expect(JSON.parse(r.output())).toMatchObject({ head: HEAD, anchor: { status: "head" } });
+    expect(r.output()).not.toContain(url); expect(r.error()).toBe("");
+  });
+  it("anchor --ledger writes the Mac-side anchor from the Postgres head and never prints the URL", async () => {
+    const dir = join(await sandbox(), "lab");
+    const f = fakes();
+    const r = run(["anchor", "--dir", dir, "--ledger", URL_PG], { createLedger: f.createLedger, createAnchor: f.createAnchor });
+    expect(await r.result).toBe(0);
+    expect(f.write).toHaveBeenCalledWith({ hash: HEAD, at: expect.any(String) });
+    expect(JSON.parse(r.output())).toMatchObject({ anchored: true, entry: { hash: HEAD }, path: join(dir, "anchors.jsonl") });
+    expect(r.output()).not.toContain("postgres://"); expect(r.output()).not.toContain("15432");
+  });
+  it("report --ledger renders from the Postgres ledger and still prints chain + anchor", async () => {
+    const dir = join(await sandbox(), "lab");
+    const f = fakes();
+    const generateReport = vi.fn<CliDeps["generateReport"]>(async store => { await store.verify(); return { pdfPath: "pack/report.pdf", csvPath: "pack/records.csv" }; });
+    const r = run(["report", "--dir", dir, "--ledger", URL_PG, "--from", "2026-10-01T00:00:00Z", "--to", "2026-10-02T00:00:00Z", "--out", join(dir, "pack")], { createLedger: f.createLedger, createAnchor: f.createAnchor, generateReport });
+    expect(await r.result).toBe(0);
+    expect(f.createLedger).toHaveBeenCalledWith("postgres", URL_PG);
+    expect(JSON.parse(r.output())).toMatchObject({ chain: { ok: true, checked: 3 }, anchor: { status: "head" } });
+    expect(r.output()).not.toContain(URL_PG);
+  });
+  it.each([
+    [["hook", "--agent", "claude-code", "--event", "pre", "--ledger", URL_PG]],
+    [["init", "--ledger", URL_PG]],
+    [["install-hooks", "--print", "--ledger", URL_PG]],
+  ])("%j refuses --ledger with usage, exit 2, before any ledger is created", async args => {
+    const createLedger = vi.fn<CliDeps["createLedger"]>();
+    const r = run(args, { createLedger, stdin: async () => "{}" });
+    expect(await r.result).toBe(2); expect(r.error()).toContain("Usage:"); expect(createLedger).not.toHaveBeenCalled();
+  });
+  it.each(["mysql://u@h/db", "file:///tmp/ledger.jsonl", "ledger", "", "postgres"])("--ledger %j (not postgres:// or postgresql://) is a usage error, exit 2", async url => {
+    const createLedger = vi.fn<CliDeps["createLedger"]>();
+    const r = run(["verify", "--dir", join(await sandbox(), "lab"), "--ledger", url], { createLedger });
+    expect(await r.result).toBe(2); expect(r.error()).toContain("Usage:"); expect(createLedger).not.toHaveBeenCalled();
+    expect(r.error()).not.toContain("mysql");
+  });
+  it("a duplicated --ledger is a usage error; without --ledger the jsonl path and the Initialize-first check are unchanged", async () => {
+    const createLedger = vi.fn<CliDeps["createLedger"]>();
+    const dup = run(["verify", "--ledger", URL_PG, "--ledger", URL_PG], { createLedger });
+    expect(await dup.result).toBe(2); expect(createLedger).not.toHaveBeenCalled();
+    const plain = run(["verify", "--dir", join(await sandbox(), "nope")], { createLedger });
+    expect(await plain.result).toBe(1); expect(createLedger).not.toHaveBeenCalled();
+    expect(plain.error()).toContain("command failed");
+  });
+  it("the usage line documents --ledger on anchor, verify and report only", async () => {
+    const r = run(["bogus"]);
+    expect(await r.result).toBe(2);
+    const u = r.error();
+    expect(u).toMatch(/anchor \[--dir d\] \[--ledger postgres:\/\/user@host:port\/db\]/); expect(u).toMatch(/verify \[--dir d\] \[--ledger url\]/); expect(u).toMatch(/report .*\[--ledger url\]/);
+    const segments = u.replace(/^Usage: agent-ledger /, "").trim().split(" | ");
+    expect(segments.filter(s => s.includes("--ledger")).map(s => s.split(" ")[0])).toEqual(["anchor", "verify", "report"]);
+  });
+});
