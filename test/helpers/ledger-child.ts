@@ -30,7 +30,7 @@ if (mode === "hold") {
     }
   });
 } else {
-  const ledger = createLedger("jsonl", path);
+  const ledger = createLedger(/^postgres(?:ql)?:\/\//.test(path) ? "postgres" : "jsonl", path);
   process.on("message", async (m: { type?: string }) => {
     if (m?.type !== "go") return;
     const records: { id: string; parentRecordId: string | null; prevHash: string; hash: string }[] = [];
@@ -43,6 +43,7 @@ if (mode === "hold") {
         records.push({ id: r.id, parentRecordId: r.parentRecordId, prevHash: r.prevHash, hash: r.hash });
       }
       send({ type: "done", pid: process.pid, records });
+      if ("close" in ledger) await (ledger as { close(): Promise<void> }).close();
       process.disconnect?.();
     } catch (e) {
       send({ type: "blocked", pid: process.pid, message: e instanceof Error ? e.message : String(e), appended: records.length });
