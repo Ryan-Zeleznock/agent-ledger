@@ -6,7 +6,8 @@ import { join, resolve } from "node:path";
 import { createLedger } from "../src/ledger/contract.js";
 import { createAnchor } from "../src/anchor/contract.js";
 import { pathToFileURL } from "node:url";
-import { MAX_STDIN_BYTES, WATCHDOG_DEADLINE_AT_ENV, WATCHDOG_DEADLINE_ENV } from "../src/hooks/contract.js";
+import { MAX_MAX_OUTPUT_BYTES, MAX_STDIN_BYTES, WATCHDOG_DEADLINE_AT_ENV, WATCHDOG_DEADLINE_ENV } from "../src/hooks/contract.js";
+import { WATCHDOG_SELF_TEST } from "../src/cli/main.js";
 import { unsealed } from "./helpers/ledger-fixtures.js";
 
 const dirs: string[] = [];
@@ -194,6 +195,55 @@ describe("Slice 1c handlers and anchor in real processes (ADR-010, ADR-011; pin 
       expect((await records(cwd))[0]!.call.args["watchdogCheck"]).toBe(mode);
     }
   });
+  it("Astra 1c P2 #2: an exit-0 watchdog whose output fails the strict validator (missing reason + extra field, several values, a deny, oversized, empty) → watchdogCheck failed; the same script with one valid allow → ok; all silent, exit 0", async () => {
+    const allow = { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", permissionDecisionReason: "x" } };
+    const payloads: Record<string, string> = {
+      valid: JSON.stringify(allow),
+      "missing-reason-extra-field": JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" }, unexpected: "unvalidated" }),
+      "multiple-values": JSON.stringify(allow) + "\n" + JSON.stringify(allow),
+      deny: JSON.stringify({ hookSpecificOutput: { ...allow.hookSpecificOutput, permissionDecision: "deny" } }),
+      oversized: JSON.stringify({ hookSpecificOutput: { ...allow.hookSpecificOutput, permissionDecisionReason: "x".repeat(MAX_MAX_OUTPUT_BYTES + 1) } }),
+      empty: "",
+    };
+    expect(Buffer.byteLength(payloads["oversized"]!)).toBeGreaterThan(MAX_MAX_OUTPUT_BYTES);
+    for (const [label, payload] of Object.entries(payloads)) {
+      const cwd = await sandbox(); const bin = await privateBuild(cwd); expect(spawnCli(bin, cwd, ["init"], "").status).toBe(0);
+      // the replacement watchdog flushes its whole payload before exiting 0, so what the probe reads is exactly the payload
+      await writeFile(join(cwd, "dist/hooks/watchdog-main.js"), `process.stdout.write(${JSON.stringify(payload)}, () => process.exit(0));\n`);
+      const r = spawnCli(bin, cwd, ["hook", "--agent", "claude-code", "--event", "session-start"], sessionStart());
+      expect(r.status, `${label}: ${r.stderr}`).toBe(0); expect(r.stdout, label).toBe(""); expect(r.stderr, label).toBe("");
+      expect((await records(cwd))[0]!.call.args["watchdogCheck"], label).toBe(label === "valid" ? "ok" : "failed");
+    }
+  });
+  it("Astra 1c P2 #1: a descendant that inherits the real watchdog's pipes cannot keep session-start alive past the probe cap: exit 0 within the cap, silent, watchdogCheck failed, and the descendant is gone", async () => {
+    const cwd = await sandbox(); expect(run(cwd, ["init"]).status).toBe(0);
+    // A preload that fires ONLY inside the real compiled watchdog: it spawns a 15 s sidecar that inherits the watchdog's
+    // stdin/stdout/stderr (the probe's pipes) and is unreferenced by its parent, then lets the watchdog run unchanged.
+    const pidFile = join(cwd, "sidecar.pid");
+    const sidecar = join(cwd, "sidecar-preload.cjs");
+    await writeFile(sidecar, [
+      "if (typeof process.argv[1] === 'string' && process.argv[1].endsWith('/hooks/watchdog-main.js')) {",
+      "  const c = require('node:child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 15000)'], { stdio: 'inherit', env: { ...process.env, NODE_OPTIONS: '' } });",
+      `  require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(c.pid)); c.unref();`,
+      "}", "",
+    ].join("\n"));
+    const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (e) { return (e as { code?: string }).code !== "ESRCH"; } };
+    let pid = 0;
+    try {
+      const started = Date.now();
+      const r = spawnCli(cli, cwd, ["hook", "--agent", "claude-code", "--event", "session-start"], sessionStart(), { ...quiet, NODE_OPTIONS: `--require=${sidecar}` });
+      const elapsed = Date.now() - started;
+      pid = Number(await readFile(pidFile, "utf8")); expect(pid).toBeGreaterThan(1); // the sidecar really ran inside the watchdog
+      expect(r.error, String(r.error)).toBeUndefined(); expect(r.signal).toBeNull();
+      expect(r.status, r.stderr).toBe(0); expect(r.stdout).toBe(""); expect(r.stderr).toBe("");
+      expect(elapsed, `session-start took ${elapsed} ms`).toBeLessThan(WATCHDOG_SELF_TEST.capMs + 2_000);
+      const hb = (await records(cwd))[0]!;
+      expect(hb.call.args).toMatchObject({ nodeOptionsSet: true, watchdogCheck: "failed" });
+      expect(await readFile(join(cwd, ".agent-ledger/ledger/records.jsonl"), "utf8")).not.toContain("sidecar");
+      for (let i = 0; i < 20 && alive(pid); i++) await new Promise(res => setTimeout(res, 50)); // SIGKILL is immediate; reaping may lag
+      expect(alive(pid), "the probe's process group was killed with it").toBe(false);
+    } finally { if (pid > 1) { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } } }
+  }, 30_000);
   it("session-start and denied exit 0 silently on a corrupt registry or a missing key and change no ledger byte; pre fails closed", async () => {
     const cwd = await sandbox(); expect(run(cwd, ["init"]).status).toBe(0);
     const dir = join(cwd, ".agent-ledger"); const ledgerPath = join(dir, "ledger/records.jsonl");
@@ -218,18 +268,24 @@ describe("Slice 1c handlers and anchor in real processes (ADR-010, ADR-011; pin 
     }
     expect((await readFile(ledgerPath)).equals(before)).toBe(true);
   });
-  it("denied chains a blocked auto-mode outcome to the intent that a session-start + pre wrote first", async () => {
+  it("denied chains a blocked auto-mode outcome to the intent that a real session-start + pre wrote first (pre given the watchdog's deadline variable, as the watchdog would)", async () => {
     const cwd = await sandbox(); expect(run(cwd, ["init"]).status).toBe(0);
     const ledger = createLedger("jsonl", join(cwd, ".agent-ledger/ledger/records.jsonl"));
-    const intent = unsealed(1); intent.call.callId = "toolu_proc_chain"; intent.call.agentSessionId = "sess-proc-3"; await ledger.append(intent);
-    const denied = JSON.stringify({ session_id: "sess-proc-3", transcript_path: "/t/x.jsonl", cwd: "/tmp", hook_event_name: "PermissionDenied", tool_name: "Read", tool_input: {}, tool_use_id: "toolu_proc_chain", reason: "Destructive command" });
+    const hb = spawnCli(cli, cwd, ["hook", "--agent", "claude-code", "--event", "session-start"], sessionStart("sess-proc-3"));
+    expect(hb.status, hb.stderr).toBe(0); expect(hb.stdout).toBe("");
+    const preEvent = JSON.stringify({ session_id: "sess-proc-3", transcript_path: "/t/x.jsonl", cwd: "/tmp", hook_event_name: "PreToolUse", tool_name: "Read", tool_input: { file_path: "/tmp/a" }, tool_use_id: "toolu_proc_chain" });
+    const pre = spawnCli(cli, cwd, ["hook", "--agent", "claude-code", "--event", "pre"], preEvent, { ...quiet, [WATCHDOG_DEADLINE_AT_ENV]: String(Date.now() + 25_000) });
+    expect(pre.status, pre.stderr).toBe(0); expect(JSON.parse(pre.stdout).hookSpecificOutput.permissionDecision).toBe("allow"); // Read is a reviewed read in the shipped registry
+    const denied = JSON.stringify({ session_id: "sess-proc-3", transcript_path: "/t/x.jsonl", cwd: "/tmp", hook_event_name: "PermissionDenied", tool_name: "Read", tool_input: { file_path: "/tmp/a" }, tool_use_id: "toolu_proc_chain", reason: "Destructive command" });
     const r = spawnCli(cli, cwd, ["hook", "--agent", "claude-code", "--event", "denied"], denied);
     expect(r.status, r.stderr).toBe(0); expect(r.stdout).toBe(""); expect(r.stderr).toBe("");
-    const all = await records(cwd); expect(all).toHaveLength(2);
-    expect(all[1]!.phase).toBe("outcome"); expect(all[1]!.outcome).toEqual({ status: "blocked", errorClass: "permission-denied:auto-mode" });
-    expect(all[1]!.call).toEqual(all[0]!.call); expect(all[1]!.policy).toEqual(all[0]!.policy);
+    const all = await records(cwd); expect(all.map(x => [x.phase, x.call.tool])).toEqual([["intent", "SessionStart"], ["intent", "Read"], ["outcome", "Read"]]);
+    expect(all[1]!.call.callId).toBe("toolu_proc_chain"); expect(all[1]!.call.agentSessionId).toBe("sess-proc-3"); expect(all[1]!.policy.verdict).toBe("allow");
+    expect(all[2]!.outcome).toEqual({ status: "blocked", errorClass: "permission-denied:auto-mode" });
+    expect(all[2]!.call).toEqual(all[1]!.call); expect(all[2]!.policy).toEqual(all[1]!.policy); // chained, not an orphan
+    expect(all[0]!.call.agentSessionId).toBe("sess-proc-3"); // the heartbeat and the tool session share the agent's session id (what the report joins on)
     expect(await readFile(join(cwd, ".agent-ledger/ledger/records.jsonl"), "utf8")).not.toContain("Destructive command");
-    expect(await ledger.verify()).toEqual({ ok: true, checked: 2 });
+    expect(await ledger.verify()).toEqual({ ok: true, checked: 3 });
   });
   it("anchor refuses a broken chain with exit 1 and chain-failed, writing no anchor line; a healthy ledger anchors and verify answers head", async () => {
     const cwd = await sandbox(); expect(run(cwd, ["init"]).status).toBe(0);

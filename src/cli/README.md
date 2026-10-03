@@ -60,9 +60,16 @@ Session-start (Slice 1c, ADR-010, pin 5): parse (must be SessionStart) → the c
 `interpreter = realpathSync(process.execPath)`, `nodeOptionsSet = NODE_OPTIONS is non-empty` (the value
 is never read into a record), and `watchdogCheck`, a **self-test** that runs the real compiled
 `<dist>/hooks/watchdog-main.js --agent <agent> --deadline-ms 1000 --timeout-s 3 -- <node> -e '<one valid
-allow line>'` under a 3 s hard cap: exit 0 with a validated allow → `ok`; ENOENT on the watchdog file →
-`missing`; anything else (non-zero exit, junk output, the cap, a spawn failure) → `failed`. The probe
-runs only after the key, credential and registry checks passed, so a broken configuration spawns nothing.
+allow line>'` under a 3 s hard cap: exit 0 AND output that passes the hooks module's strict
+`validateHandlerOutput` with decision `allow` → `ok`; ENOENT on the watchdog file → `missing`; anything else
+(non-zero exit; output the validator rejects: missing reason, extra/duplicate keys, several values, deny/ask,
+oversized, empty; the cap; a spawn failure) → `failed` (Astra 1c P2 #2). The watchdog is spawned as its own
+process-group leader and every terminal path kills that group, destroys the probe's pipe handles and unrefs the
+child, plus a 500 ms grace between the watchdog's `exit` and `close`: a descendant that inherited the watchdog's
+stdio can neither hold this handler open past the cap nor outlive it (Astra 1c P2 #1; Node `close` needs every
+shared stdio stream closed, nodejs.org/api/child_process.html#event-close, read 2026-10-03; pinned by the
+real-process sidecar test in `test/cli-process.test.ts`). The probe runs only after the key, credential and
+registry checks passed, so a broken configuration spawns nothing.
 **This handler prints NOTHING on stdout, ever**: Claude Code adds a SessionStart hook's plain-text stdout
 to Claude's context (Claude Code hooks reference, https://code.claude.com/docs/en/hooks, read 2026-10-01;
 Codex adds it "as extra developer context", https://learn.chatgpt.com/docs/hooks, same date). Failures

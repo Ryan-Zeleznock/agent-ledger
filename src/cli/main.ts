@@ -58,10 +58,20 @@ async function stdin(): Promise<string> {
 /** The watchdog self-test's clocks (pin 5): a 1 s deadline under a 3 s hook timeout, and a 3 s hard cap on the whole probe. */
 export const WATCHDOG_SELF_TEST = { deadlineMs: 1_000, timeoutS: 3, capMs: 3_000 } as const;
 const isErrno = (e: unknown, code: string) => typeof e === "object" && e !== null && (e as { code?: string }).code === code;
+/** After the watchdog EXITS, how long its pipes may stay open (a descendant holding them) before the probe gives up on `close`. */
+export const WATCHDOG_SELF_TEST_CLOSE_GRACE_MS = 500;
 /**
- * Runs the REAL compiled watchdog once with a trivial handler that prints one valid allow line (pin 5): exit 0 and a
- * validated allow → "ok"; ENOENT on the watchdog file → "missing"; anything else (non-zero exit, junk output, the cap,
- * a spawn failure) → "failed". Its stdout and stderr are captured, never ours: the session-start handler prints nothing.
+ * Runs the REAL compiled watchdog once with a trivial handler that prints one valid allow line (pin 5): exit 0 and
+ * output that passes the hooks module's STRICT `validateHandlerOutput` with decision `allow` → "ok"; ENOENT on the
+ * watchdog file → "missing"; anything else (non-zero exit; output the validator rejects: missing reason, extra or
+ * duplicate keys, several values, a deny/ask, oversized, empty; the cap; pipes still held after exit; a spawn failure)
+ * → "failed" (Astra 1c P2 #2, 2026-10-03). Its stdout and stderr are captured, never ours: the handler prints nothing.
+ *
+ * Lifetime (Astra 1c P2 #1): the watchdog is spawned as its own process-group leader; every terminal path kills that
+ * group if it is still running, destroys our three pipe handles and unrefs the child, so a descendant that inherited
+ * the watchdog's stdio (a preload, a broken entry point) can neither keep this process's event loop alive past the cap
+ * nor outlive the probe. Node: `close` fires only once ALL stdio streams close, and other processes may share them
+ * (nodejs.org/api/child_process.html#event-close, read 2026-10-03).
  */
 async function watchdogSelfTest(agent: HookAgent): Promise<SessionHeartbeat["watchdogCheck"]> {
   const watchdog = resolve(here, "../hooks/watchdog-main.js");
@@ -70,24 +80,36 @@ async function watchdogSelfTest(agent: HookAgent): Promise<SessionHeartbeat["wat
   const argv = [watchdog, "--agent", agent, "--deadline-ms", String(WATCHDOG_SELF_TEST.deadlineMs), "--timeout-s", String(WATCHDOG_SELF_TEST.timeoutS),
     "--", process.execPath, "-e", `process.stdout.write(${JSON.stringify(allow)})`];
   return new Promise((done) => {
-    let settled = false; let out = ""; let cap: NodeJS.Timeout | undefined;
-    const finish = (result: SessionHeartbeat["watchdogCheck"]) => { if (!settled) { settled = true; if (cap) clearTimeout(cap); done(result); } };
-    let child: ReturnType<typeof spawn>;
-    try { child = spawn(process.execPath, argv, { stdio: ["pipe", "pipe", "pipe"] }); } catch { finish("failed"); return; }
-    cap = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* already gone */ } finish("failed"); }, WATCHDOG_SELF_TEST.capMs);
-    child.stdout?.on("data", (d: Buffer) => { if (out.length < 64 * 1024) out += d.toString("utf8"); });
+    let settled = false; let out = ""; let overflow = false; let exitCode: number | null | undefined;
+    const timers: NodeJS.Timeout[] = [];
+    let child: ReturnType<typeof spawn> | undefined;
+    const release = () => {
+      for (const t of timers) clearTimeout(t);
+      if (!child) return;
+      // The group outlives its leader while any member runs (POSIX keeps the pgid reserved), so this also reaps a
+      // descendant left behind by a watchdog that exited normally; ESRCH means nothing is left.
+      if (child.pid !== undefined) { try { process.kill(-child.pid, "SIGKILL"); } catch { /* nothing left in the group */ } }
+      if (child.exitCode === null && child.signalCode === null) { try { child.kill("SIGKILL"); } catch { /* already gone */ } }
+      for (const s of [child.stdin, child.stdout, child.stderr]) { try { s?.destroy(); } catch { /* already closed */ } }
+      try { child.unref(); } catch { /* not a handle any more */ }
+    };
+    const finish = (result: SessionHeartbeat["watchdogCheck"]) => { if (settled) return; settled = true; release(); done(result); };
+    const verdict = (): SessionHeartbeat["watchdogCheck"] => {
+      if (exitCode !== 0 || overflow) return "failed";
+      const v = hooks.validateHandlerOutput(out, agent);
+      return v.ok && v.payload.hookSpecificOutput.permissionDecision === "allow" ? "ok" : "failed";
+    };
+    try { child = spawn(process.execPath, argv, { stdio: ["pipe", "pipe", "pipe"], detached: true }); } catch { finish("failed"); return; }
+    timers.push(setTimeout(() => finish("failed"), WATCHDOG_SELF_TEST.capMs));
+    child.stdout?.on("data", (d: Buffer) => { if (overflow) return; out += d.toString("utf8"); if (Buffer.byteLength(out, "utf8") > hooks.MAX_MAX_OUTPUT_BYTES) overflow = true; });
     child.stderr?.resume();
     child.stdin?.on("error", () => { /* the watchdog may exit before reading */ });
     child.stdin?.end("{}");
     child.on("error", () => finish("failed"));
-    child.on("close", (code) => {
-      let valid = false;
-      try {
-        const parsed = JSON.parse(out.trim()) as { hookSpecificOutput?: { hookEventName?: unknown; permissionDecision?: unknown } };
-        valid = parsed?.hookSpecificOutput?.hookEventName === "PreToolUse" && parsed.hookSpecificOutput.permissionDecision === "allow";
-      } catch { valid = false; }
-      finish(code === 0 && valid ? "ok" : "failed");
-    });
+    // `exit` says the watchdog is gone; `close` additionally needs every pipe closed. A descendant can hold the pipes open
+    // indefinitely, so after `exit` the probe waits a short grace for `close` and then calls the probe failed.
+    child.on("exit", (code) => { exitCode = code; timers.push(setTimeout(() => finish("failed"), WATCHDOG_SELF_TEST_CLOSE_GRACE_MS)); });
+    child.on("close", (code) => { if (exitCode === undefined) exitCode = code; finish(verdict()); });
   });
 }
 async function heartbeatProbe(agent: HookAgent): Promise<hooks.HeartbeatProbe> {
