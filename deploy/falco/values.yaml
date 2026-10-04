@@ -1,0 +1,14 @@
+customRules:
+  agent-ledger.yaml: >
+    - rule: Agent Ledger proxy spawned a process
+      desc: A non-node process in the distroless Agent Ledger image is anomalous.
+      condition: spawned_process and container and k8s.ns.name = "agent-ledger" and container.image.repository endswith "ryan-zeleznock/agent-ledger" and not proc.name = "node"
+      output: "Agent Ledger process (namespace=%k8s.ns.name pod=%k8s.pod.name process=%proc.name command=%proc.cmdline)"
+      priority: WARNING
+      tags: [agent-ledger]
+    - rule: Shell in agent-ledger namespace
+      desc: A shell outside the explicit BusyBox staging containers needs investigation.
+      condition: spawned_process and container and k8s.ns.name = "agent-ledger" and proc.name in (sh, ash, bash) and not container.image.repository endswith "library/busybox"
+      output: "Agent Ledger shell (namespace=%k8s.ns.name pod=%k8s.pod.name process=%proc.name command=%proc.cmdline)"
+      priority: NOTICE
+      tags: [agent-ledger]

@@ -1,5 +1,5 @@
 import type { AgentCredential, ApprovalChannel, ApprovalResult, CallHandler, HookAgent, HookDecision, IncomingCall, LedgerRecord, Outcome, PolicyDecision, SessionHeartbeat, ToolCall, ToolResult, UnsealedRecord } from "../types/index.js";
-import { BUILTIN_SERVERS, BUILTIN_SERVER_KEYS, CODEX_MCP_NOT_PROXIED_REASON, HANDOFF_TO_PROXY_REASON, HANDOFF_TO_PROXY_RULE_PREFIX, HEARTBEAT_REASON, HEARTBEAT_RULE_ID, HEARTBEAT_TOOL, HOOK_AGENTS } from "../types/index.js";
+import { APPROVAL_CHANNEL_KINDS, BUILTIN_SERVERS, BUILTIN_SERVER_KEYS, CODEX_MCP_NOT_PROXIED_REASON, HANDOFF_TO_PROXY_REASON, HANDOFF_TO_PROXY_RULE_PREFIX, HEARTBEAT_REASON, HEARTBEAT_RULE_ID, HEARTBEAT_TOOL, HOOK_AGENTS, PROXY_NO_CHANNEL_REASON } from "../types/index.js";
 import type { IdentityService } from "../identity/contract.js";
 import type { ToolRegistry } from "../policy/contract.js";
 import { clearArgFields, evaluate } from "../policy/contract.js";
@@ -200,10 +200,12 @@ export function createPipeline(deps: PipelineDeps): Pipeline {
     throw new Error(`pipeline: argsHmacKey must be a Uint8Array of at least ${ARGS_HMAC_KEY_MIN_BYTES} bytes (ADR-009)`);
   }
   const hmacKey = Uint8Array.from(deps.argsHmacKey);
-  if (!approvals || (approvals.kind !== "slack" && approvals.kind !== "hook-ask")) throw new Error("pipeline: approvals channel is required (slack or hook-ask)");
+  if (!approvals || !(APPROVAL_CHANNEL_KINDS as readonly string[]).includes(approvals.kind)) throw new Error("pipeline: approvals channel is required (slack, hook-ask or none)");
   if (hookAgent !== undefined && hookAgent !== "claude-code" && hookAgent !== "codex") throw new Error("pipeline: unknown hookAgent");
   const decideOnly = hookAgent !== undefined;
-  if (!decideOnly && approvals.kind === "hook-ask") throw new Error("pipeline: hook-ask is not a channel proxy mode can use (no terminal to ask in); configure a slack channel");
+  if (!decideOnly && approvals.kind === "hook-ask") throw new Error("pipeline: hook-ask is not a channel proxy mode can use (no terminal to ask in); configure a slack channel or none (ADR-012)");
+  // ADR-012: `none` is the proxy's explicit no-channel choice; hook semantics do not change this slice.
+  if (decideOnly && approvals.kind === "none") throw new Error("pipeline: decide-only mode uses hook-ask or slack; none is a proxy-mode channel (ADR-012)");
 
   // ADR-011: `createPipeline` reads NO watchdog clock, neither the absolute deadline nor the Slack duration. Both are
   // judged in `decide()` on every call (`deadlineGate`), so the record-only handlers (post, session-start, denied)
@@ -316,6 +318,15 @@ export function createPipeline(deps: PipelineDeps): Pipeline {
       if (!r.ok) return done(ledgerDenied(callId, r.error), policy);
       await appendBlocked(call, policy);
       return done(deny(callId, `agent-ledger: denied (${tag}): ${CODEX_NO_CHANNEL_REASON}`), policy);
+    }
+    // ADR-012 (proxy mode, `none`): nobody can approve, said out loud. Same order as the Codex no-channel branch above:
+    // the FINAL decision is in the intent record, then a `blocked` outcome, then the deny; upstream is never called.
+    if (approvals.kind === "none") {
+      const approval: ApprovalResult = { callId, decision: "no-channel", reason: PROXY_NO_CHANNEL_REASON, decidedAt: now(), channel: "none" };
+      const r = await appendIntent(intentRecord(call, policy, approval));
+      if (!r.ok) return done(ledgerDenied(callId, r.error), policy);
+      await appendBlocked(call, policy);
+      return done(deny(callId, `agent-ledger: denied (${tag}): ${PROXY_NO_CHANNEL_REASON}`), policy);
     }
     let approval: ApprovalResult;
     try {

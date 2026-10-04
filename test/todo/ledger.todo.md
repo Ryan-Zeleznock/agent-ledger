@@ -28,7 +28,7 @@ Added from Astra's round 3 (2026-09-30), all implemented:
 - [x] common-format redaction table (headers, cookies, env lines, JSON keys, URLs, CLI flags) → `test/ledger-redact.test.ts`
 
 Still to write:
-- [ ] postgres backend (Slice 2): the same chain rules over a table with an append-only role; verify() and read(range) parity with jsonl
+- [x] postgres backend acceptance (Slice 2a): `ledger-postgres.test.ts`, `ledger-chain-parity.test.ts`, `timing/ledger-postgres-process.test.ts` and `helpers/pg-cluster.ts`; coordinator verified all real-PG suites 3/3 outside the sandbox, 2026-10-03.
 - [ ] pipeline/report: the caller-side anchor comparison (anchored head ∈ verified chain) as a real function, once `src/report/` exists
 - [x] (Astra verification P2, 2026-09-30) `redact.ts` key-layer exemption also keeps arbitrary `[REDACTED:…]` strings under sensitive keys; narrow it to exact `hmac-sha256:[0-9a-f]{64}` only, with a test that a sensitive-key value shaped like a placeholder is redacted
 - [x] (coordinator, 2026-09-30) full suite is load-sensitive: `ledger-redact-bench` and several real-process watchdog timing tests fail when another suite runs concurrently on the same machine (idle: 3/3 green). Isolate timing suites (vitest project with `fileParallelism: false`, or a separate `npm run test:timing`)
@@ -93,3 +93,16 @@ Fable review 2026-10-03:
   placeholder/inexact/uppercase values normalize to `[REDACTED:pair]`, including nested arrays and header triples.
 - [ ] #9 two independent Vitest phases each run globalSetup; retain fresh child builds until safe shared-build
   invalidation exists (residual documented in `src/report/README.md`).
+
+Slice 2a (Astra, 2026-10-03):
+- [x] Extract shared chain code without weakening JSONL framing; ADR-012 none round-trip (coordinator PIN-2A literal).
+  Test-first no-channel rejection reproduced; commit c085e1e check: 1076 unit + 77 timing passed, 7 existing skips.
+- [x] Real Postgres: append-only app/superuser mutation refusal, reader insert refusal, idempotent init, all redundant
+  columns vs line, tail refusal, pool restart, >1000-row pagination and range boundaries. Passed on coordinator PostgreSQL 16.13.
+- [x] Four real processes x100 and advisory-lock contention through pg_locks; three runs passed (one npm run check, two npm test).
+- [ ] Image build/start (Node 24 + Postgres 17.11), merged-tree e2e and Ryan-run Kubernetes admission/network proofs.
+
+Coordinator acceptance, 2026-10-03: external Unix socket via AGENT_LEDGER_TEST_PG_HOST; all three runs exit 0 with
+1118 unit passed / 7 existing skips and 79 timing passed. First run also passed typecheck/build. Test databases
+remaining: zero. Timings were not supplied. No production/test/manifest behavior changed after these verified runs.
+Postgres-specific revert-check remains undemonstrated; the pre-implementation attempt failed at sandbox setup.

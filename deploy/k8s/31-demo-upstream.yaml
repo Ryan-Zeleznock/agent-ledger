@@ -1,0 +1,116 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-upstream
+  namespace: agent-ledger
+  labels:
+    app: demo-upstream
+spec:
+  selector:
+    app: demo-upstream
+  ports:
+    - name: tcp
+      port: 3001
+      targetPort: 3001
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-upstream
+  namespace: agent-ledger
+  labels:
+    app: demo-upstream
+    component: runtime
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo-upstream
+  template:
+    metadata:
+      labels:
+        app: demo-upstream
+    spec:
+      serviceAccountName: demo-upstream
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: ghcr-pull
+      terminationGracePeriodSeconds: 15
+      initContainers:
+        - name: stage-config
+          image: docker.io/library/busybox:1.37.0
+          command:
+            - sh
+            - -ec
+            - umask 077; cp /mnt/secrets/token /run/agent-ledger/token; chmod 600 /run/agent-ledger/token
+          securityContext: &a1
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+          volumeMounts:
+            - name: token
+              mountPath: /mnt/secrets
+              readOnly: true
+            - name: config
+              mountPath: /run/agent-ledger
+              readOnly: false
+      containers:
+        - name: demo-upstream
+          image: ghcr.io/ryan-zeleznock/agent-ledger:slice-2a
+          args:
+            - dist/server/demo-upstream.js
+          securityContext: *a1
+          env:
+            - name: AGENT_LEDGER_DEMO_PORT
+              value: "3001"
+            - name: AGENT_LEDGER_DEMO_TOKEN_FILE
+              value: /run/agent-ledger/token
+          ports:
+            - containerPort: 3001
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 3001
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 3001
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /run/agent-ledger
+              readOnly: true
+      volumes:
+        - name: config
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Mi
+        - name: token
+          secret:
+            secretName: demo-upstream
+            defaultMode: 288

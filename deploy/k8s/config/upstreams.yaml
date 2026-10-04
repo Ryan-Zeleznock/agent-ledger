@@ -1,0 +1,5 @@
+version: 1
+upstreams:
+  - name: demo
+    transport: http
+    url: http://demo-upstream.agent-ledger.svc.cluster.local:3001/mcp

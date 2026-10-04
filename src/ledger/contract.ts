@@ -1,8 +1,8 @@
 import type { DateRange, LedgerRecord, UnsealedRecord, VerifyResult } from "../types/index.js";
-import { notImplemented } from "../types/not-implemented.js";
 import { sha256Jcs } from "./hash.js";
 import { redactArgs } from "./redact.js";
 import { JsonlLedger } from "./jsonl.js";
+import { PostgresLedger } from "./postgres.js";
 export interface LedgerStore {
   append(record: UnsealedRecord): Promise<LedgerRecord>;
   verify(): Promise<VerifyResult>;
@@ -11,7 +11,7 @@ export interface LedgerStore {
 }
 export function createLedger(kind: "jsonl" | "postgres", target: string): LedgerStore {
   if (kind === "jsonl") return new JsonlLedger(target);
-  throw notImplemented(`ledger.createLedger(${kind})`); // Slice 2 (server mode)
+  return new PostgresLedger(target);
 }
 export function redact(args: Record<string, unknown>): Record<string, unknown> { return redactArgs(args); }
 /**

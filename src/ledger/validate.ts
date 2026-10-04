@@ -1,5 +1,5 @@
 import { types } from "node:util";
-import { APPROVAL_DECISIONS, RISKS, VERDICTS } from "../types/index.js";
+import { APPROVAL_CHANNEL_KINDS, APPROVAL_DECISIONS, RISKS, VERDICTS } from "../types/index.js";
 import type { ApprovalResult, LedgerRecord, Outcome, PolicyDecision, ProxyHandoff, ToolCall, UnsealedRecord } from "../types/index.js";
 
 /**
@@ -197,7 +197,8 @@ export function projectApproval(v: unknown, field: string, mode: Mode = LENIENT)
   noExtra(a, APPROVAL_KEYS, field, mode);
   return withOpt<ApprovalResult>({
     callId: str(a.callId, `${field}.callId`), decision: oneOf(a.decision, APPROVAL_DECISIONS, `${field}.decision`),
-    decidedAt: instant(a.decidedAt, `${field}.decidedAt`), channel: oneOf(a.channel, ["slack", "hook-ask"] as const, `${field}.channel`),
+    decidedAt: instant(a.decidedAt, `${field}.decidedAt`),
+    channel: oneOf(a.channel, APPROVAL_CHANNEL_KINDS, `${field}.channel`),
   }, { approver: optStr(a, "approver", field), reason: optStr(a, "reason", field) });
 }
 export function projectOutcome(v: unknown, field: string, mode: Mode = LENIENT): Outcome {

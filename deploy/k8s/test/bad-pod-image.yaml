@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bad-pod-image
+  namespace: agent-ledger
+  labels: {}
+spec:
+  serviceAccountName: integration
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  imagePullSecrets:
+    - name: ghcr-pull
+  restartPolicy: Never
+  containers:
+    - name: test
+      image: docker.io/library/nginx:1.28
+      args:
+        - -e
+        - process.exit(0)
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 256Mi

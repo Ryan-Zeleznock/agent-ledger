@@ -9,7 +9,7 @@ import { APPROVAL_MIN_MARGIN_MS, SLACK_HOOK_TIMING, WATCHDOG_DEADLINE_AT_ENV, WA
 import { createLedger } from "../src/ledger/contract.js";
 import type { ToolRegistry } from "../src/policy/contract.js";
 import type { ApprovalResult, IncomingCall, LedgerRecord, SessionHeartbeat, ToolCall, ToolResult, UnsealedRecord } from "../src/types/index.js";
-import { APPROVAL_DECISIONS, CODEX_MCP_NOT_PROXIED_REASON, HANDOFF_TO_PROXY_REASON, HEARTBEAT_REASON, HEARTBEAT_RULE_ID, HEARTBEAT_TOOL, PERMISSION_DENIED_ERROR_CLASS } from "../src/types/index.js";
+import { APPROVAL_DECISIONS, CODEX_MCP_NOT_PROXIED_REASON, HANDOFF_TO_PROXY_REASON, HEARTBEAT_REASON, HEARTBEAT_RULE_ID, HEARTBEAT_TOOL, PERMISSION_DENIED_ERROR_CLASS, PROXY_NO_CHANNEL_REASON } from "../src/types/index.js";
 import * as approvalsMod from "../src/approvals/contract.js";
 
 // The approvals module is a stub until the Slack slice; the pipeline's contract with it is what these tests pin.
@@ -93,6 +93,13 @@ describe("createPipeline: construction-time refusals", () => {
     const p = createPipeline(deps());
     await expect(p.handle(call("github", "list_repos"))).rejects.toThrow(/decide-only/);
     expect(upstream.execute).not.toHaveBeenCalled();
+  });
+  it("ADR-012: `none` constructs in proxy mode; `none` with a hookAgent (either agent) is refused; an unknown kind is refused", () => {
+    expect(() => createPipeline(deps({ hookAgent: undefined, approvals: { kind: "none" } }))).not.toThrow();
+    expect(() => createPipeline(deps({ hookAgent: "claude-code", approvals: { kind: "none" } }))).toThrow(/decide-only mode uses hook-ask or slack/);
+    expect(() => createPipeline(deps({ hookAgent: "codex", approvals: { kind: "none" } }))).toThrow(/decide-only mode uses hook-ask or slack/);
+    expect(() => createPipeline(deps({ hookAgent: undefined, approvals: { kind: "email" } as unknown as PipelineDeps["approvals"] }))).toThrow(/approvals channel is required/);
+    expect(() => createPipeline(deps({ hookAgent: undefined, approvals: undefined as unknown as PipelineDeps["approvals"] }))).toThrow(/approvals channel is required/);
   });
   it("ADR-011: decide-only mode CONSTRUCTS without AGENT_LEDGER_WATCHDOG_DEADLINE_AT_MS (both agents, hook-ask and slack); proxy mode never needed it", () => {
     delete process.env[WATCHDOG_DEADLINE_AT_ENV];
@@ -609,6 +616,74 @@ describe("handle(): proxy mode", () => {
     upstream.execute.mockResolvedValueOnce({ content: "nope", isError: true });
     expect((await p.handle(call("github", "list_repos"))).isError).toBe(true);
     expect(outcomes()[1]!.outcome).toMatchObject({ status: "error", errorClass: "tool-error" });
+  });
+
+  describe("ADR-012: approvals { kind: \"none\" } (Slice 2a pin 2)", () => {
+    const none = () => createPipeline(deps({ hookAgent: undefined, approvals: { kind: "none" }, ledger: ledger as never }));
+    it("risky row: intent record carries approval { decision: no-channel, channel: none, reason: PROXY_NO_CHANNEL_REASON } FIRST, then a blocked outcome, then the isError deny; upstream never called; requestApproval never consulted", async () => {
+      const order: string[] = [];
+      ledger.append.mockImplementation(async (r: UnsealedRecord) => { order.push(`append:${r.phase}`); ledger.records.push(r); return r as never; });
+      const res = await none().handle(call("github", "delete_repo", { owner: "acme", repo: "r" }, "n1"));
+      expect(res.isError).toBe(true);
+      const text = (res.content as { type: string; text: string }[])[0]!;
+      expect(text.type).toBe("text");
+      expect(text.text).toBe(`agent-ledger: denied (risky; registry:github/delete_repo): ${PROXY_NO_CHANNEL_REASON}`);
+      expect(order).toEqual(["append:intent", "append:outcome"]);
+      expect(upstream.execute).not.toHaveBeenCalled(); expect(requestApproval).not.toHaveBeenCalled();
+      const intent = intents()[0]!;
+      expect(intent.call.callId).toBe("n1");
+      expect(intent.policy).toMatchObject({ verdict: "require_approval", risk: "risky", ruleId: "registry:github/delete_repo" });
+      expect(intent.approval).toEqual({ callId: "n1", decision: "no-channel", reason: PROXY_NO_CHANNEL_REASON, decidedAt: expect.any(String), channel: "none" });
+      expect(Number.isFinite(Date.parse(intent.approval!.decidedAt))).toBe(true);
+      expect(outcomes()[0]).toMatchObject({ call: intent.call, policy: intent.policy, outcome: { status: "blocked" } });
+      expect(ledger.records.some((r) => r.approval?.decision === "delegated")).toBe(false);
+    });
+    it("unreviewed tool: same no-channel deny with ruleId unreviewed:<server>/<tool>, risk unreviewed, args hashed (no clear fields)", async () => {
+      const res = await none().handle(call("demo", "whoami", { who: "me" }, "n2"));
+      expect(res.isError).toBe(true);
+      expect((res.content as { text: string }[])[0]!.text).toBe(`agent-ledger: denied (unreviewed; unreviewed:demo/whoami): ${PROXY_NO_CHANNEL_REASON}`);
+      expect(intents()[0]!.policy).toMatchObject({ verdict: "require_approval", risk: "unreviewed", ruleId: "unreviewed:demo/whoami" });
+      expect(intents()[0]!.approval).toMatchObject({ decision: "no-channel", channel: "none" });
+      expect(intents()[0]!.call.args["who"]).toMatch(/^hmac-sha256:[0-9a-f]{64}$/);
+      expect(outcomes()[0]!.outcome).toEqual({ status: "blocked" });
+      expect(upstream.execute).not.toHaveBeenCalled();
+    });
+    it("allowed rows are unaffected by the channel: read and write rows run upstream with intent + ok outcome and no approval field", async () => {
+      const p = none();
+      expect((await p.handle(call("github", "list_repos", { owner: "acme" }, "n3"))).isError).toBe(false);
+      expect((await p.handle(call("github", "create_issue", { owner: "acme", repo: "r", title: "t" }, "n4"))).isError).toBe(false);
+      expect(upstream.execute).toHaveBeenCalledTimes(2);
+      expect(ledger.records.map((r) => [r.phase, r.outcome?.status ?? "-", "approval" in r])).toEqual([["intent", "-", false], ["outcome", "ok", false], ["intent", "-", false], ["outcome", "ok", false]]);
+    });
+    it("intent append fails → deny 'ledger unavailable' (fail closed), no blocked outcome, upstream never called; blocked-outcome append failing changes nothing", async () => {
+      ledger.failNext = 1;
+      const res = await none().handle(call("github", "delete_repo", {}, "n5"));
+      expect(res.isError).toBe(true);
+      expect((res.content as { text: string }[])[0]!.text).toMatch(/ledger unavailable/);
+      expect(ledger.records).toEqual([]);
+      ledger.append.mockImplementationOnce(async (r: UnsealedRecord) => { ledger.records.push(r); return r as never; }).mockImplementationOnce(async () => { throw new Error("disk full"); });
+      const res2 = await none().handle(call("github", "delete_repo", {}, "n6"));
+      expect((res2.content as { text: string }[])[0]!.text).toContain(PROXY_NO_CHANNEL_REASON);
+      expect(ledger.records.map((r) => r.phase)).toEqual(["intent"]);
+      expect(upstream.execute).not.toHaveBeenCalled();
+    });
+    it("record shapes survive the REAL jsonl ledger and verify() (round trip of channel: none; skipped until B's validator line lands, pin 1)", async (ctx) => {
+      const dir = mkdtempSync(join(tmpdir(), "agent-ledger-pipeline-none-"));
+      try {
+        const real = createLedger("jsonl", join(dir, "ledger.jsonl"));
+        const probe = createLedger("jsonl", join(dir, "probe.jsonl"));
+        const accepts = await probe.append({ id: "p", phase: "intent", call: { callId: "p", sessionId: "s", agentId: "a", server: "x", tool: "y", args: {}, receivedAt: new Date().toISOString() }, policy: { verdict: "require_approval", risk: "risky", ruleId: "registry:x/y", reason: "r" }, approval: { callId: "p", decision: "no-channel", reason: PROXY_NO_CHANNEL_REASON, decidedAt: new Date().toISOString(), channel: "none" } }).then(() => true, () => false);
+        if (!accepts) { ctx.skip(); return; } // src/ledger/validate.ts still lists ["slack", "hook-ask"]: B's pin 1 line (APPROVAL_CHANNEL_KINDS) is not on this branch yet
+        const p = createPipeline(deps({ hookAgent: undefined, approvals: { kind: "none" }, ledger: real }));
+        const res = await p.handle(call("github", "delete_repo", { owner: "acme" }, "rn1"));
+        expect((res.content as { text: string }[])[0]!.text).toContain(PROXY_NO_CHANNEL_REASON);
+        const recs: LedgerRecord[] = []; for await (const r of real.read({ from: "2020-01-01T00:00:00Z", to: "2090-01-01T00:00:00Z" })) recs.push(r);
+        expect(recs.map((r) => r.phase)).toEqual(["intent", "outcome"]);
+        expect(recs[0]!.approval).toMatchObject({ decision: "no-channel", channel: "none", reason: PROXY_NO_CHANNEL_REASON });
+        expect(recs[1]!.outcome).toEqual({ status: "blocked" });
+        expect(await real.verify()).toEqual({ ok: true, checked: 2 });
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
   });
 });
 

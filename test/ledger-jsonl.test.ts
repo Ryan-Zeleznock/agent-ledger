@@ -89,8 +89,11 @@ describe("createLedger('jsonl'): sealing", () => {
     expect(existsSync(path)).toBe(false);
   });
 
-  it("createLedger('postgres') stays not implemented (Slice 2)", () => {
-    expect(() => createLedger("postgres", "postgres://x")).toThrow(/^not implemented: /);
+  it("createLedger('postgres') constructs without connecting and exposes pool shutdown", async () => {
+    const ledger = createLedger("postgres", "postgres://x");
+    expect(ledger).toHaveProperty("append");
+    expect(ledger).toHaveProperty("close");
+    await (ledger as typeof ledger & { close(): Promise<void> }).close();
   });
 });
 

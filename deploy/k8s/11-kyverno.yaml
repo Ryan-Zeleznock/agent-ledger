@@ -1,0 +1,50 @@
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: agent-ledger-hardening
+spec:
+  validationActions:
+    - Deny
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: agent-ledger
+    resourceRules:
+      - apiGroups:
+          - ""
+        apiVersions:
+          - v1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - pods
+          - pods/ephemeralcontainers
+  validations:
+    - expression: "(object.spec.containers + (has(object.spec.initContainers) ? object.spec.initContainers : []) +
+        (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers : [])).all(c,
+        c.image.startsWith('ghcr.io/ryan-zeleznock/agent-ledger:') ||
+        c.image.startsWith('ghcr.io/ryan-zeleznock/agent-ledger@') ||
+        c.image.startsWith('docker.io/library/postgres:17.') ||
+        c.image.startsWith('docker.io/library/busybox:1.'))"
+      message: Only approved Agent Ledger, Postgres 17 and BusyBox 1 images are allowed.
+    - expression: "(object.spec.containers + (has(object.spec.initContainers) ? object.spec.initContainers : []) +
+        (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers : [])).all(c,
+        !c.image.startsWith('ghcr.io/ryan-zeleznock/agent-ledger') ||
+        c.image.matches('@sha256:[0-9a-f]{64}$'))"
+      message: Agent Ledger images must be pinned by sha256 digest.
+    - expression: "(object.spec.containers + (has(object.spec.initContainers) ? object.spec.initContainers : []) +
+        (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers : [])).all(c, !has(c.env) ||
+        c.env.all(e, e.name != 'NODE_OPTIONS'))"
+      message: NODE_OPTIONS is forbidden.
+    - expression: has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false
+      message: ServiceAccount token automount must be explicitly false.
+    - expression: "(object.spec.containers + (has(object.spec.initContainers) ? object.spec.initContainers : []) +
+        (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers : [])).all(c,
+        has(c.securityContext) && has(c.securityContext.readOnlyRootFilesystem) &&
+        c.securityContext.readOnlyRootFilesystem == true)"
+      message: Every container requires a read-only root filesystem.
+    - expression: "(object.spec.containers + (has(object.spec.initContainers) ? object.spec.initContainers : []) +
+        (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers : [])).all(c, !has(c.envFrom)
+        || size(c.envFrom) == 0)"
+      message: Use explicitly named env entries so NODE_OPTIONS cannot be imported through envFrom.

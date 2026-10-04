@@ -17,7 +17,7 @@ projection, spec §5); every stored value passes the JSON-only boundary before A
 stored records are rejected so the hash covers every stored byte; and over-redaction is the accepted failure direction.
 Spec §9's "raw args are never persisted" holds for the args AFTER redaction; what redaction cannot recognise (see
 "Residual") is stored, hashed and visible in the report like any other argument.
-`createLedger("postgres", …)` still throws `not implemented` (Slice 2). Files: `hash.ts`, `validate.ts`, `redact.ts`,
+`createLedger("postgres", url)` is implemented for Slice 2a (validation status below). Files: `hash.ts`, `validate.ts`, `redact.ts`,
 `jsonl.ts`, `contract.ts`. Tests: `test/ledger-hash.test.ts`, `test/ledger-validate.test.ts`, `test/ledger-redact.test.ts`,
 `test/ledger-jsonl.test.ts`, `test/ledger-multiprocess.test.ts` (4 real processes), `test/timing/ledger-redact-bench.test.ts`
 (supervised child); fixtures in `test/helpers/`.
@@ -240,3 +240,76 @@ Round 3 (Astra, 2026-09-30: `docs/reviews/2026-09-30-astra-ledger-round3.md`):
 - [H] A single `write(2)` of one JSONL line on a local APFS/ext4 file opened `O_APPEND` is not interleaved with another
   process's write in practice; POSIX does not promise it, and the lock file is the actual guarantee.
 - [H] The `wx` lock file behaves the same on Windows (`O_EXCL` maps to `CREATE_NEW`); not tested here.
+
+## Slice 2a shared chain (2026-10-03)
+
+`chain.ts` owns sealing, strict parsing, self-hash checks and streaming verification. JSONL retains its physical
+LF framing and file lock. ADR-012 `channel: none` is accepted and round-trips; the validator uses `APPROVAL_CHANNEL_KINDS` from `src/types`
+(swapped in from the temporary `PIN-2A` literal at integration).
+Test-first: the new no-channel regression failed against the old enum (1 failed / 1075 passed / 7 skipped).
+
+## Postgres (Slice 2a, ADR-013)
+
+`createLedger("postgres", url)` returns a `PostgresLedger`, with one max-4 `pg.Pool`. The concrete class exposes
+`close(): Promise<void>` for shutdown; use it in the server composition root. This is a lifecycle extension on the
+implementation, not a change to the frozen `LedgerStore` interface. Repeated close calls share the same promise.
+The driver loads only on construction of a Postgres store, preserving the local JSONL CLI's dependency path.
+
+`deploy/sql/001_init.sql` stores one canonical JCS line, plus indexed columns derived from it. Appends acquire the
+transaction advisory lock `hashtext('agent-ledger.records')`, revalidate the tail and every redundant column, seal
+with the shared chain functions, INSERT, then COMMIT on the **same connection**. Unique ids/hashes are database
+constraints. Failures rollback/release the connection and expose only the operation name and run-verify instruction,
+never the underlying exception, URL, SQL values or a nested cause. Statement timeout is 30 seconds; connection timeout
+is 5 seconds. Idle pool errors evict connections without logging secrets; a later operation reconnects or fails.
+
+The app role has SELECT+INSERT; reader has SELECT only. Triggers refuse UPDATE/DELETE/TRUNCATE even for the superuser
+while enabled. Superusers can still disable/drop protections, rewrite/re-chain rows, or remove a complete suffix:
+keep independently protected anchors on the Mac. The SQL is forward-only and idempotent for empty/populated databases;
+existing role passwords are not rotated on rerun. Kubernetes mounts only the .sh initializer in initdb.d so the .sql
+is never run again without its password variables. A byte-identical SQL copy under k8s/config is checked offline.
+
+Verification uses the same `verifyLines` as JSONL and checks every indexed value against the line. The sequence cursor
+is a bigint **string**, never a JS number. Both verify/read use a stable read-only repeatable-read snapshot and keyset
+pages of at most 1000 rows, releasing the connection even on early iterator exit. Verification is O(n) in records,
+with O(n) memory for the shared duplicate-id set; page memory depends on row size. Append reads only the tail and
+uses unique indexes, with no full-history scan. Range reads validate explicit-offset millisecond timestamps and use
+`written_at BETWEEN ... ORDER BY seq`. They reject a mismatching selected row, including sub-millisecond DB timestamp
+changes; as with any indexed range query, an administrator moving its timestamp outside the range can hide the row
+from that query. Call verify() before report reads (the report/CLI already do). `read` validates structure/canonical
+bytes and columns; `verify` additionally checks the complete hash chain.
+
+Credentials: prefer password-free URLs plus PGPASSWORD for CLI operations. If constructing a password-bearing URL,
+encode the password once with `encodeURIComponent` (`@`, `%`, `:` must not become URL syntax); never print the URL.
+The server reads `ledger.password` and does this insertion. New runtime dependency is **pg 8.23.1**, accepted in ADR-013
+and installed by the coordinator at 6523c57; @types/pg 8.23.1 is development-only. No dependency install ran here.
+
+Tests: `ledger-postgres.test.ts`, `ledger-chain-parity.test.ts`, `timing/ledger-postgres-process.test.ts`, harness
+`helpers/pg-cluster.ts` (Homebrew Postgres 16, Unix socket, private temp directory, explicit teardown + exit fallback).
+Missing initdb/pg_ctl/psql produces a visible skip; a present but broken/denied installation fails. Set
+AGENT_LEDGER_PG_BIN to the directory containing the three binaries. With `AGENT_LEDGER_TEST_PG_HOST` set to an absolute
+Unix socket directory, the harness instead connects as `postgres` to a coordinator-owned server. It creates a unique
+`al_test_<uuid>` database per suite, applies the same init SQL, and drops only that database in teardown (including an
+exit fallback); it NEVER starts, stops or reconfigures the external server. Shared ledger_app/ledger_reader roles are
+created if absent and retained; their existing passwords are unchanged. Migrations serialize role creation using an
+advisory transaction lock in the common `postgres` maintenance database, since database-local locks would not prevent
+cross-suite role races. The test-only `agent_ledger_test` URL alias maps to the external `postgres` superuser.
+Configured external-server failures are failures, never skips. The cluster image is 17.11: the Ryan-run integration
+Job is still required to establish image/version parity. This sandbox denies both initdb's shmget and connections to
+the supplied external socket. The coordinator verified this tree outside the sandbox on 2026-10-03 against PostgreSQL
+16.13: one `npm run check` (typecheck + tests + build) and two additional `npm test` runs, all exit 0. Each run passed
+1118 unit tests (7 existing skips) and 79 timing tests, including all real-Postgres cases. No test databases remained.
+These are coordinator-reported results; timings were not supplied. No behavior changed after that verified run.
+
+The no-channel regression was demonstrated failing before implementation; the earlier real-Postgres test-first
+attempts were blocked at setup by the sandbox. A Postgres-specific revert-check has not been demonstrated.
+
+
+Primary-source diligence, 2026-10-03:
+- [V] [node-postgres transactions](https://node-postgres.com/features/transactions): use one acquired client throughout
+  BEGIN/queries/COMMIT; pool.query does not provide transaction affinity.
+- [V] [node-postgres connecting](https://node-postgres.com/features/connecting): supports Unix sockets, connection URIs,
+  and libpq-style PGPASSWORD for both clients and pools.
+- [V] [Postgres 16 locking](https://www.postgresql.org/docs/16/explicit-locking.html): transaction advisory locks release
+  automatically on transaction end; pg_locks can prove a real competing writer is waiting.
+- [V] [pool API](https://node-postgres.com/apis/pool): release checked-out clients; end drains the pool; listen for idle
+  client errors. [H] These local tests cannot establish worker-disk durability or the deployed network boundary.

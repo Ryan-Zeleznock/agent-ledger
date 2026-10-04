@@ -1,0 +1,175 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: 00-default-deny
+  namespace: agent-ledger
+  labels: {}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: 10-allow-dns
+  namespace: agent-ledger
+  labels: {}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - proxy
+          - integration
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: 20-proxy-egress
+  namespace: agent-ledger
+  labels: {}
+spec:
+  podSelector:
+    matchLabels:
+      app: proxy
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - podSelector:
+            matchLabels:
+              app: demo-upstream
+      ports:
+        - protocol: TCP
+          port: 3001
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: 21-proxy-ingress
+  namespace: agent-ledger
+  labels: {}
+spec:
+  podSelector:
+    matchLabels:
+      app: proxy
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: 10.20.0.0/24
+        - podSelector:
+            matchLabels:
+              app: integration
+      ports:
+        - protocol: TCP
+          port: 8787
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: 22-postgres-ingress
+  namespace: agent-ledger
+  labels: {}
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: proxy
+        - podSelector:
+            matchLabels:
+              app: integration
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: 23-demo-upstream-ingress
+  namespace: agent-ledger
+  labels: {}
+spec:
+  podSelector:
+    matchLabels:
+      app: demo-upstream
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: proxy
+        - podSelector:
+            matchLabels:
+              app: integration
+      ports:
+        - protocol: TCP
+          port: 3001
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: 24-integration-egress
+  namespace: agent-ledger
+  labels: {}
+spec:
+  podSelector:
+    matchLabels:
+      app: integration
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: proxy
+      ports:
+        - protocol: TCP
+          port: 8787
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - podSelector:
+            matchLabels:
+              app: demo-upstream
+      ports:
+        - protocol: TCP
+          port: 3001
