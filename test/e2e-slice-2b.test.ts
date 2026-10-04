@@ -414,8 +414,12 @@ describe.sequential("Slice 2b end to end: Slack approvals + the legacy-era bridg
   });
   step("12. verify exit 0; the CC8.1 table shows approved, <U> + executed after ask (4), denied: Slack denied (5), denied: Slack timeout (6), denied: Slack unavailable (11); leak sweep over ledger, outputs, the fake's bodies and the pack", MAIN, async () => {
     const env = { ...base };
+    // Demo order (docs/DEMO.md, Slice 1c): anchor the head first, so verify can exit 0 (exit 3 = chain ok, no anchor).
+    const anchor = await run(process.execPath, [cli, "anchor", "--dir", ledgerDir], { cwd: sandbox, env });
+    expect(anchor.code, anchor.stderr).toBe(0);
     const verify = await run(process.execPath, [cli, "verify", "--dir", ledgerDir], { cwd: sandbox, env });
     expect(verify.code, verify.stderr).toBe(0);
+    expect((JSON.parse(verify.stdout) as { anchor: { status: string } }).anchor.status).toBe("head");
     expect((JSON.parse(verify.stdout) as { chain: { ok: boolean } }).chain.ok).toBe(true);
     packDir = join(sandbox, "pack");
     const report = await run(process.execPath, [cli, "report", "--dir", ledgerDir, "--from", new Date(Date.now() - 3_600_000).toISOString(), "--to", new Date(Date.now() + 60_000).toISOString(), "--out", packDir], { cwd: sandbox, env });
