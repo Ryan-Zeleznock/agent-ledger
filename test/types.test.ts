@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
-  APPROVAL_DECISIONS, BUILTIN_CODEX_SERVER, BUILTIN_NAMESPACE, BUILTIN_SERVER, BUILTIN_SERVERS, BUILTIN_SERVER_KEYS, HANDOFF_TO_PROXY_REASON, HANDOFF_TO_PROXY_RULE_PREFIX, HOOK_AGENTS, HOOK_DECISIONS, HOOK_DECISION_KINDS,
-  HEARTBEAT_REASON, HEARTBEAT_RULE_ID, HEARTBEAT_TOOL, PERMISSION_DENIED_ERROR_CLASS,
+  APPROVAL_CHANNEL_KINDS, APPROVAL_DECISIONS, BUILTIN_CODEX_SERVER, BUILTIN_NAMESPACE, BUILTIN_SERVER, BUILTIN_SERVERS, BUILTIN_SERVER_KEYS, HANDOFF_TO_PROXY_REASON, HANDOFF_TO_PROXY_RULE_PREFIX, HOOK_AGENTS, HOOK_DECISIONS, HOOK_DECISION_KINDS,
+  HEARTBEAT_REASON, HEARTBEAT_RULE_ID, HEARTBEAT_TOOL, PERMISSION_DENIED_ERROR_CLASS, PROXY_NO_CHANNEL_REASON,
   RESERVED_KEYS, RESERVED_SERVER_NAMES, RISKS, VERDICTS,
   type ApprovalChannel, type ApprovalResult, type HookAgent, type HookDecision, type IncomingCall, type LedgerRecord, type Outcome, type SessionHeartbeat, type ToolCall, type ToolInfo, type UnsealedRecord,
 } from "../src/types/index.js";
@@ -87,6 +87,18 @@ describe("types", () => {
     const noChannel: ApprovalResult = { callId: "c1", decision: "no-channel", reason: "Codex cannot ask and no Slack channel is configured", decidedAt: "2026-09-29T00:00:00Z", channel: "hook-ask" };
     const approved: ApprovalResult = { callId: "c1", decision: "approved", approver: "U0123456789", reason: "Approve", decidedAt: "2026-09-29T00:00:00Z", channel: "slack" };
     expect([down.decision, delegated.channel, noChannel.decision, approved.approver]).toEqual(["unavailable", "hook-ask", "no-channel", "U0123456789"]);
+  });
+  it("ADR-012 (Slice 2a pin 1): ApprovalChannel admits { kind: 'none' } with no options; APPROVAL_CHANNEL_KINDS is the one enum; ApprovalResult.channel admits 'none'; PROXY_NO_CHANNEL_REASON is pinned", () => {
+    const none: ApprovalChannel = { kind: "none" };
+    // @ts-expect-error none carries no options: there is nobody to wait for
+    const bad: ApprovalChannel = { kind: "none", timeoutMs: 1 };
+    expect([none.kind, bad.kind]).toEqual(["none", "none"]);
+    expect(APPROVAL_CHANNEL_KINDS).toEqual(["slack", "hook-ask", "none"]);
+    const kinds: ApprovalChannel["kind"][] = [...APPROVAL_CHANNEL_KINDS];
+    expect(kinds).toHaveLength(3);
+    const r: ApprovalResult = { callId: "c1", decision: "no-channel", reason: PROXY_NO_CHANNEL_REASON, decidedAt: "2026-10-03T00:00:00Z", channel: "none" };
+    expect(r.channel).toBe("none");
+    expect(PROXY_NO_CHANNEL_REASON).toBe("agent-ledger: no approval channel is configured for this proxy; risky and unreviewed calls are denied until a Slack channel (ADR-006) is configured");
   });
   it("exports the reserved identity constants (Astra spec v2 findings 1 and 3; ADR-005 Codex)", () => {
     expect(BUILTIN_SERVER).toBe("builtin:claude-code");

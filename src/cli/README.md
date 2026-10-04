@@ -159,3 +159,21 @@ Full gate: `npm run typecheck && npm test`.
   pages; candidate evidence mappings and auditor acceptance remain [H].
 - **#11:** Printed hooks still use the valid, tested shell command form. Moving to the documented
   exec/args form is deferred; existing POSIX quoting and hostile-path tests remain applicable.
+
+## Slice 2a: `--ledger <postgres url>` on `anchor`, `verify`, `report` (Fable, 2026-10-03; pin 7, ADR-013)
+
+```text
+agent-ledger anchor | verify | report ... [--ledger postgres://user@host:port/db]
+```
+
+With `--ledger` (the value must start with `postgres://` or `postgresql://`, else usage/exit 2) the command uses
+`createLedger("postgres", url)` instead of the jsonl file and skips the `<dir>/ledger` existence check; `--dir` still
+holds `anchors.jsonl` and is created (0700) when absent, so the Mac keeps the anchor: the off-machine copy the Postgres
+ledger needs. **The password is not on the command line**: the URL carries the user only and `pg` reads `PGPASSWORD`
+from the environment (libpq variables). [H] until B cites the node-postgres "connecting" page in `src/ledger/README.md`
+(`pg` honours `PGPASSWORD`, `PGHOST`, `PGUSER`, `PGDATABASE`, `PGPORT` like libpq); the Postgres e2e run is the check.
+The URL is never printed: stdout carries the same JSON as the jsonl form (`head`, `chain`, `anchor`, `path`), stderr the
+fixed failure line. `hook`, `init` and `install-hooks` refuse `--ledger` (strict option parsing: usage, exit 2). Exit
+codes are unchanged. `test/cli.test.ts` "--ledger" covers parsing, the refusal rows and the no-URL output with a fake
+`createLedger` injected through `CliDeps`; `test/e2e-slice-2a.test.ts` step 10 runs the real binary (`--ledger` form when
+`AGENT_LEDGER_E2E_LEDGER` is set, jsonl form otherwise).
