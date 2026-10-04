@@ -8,19 +8,19 @@ servers:
       echo:
         class: read
         reviewedBy: ryan
-        reviewedAt: 2026-10-03
+        reviewedAt: 2026-10-04
         storeArgs: [message]
       now:
         class: read
         reviewedBy: ryan
-        reviewedAt: 2026-10-03
+        reviewedAt: 2026-10-04
       add:
         class: write
         reviewedBy: ryan
-        reviewedAt: 2026-10-03
+        reviewedAt: 2026-10-04
         storeArgs: [a, b]
       wipe:
         class: risky
         reviewedBy: ryan
-        reviewedAt: 2026-10-03
+        reviewedAt: 2026-10-04
         storeArgs: []

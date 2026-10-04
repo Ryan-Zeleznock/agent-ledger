@@ -24,4 +24,4 @@ configMapGenerator:
 images:
   - name: ghcr.io/ryan-zeleznock/agent-ledger
     newTag: slice-2a
-    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+    digest: sha256:af00fb1533c9988367880f28a1b6365ec89f0744e51522882393c48a61814fe4
