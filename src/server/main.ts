@@ -1,11 +1,12 @@
 // Slice 2a pin 8 (ADR-013): the server-mode composition root. `node dist/server/main.js` in the home-lab cluster.
 // Environment contract: AGENT_LEDGER_CONFIG_DIR, AGENT_LEDGER_LEDGER_URL, AGENT_LEDGER_PORT, AGENT_LEDGER_BIND_HOST,
-// AGENT_LEDGER_ALLOWED_ORIGINS, AGENT_LEDGER_APPROVALS, AGENT_LEDGER_MAX_INFLIGHT (additive, fix round F10); nothing else is
-// read (NODE_OPTIONS is checked, never read).
+// AGENT_LEDGER_ALLOWED_ORIGINS, AGENT_LEDGER_APPROVALS (none|slack, Slice 2b pin 6), AGENT_LEDGER_MAX_INFLIGHT (additive,
+// fix round F10), AGENT_LEDGER_TLS (on|off, required; ADR-017), AGENT_LEDGER_UPSTREAM_CONNECT_BUDGET_MS (Slice 2b pin 6);
+// nothing else is read (NODE_OPTIONS is checked, never read).
 import { realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { IncomingCall, LedgerRecord, ToolResult, UnsealedRecord } from "../types/index.js";
+import type { ApprovalChannel, IncomingCall, LedgerRecord, ToolResult, UnsealedRecord } from "../types/index.js";
 import { createLedger as realCreateLedger, type LedgerStore } from "../ledger/contract.js";
 import { createIdentity } from "../identity/contract.js";
 import { loadRegistry } from "../policy/contract.js";
@@ -13,14 +14,29 @@ import { createSecretsProvider } from "../secrets/contract.js";
 import { connectUpstreams, type Upstream } from "../upstream/contract.js";
 import { createPipeline } from "../pipeline/contract.js";
 import { DEFAULT_MAX_IN_FLIGHT, startFront, type RunningFront } from "../front/contract.js";
-import { readPrivateFile, readUpstreamsConfig } from "./files.js";
+import { validateSlackChannel, type SlackChannel } from "../approvals/contract.js";
+import { readConfigFile } from "../config-file.js";
+import { readApprovalsConfig, readPrivateFile, readUpstreamsConfig, type ApprovalsConfig } from "./files.js";
+import { slack, upstreamEras, withTls } from "./seams.js";
 
 export const ENV = {
   configDir: "AGENT_LEDGER_CONFIG_DIR", ledgerUrl: "AGENT_LEDGER_LEDGER_URL", port: "AGENT_LEDGER_PORT",
   bindHost: "AGENT_LEDGER_BIND_HOST", allowedOrigins: "AGENT_LEDGER_ALLOWED_ORIGINS", approvals: "AGENT_LEDGER_APPROVALS",
-  maxInFlight: "AGENT_LEDGER_MAX_INFLIGHT",
+  maxInFlight: "AGENT_LEDGER_MAX_INFLIGHT", tls: "AGENT_LEDGER_TLS", connectBudget: "AGENT_LEDGER_UPSTREAM_CONNECT_BUDGET_MS",
 } as const;
-export const CONFIG_FILES = { registry: "registry.yaml", agents: "agents.yaml", upstreams: "upstreams.yaml", hmacKey: "hmac.key", ledgerPassword: "ledger.password", secretsDir: "secrets" } as const;
+export const CONFIG_FILES = {
+  registry: "registry.yaml", agents: "agents.yaml", upstreams: "upstreams.yaml", hmacKey: "hmac.key", ledgerPassword: "ledger.password", secretsDir: "secrets",
+  approvals: "approvals.yaml", tlsCert: "tls.crt", tlsKey: "tls.key",
+} as const;
+/** Slice 2b pin 5: the Slack tokens, staged by `stage-config` into `secrets/` under the file provider's `<name>.<key>` naming. */
+export const SLACK_TOKEN_FILES = { botToken: "approvals.botToken", appToken: "approvals.appToken" } as const;
+/** Slice 2b pin 6: total time `connectUpstreams` (and, in slack mode, `probeSlack`) is retried at start. */
+export const DEFAULT_CONNECT_BUDGET_MS = 60_000;
+export const MAX_CONNECT_BUDGET_MS = 600_000;
+/** Waits between attempts (pin 6: attempts at 0, 1, 2, 4, 8, 16, 16, … s); the last value repeats. */
+export const CONNECT_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 16_000] as const;
+export const TLS_CERT_MAX_BYTES = 64 * 1024;
+export const TLS_KEY_MAX_BYTES = 16 * 1024;
 export const DEFAULT_SERVER_PORT = 8787;
 export const DEFAULT_SERVER_BIND_HOST = "0.0.0.0"; // the ONE place 0.0.0.0 is chosen, on purpose (pin 8)
 export const SHUTDOWN_GRACE_MS = 10_000;
@@ -36,10 +52,16 @@ export interface ServerDeps {
   createLedger: typeof realCreateLedger;
   /** One JSON-able object per line; the entrypoint writes it to stderr. */
   log: (line: LogLine) => void;
+  /** Additive (Slice 2b pin 6): the connect-retry wait and clock, injectable so the backoff is testable without real time. */
+  sleep: (ms: number) => Promise<void>;
+  clock: () => number;
 }
 export interface RunningServer { readonly port: number; readonly head: string; stop(): Promise<void>; }
 
-const defaults: ServerDeps = { createLedger: realCreateLedger, log: (line) => process.stderr.write(`${JSON.stringify(line)}\n`) };
+const defaults: ServerDeps = {
+  createLedger: realCreateLedger, log: (line) => process.stderr.write(`${JSON.stringify(line)}\n`),
+  sleep: (ms) => new Promise((done) => { setTimeout(done, ms); }), clock: () => Date.now(),
+};
 const now = () => new Date().toISOString();
 
 /**
@@ -50,10 +72,14 @@ const now = () => new Date().toISOString();
 export async function startServer(env: NodeJS.ProcessEnv = process.env, overrides: Partial<ServerDeps> = {}): Promise<RunningServer> {
   const deps = { ...defaults, ...overrides };
   const secretsToStrip: string[] = [];
-  const refuse = (reason: string): never => {
+  const redact = (reason: string): string => {
     let clean = reason;
     // longest first, so the full URL (which contains the password) is redacted before the password alone would break it
     for (const s of [...secretsToStrip].sort((a, b) => b.length - a.length)) if (s.length > 0) clean = clean.split(s).join("[redacted]");
+    return clean;
+  };
+  const refuse = (reason: string): never => {
+    const clean = redact(reason);
     deps.log({ ts: now(), event: "refused", reason: clean });
     throw new StartupRefused(clean);
   };
@@ -75,7 +101,13 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env, override
   const maxInFlightRaw = env[ENV.maxInFlight] ?? String(DEFAULT_MAX_IN_FLIGHT);
   if (!/^\d{1,6}$/.test(maxInFlightRaw) || Number(maxInFlightRaw) < 1 || Number(maxInFlightRaw) > 100_000) refuse(`${ENV.maxInFlight} must be an integer 1-100000`);
   const maxInFlight = Number(maxInFlightRaw);
-  if (env[ENV.approvals] !== "none") refuse(`${ENV.approvals} must be "none" in this slice (slack arrives with the approvals module; got ${env[ENV.approvals] === undefined ? "nothing" : JSON.stringify(env[ENV.approvals]).slice(0, 32)})`);
+  const approvalsKind = env[ENV.approvals];
+  if (approvalsKind !== "none" && approvalsKind !== "slack") refuse(`${ENV.approvals} must be "none" or "slack" (got ${approvalsKind === undefined ? "nothing" : JSON.stringify(approvalsKind).slice(0, 32)})`);
+  const tlsMode = env[ENV.tls];
+  if (tlsMode !== "on" && tlsMode !== "off") refuse(`${ENV.tls} must be "on" or "off" (got ${tlsMode === undefined ? "nothing: no silent plaintext, ADR-017" : JSON.stringify(tlsMode).slice(0, 32)})`);
+  const budgetRaw = env[ENV.connectBudget] ?? String(DEFAULT_CONNECT_BUDGET_MS);
+  if (!/^\d{1,6}$/.test(budgetRaw) || Number(budgetRaw) > MAX_CONNECT_BUDGET_MS) refuse(`${ENV.connectBudget} must be an integer 0-${MAX_CONNECT_BUDGET_MS}`);
+  const connectBudgetMs = Number(budgetRaw);
 
   let ledgerUrl: URL;
   try { ledgerUrl = new URL(ledgerUrlRaw!); } catch { return refuse(`${ENV.ledgerUrl} is not a valid URL`); }
@@ -96,6 +128,38 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env, override
   // 4. secrets
   let secrets;
   try { secrets = createSecretsProvider("file", join(dir, CONFIG_FILES.secretsDir)); } catch (e) { return refuse(message(e)); }
+  // 4b. approvals.yaml (slack only; Slice 2b pin 5) and the TLS pair (ADR-017): read before anything connects, so a config
+  // mistake refuses fast. Tokens stay files: the channel names them, the approvals module reads them (pin 1 readSecret).
+  let approvalsConfig: ApprovalsConfig | undefined;
+  if (approvalsKind === "slack") {
+    try { approvalsConfig = readApprovalsConfig(join(dir, CONFIG_FILES.approvals), { maxTimeoutMs: slack.SLACK_PROXY_MAX_TIMEOUT_MS, productionApiBaseUrl: slack.SLACK_API_BASE_URL }); }
+    catch (e) { return refuse(message(e)); }
+  }
+  let tls: { cert: Buffer; key: Buffer } | undefined;
+  if (tlsMode === "on") {
+    let cert: Buffer;
+    try { cert = Buffer.from(readConfigFile(join(dir, CONFIG_FILES.tlsCert)), "utf8"); }
+    catch (e) { return refuse(`${CONFIG_FILES.tlsCert}: ${e instanceof Error && e.message === "Unsafe configuration permissions" ? "unsafe permissions or owner" : "cannot be read"}`); }
+    if (cert.length === 0 || cert.length > TLS_CERT_MAX_BYTES || !cert.includes("-----BEGIN CERTIFICATE-----")) refuse(`${CONFIG_FILES.tlsCert}: must be a PEM certificate of at most ${TLS_CERT_MAX_BYTES} bytes`);
+    let key: Buffer;
+    try { key = readPrivateFile(join(dir, CONFIG_FILES.tlsKey), TLS_KEY_MAX_BYTES); } catch (e) { return refuse(message(e)); }
+    if (!/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(key.toString("latin1"))) refuse(`${CONFIG_FILES.tlsKey}: must be a PEM private key`);
+    tls = { cert, key };
+  } else {
+    deps.log({ ts: now(), event: "warning", tls: "off" });
+  }
+  /** Pin 6 backoff: attempt, and on failure wait 1, 2, 4, 8, 16, 16, … s while the budget allows; the last reason is returned. */
+  const retrying = async <T>(what: string, attempt: () => Promise<T>): Promise<{ ok: true; value: T } | { ok: false; reason: string }> => {
+    const started = deps.clock();
+    for (let n = 1; ; n++) {
+      let reason: string;
+      try { return { ok: true, value: await attempt() }; } catch (e) { reason = message(e); }
+      const nextInMs = CONNECT_BACKOFF_MS[Math.min(n - 1, CONNECT_BACKOFF_MS.length - 1)]!;
+      if (deps.clock() - started + nextInMs > connectBudgetMs) return { ok: false, reason };
+      deps.log({ ts: now(), event: `${what}-retry`, attempt: n, nextInMs, reason: redact(reason) });
+      await deps.sleep(nextInMs);
+    }
+  };
   // 5. ledger + head
   let ledger: LedgerStore;
   try {
@@ -114,13 +178,15 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env, override
   try { head = await ledger.head(); } catch (e) { return refuse(`ledger unreachable: head() failed (${e instanceof Error ? e.name : "error"}: ${message(e)})`); }
   deps.log({ ts: now(), event: "ledger", backend, head });
   // 6. upstreams
-  let upstream: Upstream;
-  try {
-    const config = readUpstreamsConfig(join(dir, CONFIG_FILES.upstreams));
-    upstream = await connectUpstreams(config, secrets);
-  } catch (e) { return refuse(`upstreams: ${message(e)}`); }
+  // Config errors refuse at once; connect failures (network, 5xx, an auth or era refusal) are retried under the budget
+  // (pin 6: "slower, never wrong"), then refused with the last value-free reason.
+  let upstreamConfig;
+  try { upstreamConfig = readUpstreamsConfig(join(dir, CONFIG_FILES.upstreams)); } catch (e) { return refuse(`upstreams: ${message(e)}`); }
+  const connected = await retrying("upstreams", () => connectUpstreams(upstreamConfig, secrets));
+  if (!connected.ok) return refuse(`upstreams: ${connected.reason}`);
+  const upstream: Upstream = connected.value;
   const tools = await upstream.listTools();
-  const upstreamsLine: LogLine = { ts: now(), event: "upstreams", servers: [...new Set(tools.map((t) => t.server))], tools: tools.length };
+  const upstreamsLine: LogLine = { ts: now(), event: "upstreams", servers: [...new Set(tools.map((t) => t.server))], tools: tools.length, eras: upstreamEras(upstream, upstreamConfig.map((c) => c.name)) };
   if (upstream.rejectedTools && upstream.rejectedTools.length > 0) upstreamsLine["rejected"] = upstream.rejectedTools.map((r) => ({ ...r })); // transport: the client SHOULD log a warning naming the tool and the reason (F4)
   deps.log(upstreamsLine);
   // 7. pipeline, with the ledger observed so each call's log line can carry agentId/verdict/ruleId/status
@@ -138,10 +204,32 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env, override
     },
     verify: () => ledger.verify(), head: () => ledger.head(), read: (range) => ledger.read(range),
   };
+  // 6b. Slack (pin 6): configure (only when the YAML names a base URL) → validate → live probe under the same backoff.
+  let approvals: ApprovalChannel = { kind: "none" };
+  if (approvalsConfig !== undefined) {
+    const channel: SlackChannel = {
+      kind: "slack", transport: "socket-mode", channelId: approvalsConfig.channelId, approvers: approvalsConfig.approvers, timeoutMs: approvalsConfig.timeoutMs,
+      botToken: { kind: "file", path: join(dir, CONFIG_FILES.secretsDir, SLACK_TOKEN_FILES.botToken) },
+      appToken: { kind: "file", path: join(dir, CONFIG_FILES.secretsDir, SLACK_TOKEN_FILES.appToken) },
+    };
+    const slackRefuse = async (reason: string): Promise<never> => { await slack.closeSlackApprovals().catch(() => undefined); await upstream.close().catch(() => undefined); return refuse(`approvals: ${reason}`); };
+    try { if (approvalsConfig.apiBaseUrl !== undefined) slack.configureSlackApprovals({ apiBaseUrl: approvalsConfig.apiBaseUrl }); }
+    catch (e) { return slackRefuse(`configureSlackApprovals failed (${message(e)})`); }
+    let problems: string[];
+    try { problems = await validateSlackChannel(channel); } catch (e) { return slackRefuse(`validateSlackChannel failed (${message(e)})`); }
+    if (problems.length > 0) return slackRefuse(problems.join("; "));
+    const probed = await retrying("approvals", async () => { const r = await slack.probeSlack(channel); if (!r.ok) throw new Error(r.reason); return r; });
+    if (!probed.ok) return slackRefuse(`Slack probe failed (${probed.reason})`);
+    deps.log({ ts: now(), event: "approvals", kind: "slack", channelId: channel.channelId, approvers: channel.approvers.length, timeoutMs: channel.timeoutMs, teamId: probed.value.teamId });
+    approvals = channel;
+  }
   let pipeline;
   try {
-    pipeline = createPipeline({ identity, registry, ledger: observed, upstream, approvals: { kind: "none" }, argsHmacKey });
-  } catch (e) { await upstream.close().catch(() => undefined); return refuse(`pipeline: ${message(e)}`); }
+    pipeline = createPipeline({ identity, registry, ledger: observed, upstream, approvals, argsHmacKey });
+  } catch (e) {
+    if (approvals.kind === "slack") await slack.closeSlackApprovals().catch(() => undefined);
+    await upstream.close().catch(() => undefined); return refuse(`pipeline: ${message(e)}`);
+  }
   const inflight = new Set<Promise<ToolResult>>(); // admitted calls whose outcome attempt stop() must wait for (F3)
   const handler = async (incoming: IncomingCall): Promise<ToolResult> => {
     const p = handleOne(incoming);
@@ -169,9 +257,12 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env, override
   };
   // 8. front
   let front: RunningFront;
-  try { front = await startFront(handler, { mode: "http", port, bindHost, allowedOrigins, maxInFlight, drainTimeoutMs: SHUTDOWN_DRAIN_MS, tools: () => upstream.listTools() }); }
-  catch (e) { await upstream.close().catch(() => undefined); return refuse(`front: ${message(e)}`); }
-  deps.log({ ts: now(), event: "listening", port: front.port, bindHost, approvals: "none", allowedOrigins: allowedOrigins.length, maxInFlight });
+  try { front = await startFront(handler, withTls({ mode: "http", port, bindHost, allowedOrigins, maxInFlight, drainTimeoutMs: SHUTDOWN_DRAIN_MS, tools: () => upstream.listTools() }, tls)); }
+  catch (e) {
+    if (approvals.kind === "slack") await slack.closeSlackApprovals().catch(() => undefined);
+    await upstream.close().catch(() => undefined); return refuse(`front: ${message(e)}`);
+  }
+  deps.log({ ts: now(), event: "listening", port: front.port, bindHost, approvals: approvals.kind, tls: tlsMode, allowedOrigins: allowedOrigins.length, maxInFlight });
   let stopped = false;
   return {
     port: front.port, head,
@@ -184,6 +275,9 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env, override
     async stop() {
       if (stopped) return; stopped = true;
       const deadline = Date.now() + SHUTDOWN_GRACE_MS - 1_000;
+      // Slice 2b pin 6 (amends F3): pending approvals settle `unavailable` FIRST, so no admitted call waits minutes on a
+      // human while the front drains; the pipeline records each as a deny.
+      if (approvals.kind === "slack") await slack.closeSlackApprovals().catch(() => undefined);
       await front.stop();
       await upstream.close().catch(() => undefined);
       const drained = await settleWithin([...inflight], Math.max(0, deadline - Date.now()));
