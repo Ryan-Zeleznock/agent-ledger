@@ -349,7 +349,7 @@ kubectl apply -f deploy/k8s/01-serviceaccounts.yaml
 Verify: `kubectl -n agent-ledger get configmaps,serviceaccounts`; inspect the non-secret ConfigMaps if needed.
 `001_init.sh` alone is mounted in initdb.d, with the SQL at `/etc/agent-ledger-init/001_init.sql`; this avoids the
 entrypoint executing the SQL a second time without password variables. SQL reruns preserve records/role passwords.
-Undo: `kubectl -n agent-ledger delete configmap proxy-registry postgres-init`, then delete the four ServiceAccounts
+Undo: `kubectl -n agent-ledger delete configmap proxy-registry postgres-init`, then delete the five ServiceAccounts (including `everything`)
 only after the workloads stop.
 
 ## 7. Kyverno and negative proofs
@@ -825,9 +825,19 @@ no approval channel means risky calls are denied, not approved.
 tool call has to pass through the proxy to happen at all. Only server-mode records support the claim "no risky action ran
 without a recorded approval".
 
-That claim applies to the governed demo tools and the credential/network boundary proved above; this demo's risky
-action is harmless and denied. It does not turn local hooks into enforcement or defend against cluster/DB admins.
-Third-party legacy-era MCP upstreams, TLS, Slack approvals, stdio, Cilium L7 policies, versioned migrations and a
-maintained image builder remain Slice 2b. The local test database is 16; the cluster Job closes the 17.11/runtime gap.
-Build-stage/base image tags are version-pinned per the pins; only the published Agent Ledger workload image is
-resolved to a digest here. No digest or successful cluster proof is invented by this runbook.
+That claim applies to the governed tools (the `demo` and `everything` upstreams) and the credential/network boundary
+proved above. With Slice 2b a risky call runs ONLY after an allowlisted Slack approver clicks Approve, and the intent
+record names that approver (`approved, U…`); a deny, a timeout, Slack being unreachable or a proxy shutdown are
+recorded denials (step 12b, step 13). The demo's risky actions are harmless (`demo__wipe` wipes nothing; `get-env`
+runs in a Pod whose environment holds nothing secret). It does not turn local hooks into enforcement or defend against
+cluster/DB admins. The local test database is 16; the cluster Job closes the 17.11/runtime gap.
+
+Images: the Agent Ledger proxy image and the `everything` image are digest-pinned by Ryan's builds (steps 4, 4b);
+BusyBox, Postgres and the `everything` build/runtime bases are pinned by index digest (resolved 2026-10-04,
+`deploy/README.md`); the proxy's own Dockerfile bases are still version tags. No digest or successful cluster proof is
+invented by this runbook.
+
+Still open after 2b (2c): decide-only (Codex hook) Slack approvals; FQDN-scoped Slack egress and Cilium L7 policies;
+cert-manager or a public CA; approver display names; cancelling a pending approval when the client gives up; stdio
+front and upstream; versioned migrations; database password files and scram local auth; a separate integration key;
+a maintained image builder replacing archived Kaniko.
