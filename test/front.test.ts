@@ -85,8 +85,8 @@ describe("front: pin 3 status/code matrix (real node:http server)", () => {
     ["invalid JSON → 400 -32700", { ...discover, token: KEY, rawBody: "{not json" }, 400, JSONRPC_PARSE_ERROR],
     ["a batch array → 400 -32600", { ...discover, token: KEY, rawBody: "[]" }, 400, JSONRPC_INVALID_REQUEST],
     ["jsonrpc 1.0 → 400 -32600", { ...discover, token: KEY, rawBody: JSON.stringify({ jsonrpc: "1.0", id: 1, method: "server/discover" }) }, 400, JSONRPC_INVALID_REQUEST],
-    // F6: header validation first (versioning matrix: legacy → modern HTTP "is rejected per server validation with 400"); the validation error to an `initialize` still names our version (versioning SHOULD)
-    ["initialize (legacy client, no headers) → 400 -32020 naming 2026-07-28", { method: "initialize", token: KEY, params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "old", version: "1" } }, meta: false, headers: { "mcp-protocol-version": null, "mcp-method": null } }, 400, JSONRPC_HEADER_MISMATCH, (r) => { expect(rpc(r).error!.message).toContain(INITIALIZE_MESSAGE); expect(rpc(r).error!.message).toContain("2026-07-28"); expect(rpc(r).error!.data).toEqual({ supported: ["2026-07-28"] }); }],
+    // Slice 2b ADR-016: a headerless initialize selects legacy; modern-framed initialize keeps the old validation.
+    ["initialize (legacy client, no modern headers) → 200 with session", { method: "initialize", token: KEY, params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "old", version: "1" } }, meta: false, headers: { "mcp-protocol-version": null, "mcp-method": null } }, 200, null, (r) => { expect(r.headers.get("mcp-session-id")).toMatch(/^[\x21-\x7e]{1,256}$/); expect(rpc(r).result!.protocolVersion).toBe("2025-11-25"); }],
     ["initialize with a conflicting Mcp-Method header → 400 -32020, still naming 2026-07-28", { method: "initialize", token: KEY, headers: { "mcp-method": "tools/list" } }, 400, JSONRPC_HEADER_MISMATCH, (r) => { expect(rpc(r).error!.data).toEqual({ supported: ["2026-07-28"] }); }],
     ["initialize with an old version header → 400 -32022 with supported/requested", { method: "initialize", token: KEY, protocolVersion: "2025-11-25" }, 400, JSONRPC_UNSUPPORTED_VERSION, (r) => expect(rpc(r).error!.data).toEqual({ supported: ["2026-07-28"], requested: "2025-11-25" })],
     ["initialize with valid modern headers → 404 -32601 (an otherwise valid request for an unsupported method)", { method: "initialize", token: KEY }, 404, JSONRPC_METHOD_NOT_FOUND, (r) => { expect(rpc(r).error!.message).toBe(INITIALIZE_MESSAGE); expect(rpc(r).error!.data).toEqual({ supported: ["2026-07-28"] }); }],
@@ -119,7 +119,7 @@ describe("front: pin 3 status/code matrix (real node:http server)", () => {
     ["raw pair instead of the exposed name → unknown tool", { method: "tools/call", token: KEY, params: { name: "echo", arguments: {} } }, 400, JSONRPC_INVALID_PARAMS],
     ["arguments not an object → 400 -32602", { method: "tools/call", token: KEY, params: { name: "demo__echo", arguments: [1] } }, 400, JSONRPC_INVALID_PARAMS],
     ["params not an object → 400 -32600", { method: "server/discover", token: KEY, rawBody: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "server/discover", params: [] }) }, 400, JSONRPC_INVALID_REQUEST],
-    ["Mcp-Session-Id and Last-Event-ID are ignored, never echoed → 200", { ...discover, token: KEY, headers: { "mcp-session-id": "sess-123", "last-event-id": "7" } }, 200, null, (r) => { expect(r.headers.get("mcp-session-id")).toBeNull(); expect(r.text).not.toContain("sess-123"); }],
+    ["unknown Mcp-Session-Id → 404 and never echoed", { ...discover, token: KEY, headers: { "mcp-session-id": "sess-123", "last-event-id": "7" } }, 404, JSONRPC_INVALID_REQUEST, (r) => { expect(r.headers.get("mcp-session-id")).toBeNull(); expect(r.text).not.toContain("sess-123"); }],
   ];
   it.each(cases)("%s", async (_label, request, status, code, extra) => {
     const f = await start();
