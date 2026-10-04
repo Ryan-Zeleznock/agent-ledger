@@ -74,6 +74,18 @@ export class FakeSlack {
     }
   }
   private notify(): void { for (const w of this.waiters.splice(0)) w(); }
+  /** ts of every posted message a test has already paired with a call (Astra F1: never hand one message to two calls). */
+  readonly claimed = new Set<string>();
+  /** Waits for the oldest posted message nobody has claimed yet, claims it and returns it. */
+  async claimNext(ms = 10_000, what = "an unclaimed chat.postMessage"): Promise<PostedMessage> {
+    const t0 = Date.now();
+    for (;;) {
+      // re-checked after every wake-up: several waiters may wake for one message, and only the first may claim it
+      await this.waitFor(() => this.posted.some((m) => !this.claimed.has(m.ts)), Math.max(0, ms - (Date.now() - t0)), what);
+      const m = this.posted.find((x) => !this.claimed.has(x.ts));
+      if (m !== undefined) { this.claimed.add(m.ts); return m; }
+    }
+  }
   callsOf(method: string): ApiCall[] { return this.calls.filter((c) => c.method === method); }
   openConns(): WsConn[] { return this.conns.filter((c) => c.open); }
 

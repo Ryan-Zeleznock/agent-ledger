@@ -98,15 +98,19 @@ async function callTool(name: string, args: Record<string, unknown>, key = K): P
   expect(r.status, r.text.slice(0, 200)).toBe(200);
   return (r.json as { result: Record<string, unknown> }).result;
 }
-/** Starts a risky call and resolves once its Slack message is posted: the pending call and the message. */
-async function riskyCall(name: string, args: Record<string, unknown>): Promise<{ pending: Promise<Record<string, unknown>>; message: PostedMessage; callId: string }> {
-  const before = slack.posted.length;
-  const pending = callTool(name, args);
+/**
+ * Launches one request and pairs it with the Slack message it causes: the oldest message nobody has claimed yet.
+ * Pairing is only unambiguous if each launch is captured before the next one starts (Astra F1: three concurrent
+ * captures all picked the first message), so callers that want several approvals pending at once capture them ONE BY
+ * ONE and keep the `pending` promises open; the request stays in flight while its approval waits.
+ */
+async function captureApproval<R>(launch: () => Promise<R>, what: string): Promise<{ pending: Promise<R>; message: PostedMessage; callId: string }> {
+  const pending = launch();
   pending.catch(() => undefined);
-  await slack.waitFor(() => slack.posted.length > before, 10_000, `chat.postMessage for ${name}`);
-  const message = slack.posted[before]!;
+  const message = await slack.claimNext(10_000, `chat.postMessage for ${what}`);
   return { pending, message, callId: callFromBlock(message) };
 }
+const riskyCall = (name: string, args: Record<string, unknown>) => captureApproval(() => callTool(name, args), name);
 async function freePort(): Promise<number> {
   const s = createServer(); await new Promise<void>((r) => s.listen(0, "127.0.0.1", () => r()));
   const port = (s.address() as AddressInfo).port; await new Promise<void>((r) => s.close(() => r())); return port;
@@ -207,6 +211,19 @@ describe.sequential("Slice 2b harness self-tests (always run: the fakes are prov
     await slack.waitFor(() => slack.openConns().length === 0, 5_000, "close");
     // reset what the self-test produced so the product steps count from zero
     slack.calls.length = 0; slack.posted.length = 0; slack.conns.length = 0; slack.acks.clear(); slack.sentEnvelopes.length = 0; slack.authFailures.length = 0;
+  });
+  it("approval capture (Astra F1): three requests captured one by one while all stay pending are paired with three DISTINCT messages, each its own; a concurrent burst never hands one message to two captures", async () => {
+    const post = (marker: string, delayMs: number) => new Promise((r) => setTimeout(r, delayMs)).then(() => fetch(`${slack.apiBaseUrl}chat.postMessage`, { method: "POST", headers: { authorization: `Bearer ${BOT}`, "content-type": "application/json" },
+      body: JSON.stringify({ channel: CHANNEL, text: marker, blocks: [{ type: "actions", block_id: `agent-ledger:call:${marker}`, elements: [] }] }) }).then(() => marker));
+    let resolveAll: () => void = () => undefined; const gate = new Promise<void>((r) => { resolveAll = r; });
+    const caps = [];
+    for (const [i, marker] of ["call-a", "call-b", "call-c"].entries()) caps.push(await captureApproval(() => post(marker, 30 - i * 10).then(async (m) => { await gate; return m; }), marker));
+    expect(caps.map((c) => c.callId)).toEqual(["call-a", "call-b", "call-c"]);
+    expect(new Set(caps.map((c) => c.message.ts)).size).toBe(3);
+    resolveAll(); expect(await Promise.all(caps.map((c) => c.pending))).toEqual(["call-a", "call-b", "call-c"]);
+    const burst = await Promise.all(["x", "y", "z"].map((m, i) => captureApproval(() => post(`burst-${m}`, 10 * i), m)));
+    expect(new Set(burst.map((c) => c.message.ts)).size).toBe(3);
+    slack.calls.length = 0; slack.posted.length = 0; slack.claimed.clear();
   });
   it("legacy client ↔ legacy upstream: initialize (session id, negotiated version), initialized 202, tools/list and echo over JSON and SSE; no session → 400 -32000; wrong version header → 400; DELETE → 204 then 404; GET → 405", async () => {
     const c = new LegacyClient(legacy.url);
@@ -326,7 +343,11 @@ describe.sequential("Slice 2b end to end: Slack approvals + the legacy-era bridg
   });
   step("8. three concurrent risky calls share ONE WebSocket; a disconnect warning mid-wait → the new connection opens before the old closes; each click settles its own call; no unavailable", MAIN, async () => {
     const connsBefore = slack.conns.length;
-    const calls = await Promise.all([1, 2, 3].map((i) => riskyCall("demo__wipe", { target: `concurrent-${i}` })));
+    const calls: Awaited<ReturnType<typeof riskyCall>>[] = [];
+    for (const i of [1, 2, 3]) calls.push(await riskyCall("demo__wipe", { target: `concurrent-${i}` })); // all three stay pending
+    expect(new Set(calls.map((c) => c.message.ts)).size).toBe(3);
+    expect(new Set(calls.map((c) => c.callId)).size).toBe(3);
+    for (const c of calls) expect(c.callId).toMatch(/\S/);
     expect(slack.openConns()).toHaveLength(1); expect(slack.conns.length).toBe(connsBefore + 1);
     const old = slack.openConns()[0]!;
     slack.disconnect("warning", old.id);
