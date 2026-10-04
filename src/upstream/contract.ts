@@ -244,6 +244,19 @@ export function encodeHeaderValue(value: string): string {
   return `=?base64?${Buffer.from(value, "utf8").toString("base64")}?=`;
 }
 
+/** Enforce our deadline even if an injected transport or stream ignores AbortSignal. */
+async function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) { void operation.catch(() => undefined); throw signal.reason; }
+  let onAbort!: () => void;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+  try { return await Promise.race([operation, aborted]); }
+  finally { signal.removeEventListener("abort", onAbort); }
+}
+
 class TransportFailure extends UpstreamError {}
 class HttpFailure extends UpstreamError { constructor(message: string, readonly status: number, readonly modernCode?: number) { super(message); } }
 
@@ -326,9 +339,14 @@ class HttpClient {
     const timer = setTimeout(() => { timedOut = true; controller.abort(new UpstreamTimeout(`upstream ${this.name}: no response to ${method} within ${timeoutMs} ms`)); }, timeoutMs);
     try {
       let res: Response;
-      try { res = await fetch(this.url, { method: "POST", headers, body, signal: controller.signal, redirect: "error" }); }
+      try {
+        res = await abortable(fetch(this.url, { method: "POST", headers, body, signal: controller.signal, redirect: "error" }).then(response => {
+          if (controller.signal.aborted) { void response.body?.cancel().catch(() => undefined); throw controller.signal.reason; }
+          return response;
+        }), controller.signal);
+      }
       catch (e) { throw this.abortReason(controller, timedOut, e, method); }
-      if (notification && res.status >= 200 && res.status < 300) { await res.body?.cancel(); return {}; }
+      if (notification && res.status >= 200 && res.status < 300) { await abortable(res.body?.cancel().catch(() => undefined) ?? Promise.resolve(), controller.signal); return {}; }
       if (res.status !== 200) {
         let code: number | undefined;
         if (method === "server/discover" && res.status >= 400 && res.status < 500) {
@@ -336,14 +354,14 @@ class HttpClient {
           await this.readBody(res, controller, timedOut, method, c => { chunks.push(c); return false; });
           const data = tryJson(Buffer.concat(chunks).toString("utf8"));
           if (isRecord(data) && data["jsonrpc"] === "2.0" && !Object.hasOwn(data, "result") && isRecord(data["error"]) && (MODERN_ERROR_CODES as readonly unknown[]).includes(data["error"]["code"])) code = data["error"]["code"] as number;
-        } else await res.body?.cancel().catch(() => undefined);
+        } else await abortable(res.body?.cancel().catch(() => undefined) ?? Promise.resolve(), controller.signal);
         const message = `upstream ${this.name}: HTTP ${res.status} on ${method}${code === undefined ? "" : ` (JSON-RPC error ${code})`}`;
         if (res.status >= 500) throw new TransportFailure(message);
         throw new HttpFailure(message, res.status, code);
       }
       if (initialize) {
         const session = res.headers.get("mcp-session-id");
-        if (session !== null && !/^[\x21-\x7e]{1,256}$/.test(session)) { await res.body?.cancel(); throw new UpstreamError(`upstream ${this.name}: invalid legacy session header`); }
+        if (session !== null && !/^[\x21-\x7e]{1,256}$/.test(session)) { await abortable(res.body?.cancel().catch(() => undefined) ?? Promise.resolve(), controller.signal); throw new UpstreamError(`upstream ${this.name}: invalid legacy session header`); }
         this.#session = session ?? undefined;
       }
       const ct = (res.headers.get("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
@@ -366,7 +384,7 @@ class HttpClient {
         await this.readBody(res, controller, timedOut, method, (c) => take(parser.push(c)));
         if (message === undefined) take(parser.end());
         if (message === undefined) throw new UpstreamError(`upstream ${this.name}: ${method} SSE stream ended without a response`);
-      } else { await res.body?.cancel().catch(() => undefined); throw new UpstreamError(`upstream ${this.name}: ${method} response has an unsupported content-type`); }
+      } else { await abortable(res.body?.cancel().catch(() => undefined) ?? Promise.resolve(), controller.signal); throw new UpstreamError(`upstream ${this.name}: ${method} response has an unsupported content-type`); }
       if (isRecord(message) && "method" in message && "id" in message) throw new UpstreamError("upstream sent a server-to-client request; not supported");
       // JSON-RPC envelope (base protocol "Responses", re-read 2026-10-03): 2.0, same id, exactly one of result/error (F2)
       if (!isRecord(message) || message["jsonrpc"] !== "2.0") throw new UpstreamError(`upstream ${this.name}: ${method} response is not a JSON-RPC 2.0 message`);
@@ -405,16 +423,16 @@ class HttpClient {
     let size = 0;
     try {
       for (;;) {
-        const { done, value } = await reader.read();
+        const { done, value } = await abortable(reader.read(), controller.signal);
         if (done) return;
         size += value.byteLength;
-        if (size > UPSTREAM_MAX_RESPONSE_BYTES) { await reader.cancel().catch(() => undefined); throw new UpstreamError(`upstream ${this.name}: ${method} response exceeds ${UPSTREAM_MAX_RESPONSE_BYTES} bytes`); }
-        if (sink(value)) { await reader.cancel().catch(() => undefined); return; }
+        if (size > UPSTREAM_MAX_RESPONSE_BYTES) { await abortable(reader.cancel().catch(() => undefined), controller.signal); throw new UpstreamError(`upstream ${this.name}: ${method} response exceeds ${UPSTREAM_MAX_RESPONSE_BYTES} bytes`); }
+        if (sink(value)) { await abortable(reader.cancel().catch(() => undefined), controller.signal); return; }
       }
     } catch (e) {
       if (e instanceof UpstreamError) throw e;
       throw this.abortReason(controller, timedOut, e, method);
-    } finally { await reader.cancel().catch(() => undefined); reader.releaseLock(); }
+    } finally { await abortable(reader.cancel().catch(() => undefined), controller.signal).catch(() => undefined); reader.releaseLock(); }
   }
 }
 

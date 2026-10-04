@@ -217,9 +217,9 @@ describe.sequential("Slice 2a demo path: proxy → policy → ledger → demo up
     const evil = await post({ token: K, method: "server/discover", headers: { origin: "https://evil.example" } });
     expect(evil.status).toBe(403); expect(Object.hasOwn(evil.json as object, "id")).toBe(false);
     expect((await post({ token: K, method: "server/discover", httpMethod: "GET" })).status).toBe(405);
-    // F6: a legacy initialize (no headers) fails HTTP validation first (400 -32020, versioning matrix) and the error still names 2026-07-28; a modern-framed initialize is the unknown method (404 -32601)
+    // ADR-016: a headerless legacy initialize now negotiates a session; modern-framed initialize still receives 404 -32601.
     const init = await post({ token: K, method: "initialize", meta: false, params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "legacy", version: "1" } }, headers: { "mcp-protocol-version": null, "mcp-method": null } });
-    expect(init.status).toBe(400); expect(rpcErr(init)!.code).toBe(-32020); expect(rpcErr(init)!.message).toContain("2026-07-28"); expect(rpcErr(init)!.data).toEqual({ supported: ["2026-07-28"] });
+    expect(init.status).toBe(200); expect(init.headers.get("mcp-session-id")).toMatch(/^[\x21-\x7e]{1,256}$/); expect((init.json as { result: { protocolVersion: string } }).result.protocolVersion).toBe("2025-11-25");
     const initModern = await post({ token: K, method: "initialize" });
     expect(initModern.status).toBe(404); expect(rpcErr(initModern)!.code).toBe(-32601); expect(rpcErr(initModern)!.message).toContain("2026-07-28");
     const note = await post({ token: K, method: "notifications/initialized", notification: true });

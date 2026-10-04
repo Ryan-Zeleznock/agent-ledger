@@ -156,3 +156,45 @@ describe('upstream failure boundaries', () => {
     await up.execute({ ...call, tool: 'valid', args: { x: 'value' } }); expect(fake.seen.at(-1)!.headers.get('mcp-param-x')).toBe('value');
   });
 });
+
+describe('coordinator startup refusal regressions', () => {
+  it.each([500, 404])('refuses reflected HTTP %s value-free, attempting legacy only for the non-modern 404', async status => {
+    fake.script = r => Response.json({ jsonrpc: '2.0', id: r.body.id, error: { code: -32603, message: `saw ${r.headers.get('authorization')}` } }, { status });
+    const error = await connect().catch(e => e as Error);
+    expect(error).toMatchObject({ name: status === 500 ? 'UpstreamUnavailable' : 'UpstreamError', message: `upstream demo: HTTP ${status} on ${status === 500 ? 'server/discover' : 'initialize'}` });
+    expect(fake.seen.map(r => r.body.method)).toEqual(status === 500 ? ['server/discover'] : ['server/discover', 'initialize']);
+    expect(String(error)).not.toContain('upstream-secret'); expect(String(error)).not.toContain('saw ');
+  });
+  it.each(['fetch-aborts', 'fetch-stalls', 'json-stalls', 'sse-stalls', 'cancel-stalls'])('bounds a legacy initialize after reflected 404 when %s', async fault => {
+    vi.useFakeTimers();
+    let aborted = false;
+    fake.script = r => {
+      if (r.body.method === 'server/discover') return Response.json({ jsonrpc: '2.0', id: r.body.id, error: { code: -32603, message: `saw ${r.headers.get('authorization')}` } }, { status: 404 });
+      if (r.body.method !== 'initialize') return undefined;
+      r.signal?.addEventListener('abort', () => { aborted = true; });
+      if (fault === 'fetch-aborts') return new Promise<Response>((_, reject) => r.signal?.addEventListener('abort', () => reject(r.signal?.reason)));
+      if (fault === 'fetch-stalls') return new Promise<Response>(() => {});
+      return new Response(new ReadableStream({
+        start(c) { if (fault === 'cancel-stalls') { c.enqueue(Buffer.from(`data: ${JSON.stringify({ jsonrpc: '2.0', id: r.body.id, result: { protocolVersion: '2025-11-25' } })}\n\n`)); } },
+        cancel() { if (fault === 'cancel-stalls') return new Promise<void>(() => {}); },
+      }), { headers: { 'content-type': fault === 'json-stalls' ? 'application/json' : 'text/event-stream' } });
+    };
+    let outcome: unknown;
+    void connect().then(value => { outcome = value; }, error => { outcome = error; });
+    await vi.advanceTimersByTimeAsync(29_999); expect(outcome).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(outcome).toMatchObject({ name: 'UpstreamUnavailable', message: 'upstream demo: no response to initialize within 30000 ms' });
+    expect(aborted).toBe(true); expect(String(outcome)).not.toContain('upstream-secret');
+    expect(fake.seen.map(r => r.body.method)).toEqual(['server/discover', 'initialize']);
+  });
+});
+
+it.each(['fetch', 'stream'])('close settles an execution whose %s ignores abort, without waiting for its timeout', async fault => {
+  const up = await connect();
+  fake.script = r => r.body.method === 'tools/call' ? fault === 'fetch' ? new Promise<Response>(() => {})
+    : new Response(new ReadableStream(), { headers: { 'content-type': 'text/event-stream' } }) : undefined;
+  const p = expect(up.execute(call)).rejects.toMatchObject({ name: 'UpstreamClosed', message: 'upstream: closed' });
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+  await up.close(); await p;
+  expect(fake.seen.filter(r => r.body.method === 'tools/call')).toHaveLength(1);
+});

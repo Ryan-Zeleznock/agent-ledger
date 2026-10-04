@@ -309,14 +309,19 @@ describe("server root F1: upstream diagnostics reaching the agent, the log and t
     expect(recs.map((x) => [x.phase, x.outcome?.status ?? "-", x.outcome?.errorClass ?? "-"])).toEqual([["intent", "-", "-"], ["outcome", "error", "UpstreamError"]]);
     expect(log.at(-1)).toMatchObject({ tool: "echo", status: "error" });
   });
-  it("startup: a discover failure that echoes the Authorization header is refused with status only; a 404 whose body is a JSON-RPC error echoing it likewise", async () => {
+  it("startup: reflected discovery 500 and non-modern 404 followed by initialize refusal stay value-free", async () => {
     for (const status of [500, 404]) {
-      const up = await rawUpstream(() => undefined, (c) => { c.res.writeHead(status, { "content-type": "application/json" }); c.res.end(JSON.stringify({ jsonrpc: "2.0", id: c.id, error: { code: -32603, message: `saw ${String(c.req.headers.authorization)}` } })); return true; });
+      const refuse = (c: RawCall) => { c.res.writeHead(status, { "content-type": "application/json" }); c.res.end(JSON.stringify({ jsonrpc: "2.0", id: c.id, error: { code: -32603, message: `saw ${String(c.req.headers.authorization)}` } })); return true; };
+      // ADR-016/pin 2: -32603 is not a recognized modern error, so 404 must try initialize.
+      // Explicitly refuse that attempt; silent-peer deadlines are tested with fake time in upstream-dual-era.
+      const up = await rawUpstream(refuse, refuse);
       const l = await lab((l) => pointAt(l, up.url));
       const log: LogLine[] = [];
       let err: unknown; try { servers.push(await startServer(l.env, { log: (x) => log.push(x) })); } catch (e) { err = e; }
       expect(err).toBeInstanceOf(StartupRefused);
-      expect((err as Error).message).toBe(`upstreams: upstream demo: HTTP ${status} on server/discover`);
+      expect((err as Error).message).toBe(`upstreams: upstream demo: HTTP ${status} on ${status === 500 ? "server/discover" : "initialize"}`);
+      expect((err as Error).message).not.toContain(T); expect((err as Error).message).not.toContain("saw ");
+      expect(up.calls).toHaveLength(status === 500 ? 0 : 1);
       expect(JSON.stringify(log)).not.toContain(T); expect(JSON.stringify(log)).not.toContain("saw ");
     }
   });

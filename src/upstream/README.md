@@ -101,3 +101,8 @@ https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle and
 https://modelcontextprotocol.io/specification/2025-11-25/basic/transports (initialization, sessions, 404 recovery).
 `test/upstream-dual-era.test.ts` uses a stubbed fetch and in-memory legacy/modern servers. Coordinator runs the existing
 loopback suite and the real SDK reference server. An on-path forced legacy downgrade remains the stated ADR-016 risk.
+
+Coordinator fix (2026-10-04): POST fetch, body reads and stream cancellation explicitly race the request AbortSignal,
+so the existing 30 s deadline also bounds non-cooperating injected transports/streams. A reflected 404/-32603 still
+selects legacy per pin 2; a silent initialize fails value-free as UpstreamUnavailable. The server regression fixture
+now explicitly refuses initialize instead of silently waiting beyond its 5 s test limit.
