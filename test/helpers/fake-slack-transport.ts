@@ -24,7 +24,7 @@ export class FakeSlackTransport {
     const scripted = this.replies.get(method)?.shift();
     if (scripted) return scripted();
     const result = method === 'auth.test' ? { team_id: this.teamId, user_id: 'U0000000000' }
-      : method === 'apps.connections.open' ? { url: 'wss://slack.example/socket' }
+      : method === 'apps.connections.open' ? { url: 'wss://wss-primary.slack.com/socket' }
       : method === 'chat.postMessage' ? { channel: body.channel, ts: `${++this.sequence}.001` } : {};
     return Response.json({ ok: true, ...result });
   }) as typeof fetch;

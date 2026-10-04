@@ -39,6 +39,7 @@ export interface HttpFrontOptions extends FrontBase {
 export type FrontOptions = StdioFrontOptions | HttpFrontOptions;
 export const FRONT_LEGACY_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26"] as const;
 export const FRONT_MAX_LEGACY_SESSIONS = 1024;
+export const FRONT_MAX_LEGACY_SESSIONS_PER_BEARER = 32;
 export const FRONT_LEGACY_SESSION_IDLE_MS = 3_600_000;
 export const DEFAULT_BIND_HOST = "127.0.0.1";
 export const DEFAULT_PORT = 8787;
@@ -125,6 +126,7 @@ export function createFrontServer(handler: CallHandler, opts: FrontOptions): Ser
   if (!opts || typeof opts !== "object") throw new Error("front: options are required");
   if (opts.mode === "stdio") throw notImplemented("front.startFront(stdio)");
   if (opts.mode !== "http") throw new Error("front: unknown mode");
+  if (opts.tls !== undefined && (!isRecord(opts.tls) || !Buffer.isBuffer(opts.tls.cert) || opts.tls.cert.length === 0 || !Buffer.isBuffer(opts.tls.key) || opts.tls.key.length === 0)) throw new Error("front: tls requires non-empty cert and key Buffers");
   if (!Array.isArray(opts.allowedOrigins) || opts.allowedOrigins.some((o) => typeof o !== "string" || o.length === 0)) throw new Error("front: allowedOrigins must be an array of non-empty strings");
   const port = opts.port ?? DEFAULT_PORT;
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("front: port must be an integer 0-65535");
@@ -214,7 +216,12 @@ export function createFrontServer(handler: CallHandler, opts: FrontOptions): Ser
     const method = rpc["method"];
     // Every error to an `initialize` names the versions we speak (versioning page: "SHOULD name the protocol versions it supports in any error it returns to an initialize request") (F6)
     const fail = (status: number, code: number, message: string, data?: Record<string, unknown>): void => {
-      if (method === "initialize") { if (!message.includes(INITIALIZE_MESSAGE)) message = `${message}; ${INITIALIZE_MESSAGE}`; data = { ...(data ?? {}), supported: [MCP_PROTOCOL_VERSION] }; }
+      if (method === "initialize") {
+        const params = rpc["params"], meta = isRecord(params) ? params["_meta"] : undefined;
+        const modern = header(req, "mcp-protocol-version") !== undefined || (isRecord(meta) && Object.hasOwn(meta, META_VERSION));
+        if (modern) { if (!message.includes(INITIALIZE_MESSAGE)) message = `${message}; ${INITIALIZE_MESSAGE}`; }
+        data = { ...(data ?? {}), supported: modern ? [MCP_PROTOCOL_VERSION] : [...FRONT_LEGACY_VERSIONS] };
+      }
       sendJson(res, status, rpcError(rid, code, message, data));
     };
     if (rpc["jsonrpc"] !== "2.0" || typeof method !== "string" || !validId) { fail(400, JSONRPC_INVALID_REQUEST, "Invalid Request"); return; }
@@ -229,17 +236,23 @@ export function createFrontServer(handler: CallHandler, opts: FrontOptions): Ser
       if (!session) { sendJson(res, 404, rpcError(rid, JSONRPC_INVALID_REQUEST, "unknown legacy session")); return; }
       if (versionHeader !== session.version && !(versionHeader === undefined && session.version === "2025-03-26")) { fail(400, JSONRPC_INVALID_REQUEST, "legacy protocol version mismatch"); return; }
       session.touched = Date.now(); legacy = true;
-      if (method === "notifications/initialized") { res.writeHead(202); res.end(); return; }
+      const sessionId = header(req, "mcp-session-id")!;
+      sessions.delete(sessionId); sessions.set(sessionId, session); // insertion order is LRU, even within one clock tick
+      // 2025-11-25 transport: 404 means a terminated session; unsupported RPC methods do not terminate it.
+      if (isNotification) { res.writeHead(202); res.end(); return; }
       if (method === "ping") { sendJson(res, 200, { jsonrpc: "2.0", id: rid, result: {} }); return; }
       if (method === "tools/list") { sendJson(res, 200, { jsonrpc: "2.0", id: rid, result: { tools: toolsResult["tools"] } }); return; }
-      if (method !== "tools/call") { fail(404, JSONRPC_METHOD_NOT_FOUND, "Method not found"); return; }
-      if (isNotification) { fail(400, JSONRPC_INVALID_REQUEST, "tools/call requires an id"); return; }
+      if (method !== "tools/call") { fail(200, JSONRPC_METHOD_NOT_FOUND, "Method not found"); return; }
     } else if (method === "initialize" && versionHeader === undefined && !(isRecord(p["_meta"]) && Object.hasOwn(p["_meta"], META_VERSION))) {
       if (isNotification || typeof p["protocolVersion"] !== "string" || !isRecord(p["capabilities"])) { fail(400, JSONRPC_INVALID_PARAMS, "initialize requires protocolVersion and capabilities"); return; }
       expire();
-      if (sessions.size >= FRONT_MAX_LEGACY_SESSIONS) { fail(503, JSONRPC_OVERLOADED, "too many legacy sessions"); return; }
+      const tokenHash = createHash("sha256").update(token).digest();
+      let ownCount = 0, oldestOwned: string | undefined;
+      for (const [id, session] of sessions) if (timingSafeEqual(session.tokenHash, tokenHash)) { ownCount++; oldestOwned ??= id; }
+      if (ownCount >= FRONT_MAX_LEGACY_SESSIONS_PER_BEARER) sessions.delete(oldestOwned!);
+      if (sessions.size >= FRONT_MAX_LEGACY_SESSIONS) sessions.delete(sessions.keys().next().value!);
       const version = (FRONT_LEGACY_VERSIONS as readonly string[]).includes(p["protocolVersion"]) ? p["protocolVersion"] : FRONT_LEGACY_VERSIONS[0];
-      const id = randomUUID(); sessions.set(id, { tokenHash: createHash("sha256").update(token).digest(), version, touched: Date.now() });
+      const id = randomUUID(); sessions.set(id, { tokenHash, version, touched: Date.now() });
       res.setHeader("Mcp-Session-Id", id);
       sendJson(res, 200, { jsonrpc: "2.0", id: rid, result: { protocolVersion: version, capabilities: { tools: {} }, serverInfo, instructions: DISCOVER_INSTRUCTIONS } }); return;
     }
@@ -293,7 +306,7 @@ export function createFrontServer(handler: CallHandler, opts: FrontOptions): Ser
     admitted++;
     let released = false;
     const release = () => { if (!released) { released = true; admitted--; } };
-    res.once("close", release); // a disconnected client must not retain an admission slot
+    // Keep capacity until handler settlement: transport disconnect does not cancel pipeline/Slack work.
     const incoming: IncomingCall = { callId: randomUUID(), credential: { kind: "api_key", value: token }, server: entry.server, tool: entry.tool, args: (args ?? {}) as Record<string, unknown>, receivedAt: new Date().toISOString() };
     const run = (async () => {
       let result: unknown;
@@ -303,7 +316,7 @@ export function createFrontServer(handler: CallHandler, opts: FrontOptions): Ser
       sendJson(res, 200, { jsonrpc: "2.0", id: rid, result: { ...(!legacy ? { resultType: "complete", _meta: { [META_SERVER_INFO]: serverInfo } } : {}), content: result.content, isError: result.isError } });
     })();
     inflight.add(run);
-    try { await run; } finally { release(); res.off("close", release); inflight.delete(run); }
+    try { await run; } finally { release(); inflight.delete(run); }
   }
 
   let stopPromise: Promise<void> | undefined;

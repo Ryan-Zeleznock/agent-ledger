@@ -8,6 +8,8 @@ export const SLACK_PROXY_MAX_TIMEOUT_MS = 240_000;
 export const SLACK_HTTP_TIMEOUT_MS = 10_000;
 // Kept local: only the pipeline may import another module; frozen hooks timing margin is 5 s.
 const APPROVAL_MIN_MARGIN_MS = 5_000;
+const SETTLED_FEEDBACK_MS = 30_000;
+const MAX_SETTLED_FEEDBACK = 1024;
 export interface WebSocketLike {
   readyState: number; send(data: string): void; close(code?: number): void;
   addEventListener(type: 'open' | 'message' | 'close' | 'error', fn: (ev: { data?: unknown }) => void): void;
@@ -89,7 +91,7 @@ function unavailable(callId: string, step: string) { return result(callId, 'unav
 interface Connection { socket: WebSocketLike; appId: string; }
 class Router implements SlackApprovalRouter {
   pending = new Map<string, PendingApproval>();
-  justSettled = new Map<string, { entry: PendingApproval; outcome: ApprovalResult }>();
+  justSettled = new Map<string, { entry: Pick<PendingApproval, "callId" | "nonce" | "messageTs" | "channelId">; outcome: ApprovalResult; expiresAt: number }>();
   sockets = new Set<WebSocketLike>();
   current: Connection | undefined;
   opening: Promise<Connection> | undefined;
@@ -114,7 +116,7 @@ class Router implements SlackApprovalRouter {
       const r = await api('auth.test', this.bot, {});
       if (typeof r.team_id !== 'string' || typeof r.user_id !== 'string') throw new SlackFailure('auth.test: error');
       this.teamId = r.team_id; this.botUserId = r.user_id;
-    })();
+    })().catch(e => { this.credentials = undefined; throw e; });
     return this.credentials;
   }
   ready(): Promise<Connection> {
@@ -130,7 +132,7 @@ class Router implements SlackApprovalRouter {
     let url: URL;
     try { url = new URL(r.url); } catch { throw new SlackFailure('websocket'); }
     const loopback = config.apiBaseUrl !== undefined && config.apiBaseUrl !== SLACK_API_BASE_URL;
-    if (url.username || url.password || !(url.protocol === 'wss:' || (loopback && url.protocol === 'ws:' && url.hostname === '127.0.0.1' && url.port))) throw new SlackFailure('websocket');
+    if (url.username || url.password || !((url.protocol === 'wss:' && url.hostname.endsWith('.slack.com')) || (loopback && url.protocol === 'ws:' && url.hostname === '127.0.0.1' && url.port))) throw new SlackFailure('websocket');
     if (this.closed || shutdown) throw new SlackFailure('proxy shutting down');
     return new Promise<Connection>((resolve, reject) => {
       let socket: WebSocketLike;
@@ -184,7 +186,9 @@ class Router implements SlackApprovalRouter {
     if (p.api_app_id !== appId || !record(p.user) || (p.user.team_id !== undefined && this.teamId && p.user.team_id !== this.teamId) || !Array.isArray(p.actions) || p.actions.length !== 1) return;
     const action: unknown = p.actions[0];
     if (!record(action) || !Object.values(SLACK_ACTION_IDS).includes(action.action_id) || typeof action.value !== 'string' || !SLACK_BUTTON_VALUE_RE.test(action.value)) return;
-    const [callId, nonce] = action.value.split(':'); const recent = this.justSettled.get(callId!); const entry = this.pending.get(callId!) ?? recent?.entry;
+    this.pruneFeedback();
+    const [callId, nonce] = action.value.split(':'); const recent = this.justSettled.get(action.value); const pending = this.pending.get(callId!);
+    const entry = recent?.entry ?? pending;
     if (!entry || action.block_id !== SLACK_BLOCK_ID_PREFIX + callId || nonce !== entry.nonce || !entry.messageTs) return;
     const ts = p.container?.message_ts ?? p.message?.ts, channelId = p.container?.channel_id ?? p.channel?.id;
     if (ts !== entry.messageTs || channelId !== entry.channelId || (p.message?.ts !== undefined && p.message.ts !== entry.messageTs) || (p.channel?.id !== undefined && p.channel.id !== entry.channelId)) return;
@@ -195,8 +199,19 @@ class Router implements SlackApprovalRouter {
       void api('chat.postEphemeral', this.bot, { channel: entry.channelId, user: p.user.id, text: `already decided by ${recent.outcome.approver ?? 'proxy'} at ${recent.outcome.decidedAt}` }).catch(() => undefined); return;
     }
     const approve = action.action_id === SLACK_ACTION_IDS.approve;
-    entry.settle(result(entry.callId, approve ? 'approved' : 'denied', `slack: ${approve ? 'Approve' : 'Deny'} clicked by ${p.user.id}`, p.user.id));
+    pending?.settle(result(entry.callId, approve ? 'approved' : 'denied', `slack: ${approve ? 'Approve' : 'Deny'} clicked by ${p.user.id}`, p.user.id));
   }
+  // Keep only binding fields, not a PendingApproval's closure (which retains the whole call).
+  remember(p: PendingApproval, outcome: ApprovalResult): void {
+    if (!p.messageTs || this.closed) return;
+    this.pruneFeedback();
+    const expiresAt = Date.parse(outcome.decidedAt) + SETTLED_FEEDBACK_MS;
+    if (expiresAt <= now()) return;
+    const key = `${p.callId}:${p.nonce}`;
+    this.justSettled.set(key, { entry: { callId: p.callId, nonce: p.nonce, messageTs: p.messageTs, channelId: p.channelId }, outcome, expiresAt });
+    while (this.justSettled.size > MAX_SETTLED_FEEDBACK) this.justSettled.delete(this.justSettled.keys().next().value!);
+  }
+  pruneFeedback(): void { for (const [key, recent] of this.justSettled) if (recent.expiresAt <= now()) this.justSettled.delete(key); }
   remove(p: PendingApproval): void { if (this.pending.get(p.callId) === p) this.pending.delete(p.callId); if (!this.pendingCount) this.closeSockets(); }
   fail(step: string): void { for (const p of [...this.pending.values()]) p.settle(unavailable(p.callId, step)); this.closeSockets(); }
   closeSockets(): void {
@@ -220,7 +235,7 @@ export async function probeSlack(channel: SlackChannel): Promise<{ ok: true; tea
   } catch (e) { return { ok: false, reason: `Slack unreachable: ${e instanceof SlackFailure ? e.step : 'websocket'}` }; }
   finally { probe.closed = true; probe.closeSockets(); }
 }
-export async function closeSlackApprovals(): Promise<void> { shutdown = true; if (router) { router.closed = true; router.fail('proxy shutting down'); } }
+export async function closeSlackApprovals(): Promise<void> { shutdown = true; if (router) { router.closed = true; router.fail('proxy shutting down'); router.justSettled.clear(); } }
 function escape(text: string): string { return text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;'); }
 export async function requestApprovalImpl(call: ToolCall, policy: PolicyDecision, channel: SlackChannel, deadlineAt?: number): Promise<ApprovalResult> {
   const callId = call?.callId ?? '';
@@ -235,13 +250,13 @@ export async function requestApprovalImpl(call: ToolCall, policy: PolicyDecision
     catch { resolve(unavailable(callId, 'secret')); return; }
     const expires = now() + wait; let settled: ApprovalResult | undefined, updated = false; let blocks: unknown[] = [];
     const update = () => {
-      if (!settled || !entry.messageTs || updated) return; updated = true;
+      if (!settled || !entry.messageTs || updated) return; updated = true; r.remember(entry, settled);
       const text = settled.decision === 'approved' ? `Approved by <@${settled.approver}> at ${settled.decidedAt}` : settled.decision === 'denied' ? `Denied by <@${settled.approver}> at ${settled.decidedAt}` : settled.decision === 'timeout' ? `Expired after ${wait} ms` : 'Not decided: Slack unavailable';
       void api('chat.update', r.bot, { channel: entry.channelId, ts: entry.messageTs, text, blocks: [...blocks.slice(0, 2), { type: 'context', elements: [{ type: 'mrkdwn', text }] }] }).catch(() => undefined);
     };
     const entry: PendingApproval = { callId, nonce, messageTs: '', channelId: channel.channelId, state: 'pending', settle(outcome) {
       if (entry.state !== 'pending') return false;
-      entry.state = 'settled'; settled = outcome; clearTimeout(timer); r.justSettled.set(callId, { entry, outcome }); queueMicrotask(() => { if (r.justSettled.get(callId)?.entry === entry) r.justSettled.delete(callId); }); r.remove(entry); update(); resolve(outcome); return true;
+      entry.state = 'settled'; settled = outcome; clearTimeout(timer); r.remove(entry); update(); resolve(outcome); return true;
     } };
     const timer = setTimeout(() => entry.settle(result(callId, 'timeout', `no approver answered within ${wait} ms`)), wait);
     r.register(entry);

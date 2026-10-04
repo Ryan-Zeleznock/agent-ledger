@@ -285,7 +285,7 @@ describe("front F4 (server side): advertised x-mcp-header parameters are validat
 });
 
 describe("front F10: bounded admission of tools/call", () => {
-  it("over maxInFlight concurrent invocations → 503 with Retry-After and a JSON-RPC error, no handler call; capacity is released on completion, on a handler throw and on a client disconnect", async () => {
+  it("over maxInFlight concurrent invocations → 503 with Retry-After and a JSON-RPC error, no handler call; capacity is released on completion or a handler throw", async () => {
     expect(DEFAULT_MAX_IN_FLIGHT).toBe(64);
     let release!: () => void; const gate = new Promise<void>((r) => { release = r; });
     const f = await start({ maxInFlight: 2, hold: () => gate });

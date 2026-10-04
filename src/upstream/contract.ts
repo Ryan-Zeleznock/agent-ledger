@@ -114,9 +114,9 @@ export async function connectUpstreams(config: UpstreamConfig[], secrets: Secret
           if (names.has(toolName)) throw new UpstreamError(`upstream ${name}: duplicate tool name ${toolName}`);
           names.add(toolName);
           let hp: HeaderParam[];
-          try { hp = client.era === "legacy" ? [] : headerParams(raw["inputSchema"]); }
+          try { hp = headerParams(raw["inputSchema"]); }
           catch (e) { rejected.push({ server: name, tool: toolName, reason: e instanceof Error ? e.message : "x-mcp-header: invalid" }); return; } // transport: the client MUST exclude the tool
-          params.set(`${name}\0${toolName}`, hp);
+          params.set(`${name}\0${toolName}`, client.era === "legacy" ? [] : hp);
           const info: ToolInfo = { server: name, name: toolName };
           if (typeof raw["description"] === "string") info.description = raw["description"];
           if (raw["inputSchema"] !== undefined) info.inputSchema = raw["inputSchema"];
@@ -267,6 +267,7 @@ class HttpClient {
   era: "modern" | "legacy" = "modern";
   #version: string = UPSTREAM_PROTOCOL_VERSION;
   #session: string | undefined;
+  #sessionful = false;
   #initializing: Promise<void> | undefined;
   constructor(private readonly name: string, private readonly url: string, bearer: string | undefined, private readonly inflight: Set<AbortController>, private readonly isClosed: () => boolean) { this.#bearer = bearer; }
 
@@ -289,7 +290,8 @@ class HttpClient {
       }
       this.#version = version;
       await this.requestOnce("notifications/initialized", {}, undefined, UPSTREAM_TIMEOUT_MS, false);
-    })().finally(() => { this.#initializing = undefined; });
+      this.#sessionful = this.#session !== undefined;
+    })().catch(async e => { await this.deleteSession(); throw e; }).finally(() => { this.#initializing = undefined; });
     return this.#initializing;
   }
   async deleteSession(): Promise<void> {
@@ -307,6 +309,7 @@ class HttpClient {
   }
   async request(method: string, params: Record<string, unknown>, mcpName: string | undefined, timeoutMs: number, allowInputRequired: boolean, extraHeaders: Record<string, string> = {}): Promise<Record<string, unknown>> {
     if (this.#initializing) await this.#initializing;
+    else if (this.era === "legacy" && this.#sessionful && this.#session === undefined) await this.initialize();
     const session = this.#session;
     try { return await this.requestOnce(method, params, mcpName, timeoutMs, allowInputRequired, extraHeaders); }
     catch (e) {

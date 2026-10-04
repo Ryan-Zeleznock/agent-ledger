@@ -87,13 +87,19 @@ omit upstream text. The real client always supplies a frozen `eras` map (the int
 
 Legacy initializes with 2025-11-25, accepts 2025-06-18/2025-03-26, validates an optional visible-ASCII session header,
 and sends notifications/initialized. Subsequent requests carry the negotiated version and session, without modern
-headers/metadata. Legacy schemas' x-mcp-header annotations are ignored. Pagination and result validation stay shared.
-A session 404 triggers one shared reinitialization and one resend, even for concurrent callers. Server-to-client
+headers/metadata. Legacy schemas' x-mcp-header annotations are validated and invalid tools enter `rejectedTools`, so
+they cannot prevent the front from starting; valid annotations are never mirrored into legacy request headers.
+This refines pin 2 per the coordinator's explicit P2-3 decision on 2026-10-04. Pagination and result validation stay shared.
+A session 404 triggers one shared reinitialization and one resend, even for concurrent callers. If reinitialization
+fails, the next call retries the shared handshake before sending work. A partially initialized session is deleted;
+sessionless upstreams continue without unnecessary handshakes. Server-to-client
 requests fail immediately. Shutdown aborts calls then best-effort DELETEs each session within 2 s; failed startup also
 cleans up sessions. No GET or deprecated HTTP+SSE negotiation is attempted.
 
 The CR SSE regression now dispatches on CR immediately, swallowing a following LF across chunks. Header annotation
 validation walks only schema keywords; default/example/examples/const/enum instance data cannot reject a valid tool.
+The SDK 1.x empty-data priming event (`id: x\ndata: \n\n`) is ignored before the terminal JSON-RPC response, with a
+dedicated legacy SSE regression (Fable review P3-4, 2026-10-04; existing behavior preserved).
 
 Primary sources [V], architect-verified 2026-10-04 in the binding pins:
 https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http (Backward Compatibility),

@@ -132,3 +132,45 @@ describe('Slack fault and race regressions', () => {
     await vi.advanceTimersByTimeAsync(10_000); expect((await p).reason).toBe('Slack unreachable: auth.test: error');
   });
 });
+
+describe('Fable review recovery and feedback regressions', () => {
+  it('P2-1 retries auth.test after a transient failure and shares the successful retry', async () => {
+    fake.replies.set('auth.test', [() => new Response(null, { status: 503 })]);
+    expect((await a.requestApproval(call, policy, channel)).decision).toBe('unavailable');
+    const pending = [2, 3].map(n => a.requestApproval({ ...call, callId: `retry-${n}` }, policy, channel)); await flush();
+    expect(fake.calls.filter(c => c.method === 'auth.test')).toHaveLength(2);
+    expect(fake.sockets).toHaveLength(1); fake.click(0); fake.click(1);
+    expect((await Promise.all(pending)).map(r => r.decision)).toEqual(['approved', 'approved']);
+  });
+  it('P3-1 tells a late allowed click who decided, but never repeats a decision or update', async () => {
+    const pending = a.requestApproval(call, policy, channel); await flush(); fake.click(); const winner = await pending;
+    await vi.advanceTimersByTimeAsync(1000);
+    const next = a.requestApproval(call, policy, channel); await flush();
+    fake.click(0); await flush();
+    expect(fake.calls.filter(c => c.method === 'chat.postEphemeral').at(-1)?.body.text).toBe(`already decided by ${winner.approver} at ${winner.decidedAt}`);
+    expect(a.getSlackApprovalRouter(channel).pendingCount).toBe(1);
+    expect(fake.calls.filter(c => c.method === 'chat.update')).toHaveLength(1);
+    fake.click(1); expect((await next).decision).toBe('approved');
+  });
+  it('P3-1 expires late-click feedback after 30 seconds without revising the decision', async () => {
+    const pending = a.requestApproval(call, policy, channel); await flush(); fake.click(); await pending;
+    await vi.advanceTimersByTimeAsync(30_000);
+    const next = a.requestApproval({ ...call, callId: 'next' }, policy, channel); await flush(); fake.click(0); await flush();
+    expect(fake.calls.filter(c => c.method === 'chat.postEphemeral')).toHaveLength(0);
+    fake.click(1); await next;
+  });
+  it('P3-1 bounds retained feedback to the latest 1024 settlements', async () => {
+    const keeper = a.requestApproval({ ...call, callId: 'keeper' }, policy, channel); await flush();
+    for (let n = 1; n <= 1025; n++) {
+      const pending = a.requestApproval({ ...call, callId: `settled-${n}` }, policy, channel); await flush();
+      fake.click(n); expect((await pending).decision).toBe('approved');
+    }
+    fake.click(1); await flush(); expect(fake.calls.filter(c => c.method === 'chat.postEphemeral')).toHaveLength(0);
+    fake.click(2); await flush(); expect(fake.calls.filter(c => c.method === 'chat.postEphemeral')).toHaveLength(1);
+    expect(a.getSlackApprovalRouter(channel).pendingCount).toBe(1); fake.click(0); await keeper;
+  });
+  it.each(['wss://evil.example/socket', 'wss://slack.com.evil.example/socket', 'wss://notslack.com/socket'])('P3-2 refuses Socket Mode host %s', async url => {
+    fake.replies.set('apps.connections.open', [() => Response.json({ ok: true, url })]);
+    expect((await a.requestApproval(call, policy, channel)).reason).toBe('Slack unreachable: websocket'); expect(fake.sockets).toHaveLength(0);
+  });
+});

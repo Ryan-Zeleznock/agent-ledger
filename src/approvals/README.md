@@ -22,6 +22,12 @@ three failures or link_disabled settle remaining requests unavailable. The final
 idempotent and returns unavailable for pending/new approvals. Waits are capped by the supplied absolute deadline minus
 5 s; server configuration is limited to 240 s. No pending approval is an allow.
 
+Fable review fixes (2026-10-04): a failed secret read or auth.test clears the cached credential attempt, allowing the
+next request to retry with concurrent callers sharing that attempt. Socket Mode WSS URLs must use a `*.slack.com` host;
+the explicitly configured loopback WS test seam remains available. Late losing clicks receive best-effort feedback for
+30 s when a socket is available, using at most 1024 settled message bindings and outcomes. Expired entries are pruned
+on access; pending closures and call arguments are not retained in this cache. Shutdown clears it.
+
 Primary research [V], verified by the architect 2026-10-04 and supplied in `docs/slices/slice-2b-pins.md` §0:
 https://docs.slack.dev/apis/events-api/using-socket-mode/ (hello, envelopes, acknowledgement, refresh, payload distribution),
 https://docs.slack.dev/reference/interaction-payloads/block_actions-payload/ (user/team/app and message binding),

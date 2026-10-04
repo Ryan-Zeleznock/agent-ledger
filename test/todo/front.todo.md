@@ -13,4 +13,6 @@ Converted on 2026-10-03 (Fable, Slice 2a pins 3 and 5) in `test/front.test.ts` o
 - [x] 2b: TLS >= 1.2, non-listening factory, actual HTTP/TLS over duplexPair, upstream→legacy-front compatibility
 - [ ] 2c: per-key token-bucket rate limit; stdio front; SSE/progress responses; tool-list refresh
 - [x] (Astra verification P2 N2, 2026-10-03) Base64 header sentinel decoding strips a leading U+FEFF: use `TextDecoder(..., { fatal: true, ignoreBOM: true })`; test exact round-trip of a value starting with U+FEFF.
-- [x] (Astra verification, 2026-10-03) add assertions for the disconnect-releases-slot and shutdown-admission (503 while stopping) claims.
+- [x] Fable review 2026-10-04 P2-4 (coordinator override): disconnect retains admission until the handler settles; shutdown refuses new admission (503 while stopping).
+- [x] Fable review P2-5/6: global LRU and 32-session per-bearer cap replace capacity refusal; 1024 garbage bearers cannot lock out a real initialize; valid-session unknown methods get 200/-32601, all notifications get 202.
+- [x] Fable review P3-3/6: legacy initialize errors name legacy versions; reject missing, empty and non-Buffer TLS cert/key at construction.

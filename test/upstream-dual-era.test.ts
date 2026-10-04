@@ -48,9 +48,9 @@ describe('dual-era upstream client', () => {
   it('refuses HTTP+SSE revision without a GET and best-effort deletes the assigned session', async () => {
     fake.version = '2024-11-05'; await expect(connect()).rejects.toThrow(); expect(fake.seen.at(-1)?.method).toBe('DELETE'); expect(fake.seen.some(r => r.method === 'GET')).toBe(false);
   });
-  it('supports an optional session header and ignores legacy x-mcp-header annotations', async () => {
+  it('supports an optional session header and does not mirror valid legacy x-mcp-header annotations', async () => {
     fake.sessionHeader = null; fake.script = r => r.body.method === 'server/discover' ? new Response(null, { status: 400 }) : undefined;
-    fake.pages = [[{ name: 'echo', inputSchema: { properties: { x: { 'x-mcp-header': 'bad header' } } } }]];
+    fake.pages = [[{ name: 'echo', inputSchema: { properties: { x: { type: 'string', 'x-mcp-header': 'X' } } } }]];
     const up = await connect(); expect(await up.listTools()).toHaveLength(1); await up.execute({ ...call, args: { x: {} } }); expect(fake.seen.at(-1)!.headers.has('mcp-session-id')).toBe(false);
   });
   it.each(['', 'has space', 'a'.repeat(257)])('rejects invalid session header %j', async session => {
@@ -197,4 +197,44 @@ it.each(['fetch', 'stream'])('close settles an execution whose %s ignores abort,
   for (let i = 0; i < 20; i++) await Promise.resolve();
   await up.close(); await p;
   expect(fake.seen.filter(r => r.body.method === 'tools/call')).toHaveLength(1);
+});
+
+describe('Fable review legacy recovery and schema regressions', () => {
+  it('P2-2 retries a failed reinitialize on the next call, single-flight across concurrent callers', async () => {
+    const up = await connect(); fake.sessions.clear(); let fail = true;
+    fake.script = r => fail && r.body.method === 'initialize' ? new Response(null, { status: 503 }) : undefined;
+    await expect(up.execute(call)).rejects.toThrow('HTTP 503 on initialize'); fail = false;
+    expect((await Promise.all([up.execute(call), up.execute(call), up.execute(call)])).every(r => !r.isError)).toBe(true);
+    expect(fake.seen.filter(r => r.body.method === 'initialize')).toHaveLength(3);
+    expect(fake.seen.filter(r => r.body.method === 'tools/call').every(r => r.headers.has('mcp-session-id'))).toBe(true);
+  });
+  it('P2-2 discards a partially initialized session and recovers after its notification fails', async () => {
+    const up = await connect(); fake.sessions.clear();
+    fake.script = r => r.body.method === 'notifications/initialized' ? new Response(null, { status: 503 }) : undefined;
+    await expect(up.execute(call)).rejects.toThrow('HTTP 503 on notifications/initialized');
+    expect(fake.seen.at(-1)?.method).toBe('DELETE'); expect(fake.sessions.size).toBe(0);
+    fake.script = undefined;
+    expect((await up.execute(call)).isError).toBe(false);
+    expect(fake.seen.filter(r => r.body.method === 'initialize')).toHaveLength(3);
+    expect(fake.seen.at(-1)?.headers.get('mcp-session-id')).toBe('session-3');
+  });
+  it('P2-3 excludes invalid legacy header annotations before the front builds its table, and does not mirror valid ones', async () => {
+    fake.pages = [[{ name: 'valid', inputSchema: { properties: { x: { type: 'string', 'x-mcp-header': 'X' } } } },
+      { name: 'invalid', inputSchema: { items: { type: 'string', 'x-mcp-header': 'Item' } } }]];
+    const up = await connect(); expect((await up.listTools()).map(t => t.name)).toEqual(['valid']);
+    expect(up.rejectedTools).toEqual([{ server: 'demo', tool: 'invalid', reason: expect.stringContaining('not statically reachable') }]);
+    const { buildExposedTable } = await import('../src/front/contract.js');
+    expect(buildExposedTable(await up.listTools()).size).toBe(1);
+    await up.execute({ ...call, tool: 'valid', args: { x: 'value' } }); expect(fake.seen.at(-1)!.headers.has('mcp-param-x')).toBe(false);
+  });
+  it('P3-4 skips the SDK empty-data priming event before a legacy JSON-RPC response', async () => {
+    fake.sse = true;
+    const ordinaryFetch = fake.fetch;
+    vi.stubGlobal('fetch', (async (...args: Parameters<typeof fetch>) => {
+      const response = await ordinaryFetch(...args);
+      return response.headers.get('content-type') === 'text/event-stream'
+        ? new Response(`id: sdk-prime\ndata: \n\n${await response.text()}`, { status: response.status, headers: response.headers }) : response;
+    }) as typeof fetch);
+    const up = await connect(); expect((await up.execute(call)).isError).toBe(false);
+  });
 });

@@ -7,5 +7,6 @@
 - [x] private file and environment secrets, prefixes, config validation and set-once seam
 - [x] bounded HTTP/hello waits, sanitized API errors, bounded 429 retry, startup probe and shutdown
 - [x] shape contract remains green; pipeline keeps hook-ask out of requestApproval
+- [x] Fable review 2026-10-04 P2-1: failed auth.test retries single-flight; P3-1/2: late-click feedback expires at 30 s, bounded to 1024 settlements; WSS host restricted to *.slack.com
 - [ ] 2c: decide-only Slack router daemon/HTTP interactivity, display names, pipeline abort input
 - [ ] Coordinator: real Slack Socket Mode and loopback e2e checks; review by Fable (not self-approved)
