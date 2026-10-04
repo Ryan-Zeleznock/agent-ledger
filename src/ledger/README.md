@@ -244,8 +244,8 @@ Round 3 (Astra, 2026-09-30: `docs/reviews/2026-09-30-astra-ledger-round3.md`):
 ## Slice 2a shared chain (2026-10-03)
 
 `chain.ts` owns sealing, strict parsing, self-hash checks and streaming verification. JSONL retains its physical
-LF framing and file lock. ADR-012 `channel: none` is accepted and round-trips; the `PIN-2A` enum literal/type assertion
-is temporary under the coordinator amendment and must become `APPROVAL_CHANNEL_KINDS` at integration.
+LF framing and file lock. ADR-012 `channel: none` is accepted and round-trips; the validator uses `APPROVAL_CHANNEL_KINDS` from `src/types`
+(swapped in from the temporary `PIN-2A` literal at integration).
 Test-first: the new no-channel regression failed against the old enum (1 failed / 1075 passed / 7 skipped).
 
 ## Postgres (Slice 2a, ADR-013)

@@ -5,7 +5,7 @@ files and run offline checks. `node deploy/check.mjs` renders with `kubectl kust
 it does not prove live admission, event detection, image startup or network isolation.
 
 Fable's [full review](../docs/reviews/2026-10-03-fable-slice-2a-deploy-review.md) reports GATE: PASS for `5f998f8..4e676ab`.
-That verdict belongs to the reviewer and does not approve subsequent fixes. The scoped verification pass is pending.
+Fable's scoped verification pass over the fixes (`4e676ab..6b88218`) also reports GATE: PASS.
 
 ## Review fixes
 
@@ -16,14 +16,13 @@ That verdict belongs to the reviewer and does not approve subsequent fixes. The 
   shell alert. Silence without the positive control fails. Logs must cover every relevant node.
 - P3-1: the SQL draft enables both append-only triggers `ALWAYS`, including after an idempotent rerun. Three real-PG
   regressions cover UPDATE, DELETE and TRUNCATE by a superuser in replica mode, starting from ordinary trigger mode.
-  These changes, the matching ConfigMap SQL copy and test cleanup changes are **uncommitted pending the coordinator's
-  Postgres run**. Existing clusters do not rerun initdb hooks automatically; any live upgrade is separate DBA work.
+  Committed in `6b88218` after two real-Postgres runs outside the Codex sandbox. Existing clusters do not rerun initdb hooks automatically; any live upgrade is separate DBA work.
 - Runbook clarifications cover password-less superuser access via postgres Pod exec, namespace/PVC deletion,
   project-scope `.mcp.json` fallback, unused build-context removal and node IPs within the LAN range.
 
 The database administrator can still explicitly disable/drop triggers. `ENABLE ALWAYS` closes the replication-role
 bypass without changing that trust boundary. [PostgreSQL 16 ALTER TABLE](https://www.postgresql.org/docs/16/sql-altertable.html)
-documents this behavior (checked 2026-10-03); the new runtime regressions await coordinator execution.
+documents this behavior (checked 2026-10-03); the runtime regressions pass against PostgreSQL 16.
 
 ## Slice 2b residuals
 

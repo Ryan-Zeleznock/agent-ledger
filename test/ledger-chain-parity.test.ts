@@ -16,9 +16,8 @@ describe("shared chain storage", () => {
   it("round-trips the pinned no-channel approval and verifies it", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ledger-chain-")); dirs.push(dir);
     const ledger = createLedger("jsonl", join(dir, "ledger.jsonl"));
-    // PIN-2A: shared type is supplied by Package A at integration; runtime literal is binding now.
     const input = { ...unsealed(1), approval: { callId: "call-1", decision: "no-channel",
-      channel: "none", decidedAt: "2026-10-03T12:00:00.000Z" } } as unknown as UnsealedRecord;
+      channel: "none", decidedAt: "2026-10-03T12:00:00.000Z" } } satisfies UnsealedRecord;
     const record = await ledger.append(input);
     expect(record.approval?.channel).toBe("none");
     expect(await ledger.verify()).toEqual({ ok: true, checked: 1 });
