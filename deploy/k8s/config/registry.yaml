@@ -1,7 +1,8 @@
 # Ryan: review all five tool identities and update reviewedAt before applying.
 # whoami is deliberately absent: unreviewed must deny. Four reviewed rows, five exposed tools.
 # Slice 2b pin 7: `everything` (server-everything 2026.8.31, exposed `everything__<tool>`). storeArgs names copied from
-# the package's published zod schemas (echo: message; get-sum: a, b), re-checked against the live tools/list in step 6.
+# the package's published zod schemas (echo: message; get-sum: a, b) and confirmed against a live loopback tools/list of
+# the pinned lockfile on 2026-10-04 (Fable); Ryan re-checks against the cluster's tools/list in step 6.
 # get-env (returns the process environment) and gzip-file-as-resource (fetches a URL) are RISKY → Slack. Every other
 # everything tool is unlisted → unreviewed → Slack.
 version: 1

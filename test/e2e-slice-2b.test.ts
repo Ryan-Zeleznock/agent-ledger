@@ -448,7 +448,7 @@ describe.sequential("Slice 2b end to end: Slack approvals + the legacy-era bridg
         const { pending, message } = await riskyCall("everything__get-env", {});
         slack.click(message, { action: "approve", userId: APPROVER });
         const r = await pending;
-        expect(r["isError"]).toBe(false); expect(toolText(r)).toContain(`"PORT":"${port}"`);
+        expect(r["isError"]).toBe(false); expect(toolText(r)).toMatch(new RegExp(`"PORT":\\s*"${port}"`)); // get-env pretty-prints JSON.stringify(process.env) (live check 2026-10-04)
       } finally { await p.stop(5_000); proxyUrl = mainUrl; }
     } finally { child.kill("SIGTERM"); }
   }, 90_000);

@@ -54,7 +54,9 @@ export class LegacyUpstream {
       const sse = this.o.mode === "sse" || (this.o.mode === "alternate" && this.n++ % 2 === 1);
       if (sse && status === 200) {
         res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", ...headers });
-        res.end(`event: message\nid: ${randomUUID()}\ndata: ${JSON.stringify(body)}\n\n`);
+        // The SDK 1.x reference server (server-everything 2026.8.31, run on loopback 2026-10-04) opens every SSE response
+        // with a resumability priming event whose data is EMPTY (`id: <uuid>\ndata: \n\n`); a client must skip it.
+        res.end(`id: ${randomUUID()}\ndata: \n\nevent: message\nid: ${randomUUID()}\ndata: ${JSON.stringify(body)}\n\n`);
       } else { res.writeHead(status, { "content-type": "application/json", ...headers }).end(JSON.stringify(body)); }
     };
     const err = (status: number, code: number, message: string, id: unknown = null) => send(status, { jsonrpc: "2.0", id, error: { code, message } });
