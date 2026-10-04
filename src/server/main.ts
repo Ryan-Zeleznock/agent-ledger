@@ -35,6 +35,12 @@ export const DEFAULT_CONNECT_BUDGET_MS = 60_000;
 export const MAX_CONNECT_BUDGET_MS = 600_000;
 /** Waits between attempts (pin 6: attempts at 0, 1, 2, 4, 8, 16, 16, … s); the last value repeats. */
 export const CONNECT_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 16_000] as const;
+/**
+ * Fix round F2: the whole start operation (every attempt, sleep and in-flight request) is bounded by
+ * max(budget, START_SINGLE_ATTEMPT_MAX_MS) from its first attempt; budget 0 keeps its one attempt, bounded by this
+ * (one upstream request timeout). 2 x 60 s + 30 s still fits the 160 s startupProbe.
+ */
+export const START_SINGLE_ATTEMPT_MAX_MS = 30_000;
 export const TLS_CERT_MAX_BYTES = 64 * 1024;
 export const TLS_KEY_MAX_BYTES = 16 * 1024;
 export const DEFAULT_SERVER_PORT = 8787;
@@ -55,12 +61,24 @@ export interface ServerDeps {
   /** Additive (Slice 2b pin 6): the connect-retry wait and clock, injectable so the backoff is testable without real time. */
   sleep: (ms: number) => Promise<void>;
   clock: () => number;
+  /**
+   * Additive (Slice 2b fix round, Astra F2): resolves after `ms` unless `signal` aborts first (then it never resolves).
+   * Bounds each WHOLE connect/probe attempt by what is left of the start budget.
+   */
+  deadline: (ms: number, signal: AbortSignal) => Promise<void>;
+  /** Additive (fix round F2): the upstream connector, injectable so a slow or hanging attempt is testable. */
+  connectUpstreams: typeof connectUpstreams;
 }
 export interface RunningServer { readonly port: number; readonly head: string; stop(): Promise<void>; }
 
 const defaults: ServerDeps = {
   createLedger: realCreateLedger, log: (line) => process.stderr.write(`${JSON.stringify(line)}\n`),
   sleep: (ms) => new Promise((done) => { setTimeout(done, ms); }), clock: () => Date.now(),
+  deadline: (ms, signal) => new Promise((done) => {
+    const t = setTimeout(done, ms); t.unref();
+    signal.addEventListener("abort", () => clearTimeout(t), { once: true });
+  }),
+  connectUpstreams,
 };
 const now = () => new Date().toISOString();
 
@@ -148,12 +166,33 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env, override
   } else {
     deps.log({ ts: now(), event: "warning", tls: "off" });
   }
-  /** Pin 6 backoff: attempt, and on failure wait 1, 2, 4, 8, 16, 16, … s while the budget allows; the last reason is returned. */
-  const retrying = async <T>(what: string, attempt: () => Promise<T>): Promise<{ ok: true; value: T } | { ok: false; reason: string }> => {
+  /**
+   * Pin 6 backoff: attempt, and on failure wait 1, 2, 4, 8, 16, 16, … s while the budget allows; the last reason is
+   * returned. Fix round F2: every attempt races the time left of max(budget, START_SINGLE_ATTEMPT_MAX_MS); an attempt
+   * still pending at that deadline is abandoned and, if it ever succeeds, `dispose`d (no late activation), and a
+   * success that arrives after the deadline (per the injected clock) is disposed and refused as well.
+   */
+  const startDeadlineMs = Math.max(connectBudgetMs, START_SINGLE_ATTEMPT_MAX_MS);
+  const retrying = async <T>(what: string, attempt: () => Promise<T>, dispose: (v: T) => Promise<unknown> | unknown = () => undefined): Promise<{ ok: true; value: T } | { ok: false; reason: string }> => {
     const started = deps.clock();
+    const left = () => startDeadlineMs - (deps.clock() - started);
+    const late = (n: number) => `attempt ${n} did not finish within the ${startDeadlineMs} ms start budget`;
+    const disposeQuietly = (v: T) => { void Promise.resolve().then(() => dispose(v)).catch(() => undefined); };
     for (let n = 1; ; n++) {
-      let reason: string;
-      try { return { ok: true, value: await attempt() }; } catch (e) { reason = message(e); }
+      const ac = new AbortController();
+      const p = Promise.resolve().then(attempt);
+      type Outcome = { kind: "ok"; value: T } | { kind: "error"; error: unknown } | { kind: "late" };
+      const outcome: Outcome = await Promise.race([
+        p.then((value): Outcome => ({ kind: "ok", value }), (error: unknown): Outcome => ({ kind: "error", error })),
+        deps.deadline(Math.max(0, left()), ac.signal).then((): Outcome => ({ kind: "late" })),
+      ]);
+      ac.abort();
+      if (outcome.kind === "late") { p.then(disposeQuietly, () => undefined); return { ok: false, reason: late(n) }; }
+      if (outcome.kind === "ok") {
+        if (left() < 0) { disposeQuietly(outcome.value); return { ok: false, reason: late(n) }; }
+        return { ok: true, value: outcome.value };
+      }
+      const reason = message(outcome.error);
       const nextInMs = CONNECT_BACKOFF_MS[Math.min(n - 1, CONNECT_BACKOFF_MS.length - 1)]!;
       if (deps.clock() - started + nextInMs > connectBudgetMs) return { ok: false, reason };
       deps.log({ ts: now(), event: `${what}-retry`, attempt: n, nextInMs, reason: redact(reason) });
@@ -182,7 +221,7 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env, override
   // (pin 6: "slower, never wrong"), then refused with the last value-free reason.
   let upstreamConfig;
   try { upstreamConfig = readUpstreamsConfig(join(dir, CONFIG_FILES.upstreams)); } catch (e) { return refuse(`upstreams: ${message(e)}`); }
-  const connected = await retrying("upstreams", () => connectUpstreams(upstreamConfig, secrets));
+  const connected = await retrying("upstreams", () => deps.connectUpstreams(upstreamConfig, secrets), (u) => u.close());
   if (!connected.ok) return refuse(`upstreams: ${connected.reason}`);
   const upstream: Upstream = connected.value;
   const tools = await upstream.listTools();

@@ -291,3 +291,43 @@ describe("server root 2b: TLS files (ADR-017)", () => {
     expect(log.find((x) => x["event"] === "listening")).toMatchObject({ tls: "on" });
   });
 });
+
+describe("server root 2b fix round F2: the start budget bounds each WHOLE attempt, not just the sleeps", () => {
+  type Up = Awaited<ReturnType<typeof import("../src/upstream/contract.js").connectUpstreams>>;
+  const fakeUpstream = (closed: string[], name: string): Up => ({ listTools: async () => [], execute: async () => { throw new Error("unused"); }, close: async () => { closed.push(name); } });
+  it("a SUCCESSFUL but slow attempt (180 s by the injected clock, e.g. discovery + 8 list pages at 20 s) past the 60 s budget is refused and its upstream client closed; nothing listens", async () => {
+    const l = await lab(); l.env[ENV.connectBudget] = "60000";
+    let t = 0; const closed: string[] = []; const log: LogLine[] = [];
+    await expect(startServer(l.env, { log: (x) => log.push(x), clock: () => t, sleep: async (ms) => { t += ms; },
+      connectUpstreams: async () => { t += 180_000; return fakeUpstream(closed, "slow"); } })).rejects.toBeInstanceOf(StartupRefused);
+    expect(String(log.at(-1)?.["reason"])).toBe("upstreams: attempt 1 did not finish within the 60000 ms start budget");
+    await vi.waitFor(() => expect(closed).toEqual(["slow"]));
+    expect(log.some((x) => x["event"] === "listening")).toBe(false);
+  });
+  it("a HANGING attempt is cut when the deadline (= the whole budget for attempt 1) fires; a result that arrives after the refusal is closed, never activated", async () => {
+    const l = await lab(); l.env[ENV.connectBudget] = "60000";
+    const deadlines: number[] = []; const closed: string[] = []; const log: LogLine[] = [];
+    let release: (u: Up) => void = () => undefined;
+    const hanging = new Promise<Up>((r) => { release = r; });
+    await expect(startServer(l.env, { log: (x) => log.push(x), clock: () => 0, deadline: async (ms) => { deadlines.push(ms); }, connectUpstreams: () => hanging })).rejects.toBeInstanceOf(StartupRefused);
+    expect(deadlines).toEqual([60_000]);
+    expect(String(log.at(-1)?.["reason"])).toMatch(/did not finish within the 60000 ms start budget/);
+    release(fakeUpstream(closed, "late"));
+    await vi.waitFor(() => expect(closed).toEqual(["late"]));
+  });
+  it("deadlines shrink with time spent: after failures and sleeps the next attempt only gets what is left; a failure near the deadline is refused with ITS reason; budget 0 = one attempt bounded at 30 s", async () => {
+    const l = await lab(); l.env[ENV.connectBudget] = "10000";
+    let t = 0; const deadlines: number[] = []; let n = 0; const log: LogLine[] = [];
+    await expect(startServer(l.env, { log: (x) => log.push(x), clock: () => t, sleep: async (ms) => { t += ms; }, deadline: () => new Promise(() => undefined),
+      connectUpstreams: async () => { n++; t += 500; throw new Error(`HTTP 503 #${n}`); } })).rejects.toBeInstanceOf(StartupRefused);
+    expect(String(log.at(-1)?.["reason"])).toMatch(/HTTP 503 #4$/);
+    const l0 = await lab(); l0.env[ENV.connectBudget] = "0";
+    await expect(startServer(l0.env, { log: () => undefined, clock: () => 0, deadline: async (ms) => { deadlines.push(ms); }, connectUpstreams: () => new Promise(() => undefined) })).rejects.toBeInstanceOf(StartupRefused);
+    expect(deadlines).toEqual([30_000]);
+    // the remaining-time arithmetic, observed: 10 s budget, each failure costs 0.5 s, sleeps 1, 2, 4 s
+    const seen: number[] = []; t = 0; n = 0;
+    await expect(startServer(l.env, { log: () => undefined, clock: () => t, sleep: async (ms) => { t += ms; }, deadline: (ms) => { seen.push(ms); return new Promise(() => undefined); },
+      connectUpstreams: async () => { n++; t += 500; throw new Error("x"); } })).rejects.toBeInstanceOf(StartupRefused);
+    expect(seen).toEqual([30_000, 28_500, 26_000, 21_500]);
+  });
+});

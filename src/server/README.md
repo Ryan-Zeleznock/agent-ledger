@@ -33,7 +33,7 @@ front's `tls`; `off` serves plain HTTP and logs `{ event: "warning", tls: "off" 
 refuse (no silent plaintext, ADR-017). `AGENT_LEDGER_UPSTREAM_CONNECT_BUDGET_MS` (integer 0..600000, default 60000):
 `connectUpstreams` is attempted, and on ANY failure retried after 1, 2, 4, 8, 16, 16, … s while the next wait still fits
 the budget; each failure logs `{ event: "upstreams-retry", attempt, nextInMs, reason }` (value-free, redacted like
-refusals); budget spent → refuse with the last reason. `upstreams.yaml` errors are config errors and refuse at once; an
+refusals); budget spent → refuse with the last reason. Fix round (Astra F2): each WHOLE attempt also races the time left of max(budget, 30 s) from the first attempt (`deadline`, injectable); an attempt still pending at that deadline, or one that succeeds after it by the clock, is refused as `attempt <n> did not finish within the <ms> ms start budget` and its late result is closed, never activated. Budget 0 = one attempt bounded at 30 s. The same bound applies to the Slack probe loop. `upstreams.yaml` errors are config errors and refuse at once; an
 entry named `approvals` is refused (reserved: the Slack tokens are `secrets/approvals.*`, pin 5). The `upstreams` line
 gains `eras` (`{ <server>: "modern" | "legacy" }`, from `Upstream.eras`). With `AGENT_LEDGER_APPROVALS=slack`:
 `approvals.yaml` (`version: 1`, `slack: { channelId ^[CG][A-Z0-9]{8,}$, approvers non-empty unique ^[UW][A-Z0-9]{8,}$,
