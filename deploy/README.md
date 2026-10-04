@@ -24,20 +24,39 @@ The database administrator can still explicitly disable/drop triggers. `ENABLE A
 bypass without changing that trust boundary. [PostgreSQL 16 ALTER TABLE](https://www.postgresql.org/docs/16/sql-altertable.html)
 documents this behavior (checked 2026-10-03); the runtime regressions pass against PostgreSQL 16.
 
-## Slice 2b residuals
+## Slice 2b (pins 7, 9, 10; ADR-015/016/017)
 
-- [ ] **Projected ServiceAccount tokens:** add a Kyverno validation rejecting explicit
-  `projected.sources[].serviceAccountToken` volumes and a matching negative Pod. Current automount denial prevents
-  automatic injection, not an explicitly requested token projection; shipped workloads have neither.
-- [ ] **BusyBox/Postgres digest pins:** resolve and pin `busybox:1.37.0` and `postgres:17.11-alpine3.24` digests, and
-  extend Kyverno's digest requirement to those repositories. Both are currently tag-pinned; BusyBox handles secrets.
-- [ ] **Database secrets in files:** use the official image's `POSTGRES_PASSWORD_FILE`, mounted app/reader password
-  files in the init hook, and a file-based integration credential flow. Current explicit environment entries follow
-  the Slice 2a pins. Prove ownership/modes, initialization, restart and secret-free logs before switching.
-- [ ] **Local DB authentication:** evaluate `--auth-local=scram-sha-256` with entrypoint/init-hook tests. Currently anyone
-  with exec access to postgres-0 can become the database superuser over its local trusted socket.
-- [ ] **Separate integration key:** consider an `integration-key` Secret so exclusion from the proxy is enforced by
-  resource access as well as its current Secret `items` projection.
+- **Proxy:** `replicas: 1` + `strategy: Recreate` (one Socket Mode router per Slack app), `AGENT_LEDGER_APPROVALS=slack`,
+  `AGENT_LEDGER_TLS=on`, HTTPS startup/readiness/liveness probes (startup allows 160 s: two 60 s retry loops + 30 s).
+  `stage-config` also copies `approvals.yaml` (ConfigMap), `slack-tokens` → `secrets/approvals.{botToken,appToken}` and
+  `proxy-tls` → `tls.crt`/`tls.key`, all 0600 as uid 65532.
+- **Egress:** proxy → TCP 443 on `0.0.0.0/0` except RFC 1918 (Slack; FQDN policy is 2c) and → `everything:3001`.
+- **`everything` upstream** (`32-everything.yaml`, `25-everything` policy: ingress only from the proxy, no egress):
+  image built from `upstreams/everything/` (exact `@modelcontextprotocol/server-everything@2026.8.31`, lockfile integrity
+  `sha512-5U3OZh8X…zxc7jQ==` asserted by `check.mjs`, `ignore-scripts`), Kaniko `kaniko/job-everything.yaml`, digest
+  recorded in the kustomization's `agent-ledger-everything` image entry (zero placeholder until HOMELAB step 4b).
+- **Kyverno:** digest requirement extended to Postgres and BusyBox; projected ServiceAccount token volumes forbidden
+  (negative Pod `k8s/test/bad-pod-projected-token.yaml`); reports-controller RBAC for `pods/ephemeralcontainers` in
+  `k8s/cluster/` (cluster-scoped, applied by HOMELAB step 7b, not part of `-k deploy/k8s`).
+- **Slack app:** `slack/app-manifest.yaml` (bot scope `chat:write` only, Socket Mode, interactivity without Request URL).
 
-Other retained Slice 2b work: TLS, a maintained image builder replacing archived Kaniko, approval channels, legacy-era
-MCP support, and versioned migrations. Runtime image digests remain explicit placeholders until Ryan builds/pins them.
+### Digest pins (resolved 2026-10-04 from the registries' manifest APIs; multi-arch index digests)
+
+| Image | Digest | Source |
+|---|---|---|
+| `docker.io/library/busybox:1.37.0` | `sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e` | registry-1.docker.io `Docker-Content-Digest` |
+| `docker.io/library/postgres:17.11-alpine3.24` | `sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24` | same |
+| `docker.io/library/node:24-alpine3.24` (everything build stage) | `sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1` | same |
+| `gcr.io/distroless/nodejs24-debian12:nonroot` (everything runtime) | `sha256:14d42e2511532589a7c7e01a753667a74fcc96266e137e8125006b87b0c32d0a` | gcr.io `Docker-Content-Digest` |
+
+The proxy's own `Dockerfile` still uses version tags for its bases (unchanged this slice).
+
+## Residuals carried to 2c
+
+- [x] Projected ServiceAccount tokens (2b). [x] BusyBox/Postgres digest pins (2b).
+- [ ] **Database secrets in files:** `POSTGRES_PASSWORD_FILE`, mounted app/reader password files, file-based integration
+  credential flow.
+- [ ] **Local DB authentication:** evaluate `--auth-local=scram-sha-256` (exec on postgres-0 is a superuser path today).
+- [ ] **Separate integration key** Secret.
+- [ ] FQDN-scoped Slack egress (CiliumNetworkPolicy); cert-manager/public CA; replacing archived Kaniko; versioned
+  migrations; pinning the proxy Dockerfile's base images by digest.

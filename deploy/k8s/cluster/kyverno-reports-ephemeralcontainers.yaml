@@ -1,0 +1,20 @@
+# Slice 2b pin 9: cluster-scoped, NOT in the namespace kustomization; applied by HOMELAB step 7b only.
+# Our ValidatingPolicy matches pods/ephemeralcontainers, and Kyverno's reports controller could not get/list/watch that
+# subresource (`kubectl auth can-i ... --subresource=ephemeralcontainers --as=system:serviceaccount:kyverno:
+# kyverno-reports-controller` → no x3, read-only, 2026-10-04). ClusterRole `kyverno:reports-controller` aggregates every
+# ClusterRole carrying the label below, so this adds exactly those three verbs on that one subresource. Nothing else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: agent-ledger:kyverno-reports-ephemeralcontainers
+  labels:
+    rbac.kyverno.io/aggregate-to-reports-controller: "true"
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - pods/ephemeralcontainers
+    verbs:
+      - get
+      - list
+      - watch

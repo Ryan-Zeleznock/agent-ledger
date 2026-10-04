@@ -49,7 +49,7 @@ async function lab(mut: (l: Lab) => void = () => undefined): Promise<Lab> {
   mkdirSync(join(dir, "secrets")); write(join(dir, "secrets", "demo.bearerToken"), `${T}\n`);
   write(join(dir, "upstreams.yaml"), `version: 1\nupstreams:\n  - name: demo\n    transport: http\n    url: ${demoUrl}\n`);
   const ledgerPath = join(dir, "ledger", "records.jsonl");
-  const env: NodeJS.ProcessEnv = { [ENV.configDir]: dir, [ENV.ledgerUrl]: pathToFileURL(ledgerPath).toString(), [ENV.port]: "0", [ENV.bindHost]: "127.0.0.1", [ENV.allowedOrigins]: "", [ENV.approvals]: "none" };
+  const env: NodeJS.ProcessEnv = { [ENV.configDir]: dir, [ENV.ledgerUrl]: pathToFileURL(ledgerPath).toString(), [ENV.port]: "0", [ENV.bindHost]: "127.0.0.1", [ENV.allowedOrigins]: "", [ENV.approvals]: "none", [ENV.tls]: "off", [ENV.connectBudget]: "0" };
   const l = { dir, env, demoUrl, demoLog, ledgerPath };
   mut(l);
   return l;
@@ -73,7 +73,7 @@ describe("server root: start, serve, record, log, stop (pin 8)", () => {
     const l = await lab();
     const { server, url, log } = await up(l);
     expect(server.head).toBe("0");
-    expect(log.map((x) => x["event"])).toEqual(["ledger", "upstreams", "listening"]);
+    expect(log.map((x) => x["event"])).toEqual(["warning", "ledger", "upstreams", "listening"]); expect(log[0]).toMatchObject({ tls: "off" }); log.shift();
     expect(log[0]).toMatchObject({ backend: "jsonl", head: "0" }); expect(log[1]).toMatchObject({ servers: ["demo"], tools: 5 }); expect(log[2]).toMatchObject({ port: server.port, bindHost: "127.0.0.1", approvals: "none" });
     leakFree(JSON.stringify(log), l);
     expect((await (await fetch(`http://127.0.0.1:${server.port}/healthz`)).json())).toEqual({ ok: true });
@@ -165,7 +165,7 @@ describe("server root: refuses to start (one `refused` line, exit-1 semantics, n
     leakFree(JSON.stringify(log), l);
   };
   it("NODE_OPTIONS set (even empty)", () => refusal((l) => { l.env["NODE_OPTIONS"] = ""; }, /NODE_OPTIONS is set/));
-  it("approvals other than none, or absent", async () => { await refusal((l) => { l.env[ENV.approvals] = "slack"; }, /AGENT_LEDGER_APPROVALS must be "none"/); await refusal((l) => { delete l.env[ENV.approvals]; }, /got nothing/); });
+  it("approvals other than none, or absent", async () => { await refusal((l) => { l.env[ENV.approvals] = "Slack"; }, /AGENT_LEDGER_APPROVALS must be "none" or "slack"/); await refusal((l) => { delete l.env[ENV.approvals]; }, /got nothing/); });
   it("config dir / ledger URL missing, bad scheme, embedded password", async () => {
     await refusal((l) => { delete l.env[ENV.configDir]; }, /AGENT_LEDGER_CONFIG_DIR is required/);
     await refusal((l) => { delete l.env[ENV.ledgerUrl]; }, /AGENT_LEDGER_LEDGER_URL is required/);
@@ -251,7 +251,7 @@ describe("smoke client (pin 8), in process against the root + demo upstream", ()
     const lines: string[] = [];
     const code = await runSmoke({ url, key: KEY, upstreamUrl: l.demoUrl }, (s) => lines.push(s));
     expect(lines.join("\n")).not.toContain(KEY); expect(lines.join("\n")).not.toContain(T);
-    expect(lines.slice(0, 5)).toEqual(["ok discover lists 2026-07-28", "ok tools/list is exactly the five demo tools, sorted", "ok demo__echo ok", "ok demo__now ok", "ok demo__add ok"]);
+    expect(lines.slice(0, 5)).toEqual(["ok discover lists 2026-07-28", "ok tools/list contains the five demo tools, sorted overall", "ok demo__echo ok", "ok demo__now ok", "ok demo__add ok"]);
     if (!accepts) {
       expect(code).toBe(1); expect(lines.at(-1)).toBe("SMOKE FAIL demo__wipe denied: no channel"); expect(lines.at(-2)).toMatch(/^FAIL demo__wipe denied: no channel: Error: isError=true blocks=1 textBytes=\d+$/); // value-free (F1)
     } else {
@@ -262,7 +262,7 @@ describe("smoke client (pin 8), in process against the root + demo upstream", ()
     }
     const wrong: string[] = [];
     expect(await runSmoke({ url, key: "not-the-key" }, (s) => wrong.push(s))).toBe(1);
-    expect(wrong.slice(0, 2)).toEqual(["ok discover lists 2026-07-28", "ok tools/list is exactly the five demo tools, sorted"]);
+    expect(wrong.slice(0, 2)).toEqual(["ok discover lists 2026-07-28", "ok tools/list contains the five demo tools, sorted overall"]);
     expect(wrong.at(-1)).toBe("SMOKE FAIL demo__echo ok");
     expect(l.demoLog.filter((x) => x["event"] === "call" && x["tool"] === "wipe")).toEqual([]);
     const d = tmp(); const keyFile = join(d, "api-key"); write(keyFile, `${KEY}\n`, 0o644);

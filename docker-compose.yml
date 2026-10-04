@@ -18,6 +18,7 @@ services:
       AGENT_LEDGER_BIND_HOST: 0.0.0.0
       AGENT_LEDGER_ALLOWED_ORIGINS: ""
       AGENT_LEDGER_APPROVALS: none
+      AGENT_LEDGER_TLS: "off"   # Slice 2b: required; this local lab publishes on 127.0.0.1 only
     volumes: ["${CONFIG_DIR:?absolute staged config dir}:/run/agent-ledger:ro"]
     depends_on:
       postgres: {condition: service_healthy}
@@ -36,7 +37,7 @@ services:
     volumes: ["${CONFIG_DIR:?}/secrets/demo.bearerToken:/run/token:ro"]
     networks: [ledger-internal]
   postgres:
-    image: docker.io/library/postgres:17.11-alpine3.24
+    image: docker.io/library/postgres:17.11-alpine3.24@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
     user: "70:70"
     read_only: true
     cap_drop: [ALL]
