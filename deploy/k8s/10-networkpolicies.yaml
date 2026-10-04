@@ -67,6 +67,26 @@ spec:
       ports:
         - protocol: TCP
           port: 3001
+    # Slice 2b pin 9: the legacy-era `everything` upstream.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: everything
+      ports:
+        - protocol: TCP
+          port: 3001
+    # Slice 2b pin 9 (ADR-015): Slack Web API + Socket Mode over TLS. Standard NetworkPolicy cannot name FQDNs, so this
+    # is any public address on 443 (private ranges excluded); FQDN-scoped egress via CiliumNetworkPolicy is 2c.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -173,3 +193,29 @@ spec:
       ports:
         - protocol: TCP
           port: 3001
+---
+# Slice 2b pin 9: `everything` (server-everything, no auth of its own): reachable ONLY from the proxy on 3001, and NO
+# egress at all (not even DNS), so `gzip-file-as-resource` cannot fetch anything. Both directions are stated here
+# explicitly even though 00-default-deny already covers egress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: 25-everything
+  namespace: agent-ledger
+  labels: {}
+spec:
+  podSelector:
+    matchLabels:
+      app: everything
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: proxy
+      ports:
+        - protocol: TCP
+          port: 3001
+  egress: []

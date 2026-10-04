@@ -1,0 +1,7 @@
+# Slice 2b pin 5 (ADR-015). Ryan: replace the two PLACEHOLDER ids in HOMELAB step 5b (channel id of the private
+# #agent-ledger-approvals channel; each approver's Slack member id). No tokens here: they are the `slack-tokens` Secret.
+version: 1
+slack:
+  channelId: C0000000000        # PLACEHOLDER
+  approvers: [U0000000000]      # PLACEHOLDER
+  timeoutMs: 180000

@@ -25,7 +25,12 @@ metadata:
     app: proxy
     component: runtime
 spec:
+  # Slice 2b pin 9 (ADR-015): exactly ONE proxy per Slack app, and Recreate so a rollout never runs two Socket Mode
+  # routers at once (Slack delivers each interactive payload to ANY open connection of the app; a second router eats
+  # clicks). deploy/check.mjs asserts both.
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: proxy
@@ -48,14 +53,15 @@ spec:
       terminationGracePeriodSeconds: 15
       initContainers:
         - name: stage-config
-          image: docker.io/library/busybox:1.37.0
+          image: docker.io/library/busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
           command:
             - sh
             - -ec
             - umask 077; mkdir -p /run/agent-ledger/secrets; cp /mnt/registry/registry.yaml
-              /mnt/registry/upstreams.yaml /mnt/secrets/agents.yaml /mnt/secrets/hmac.key
-              /mnt/secrets/ledger.password /run/agent-ledger/; cp /mnt/secrets/demo.bearerToken
-              /run/agent-ledger/secrets/demo.bearerToken; chmod 600 /run/agent-ledger/*.*
+              /mnt/registry/upstreams.yaml /mnt/registry/approvals.yaml /mnt/secrets/agents.yaml
+              /mnt/secrets/hmac.key /mnt/secrets/ledger.password /mnt/tls/tls.crt /mnt/tls/tls.key
+              /run/agent-ledger/; cp /mnt/secrets/demo.bearerToken /mnt/slack/approvals.botToken
+              /mnt/slack/approvals.appToken /run/agent-ledger/secrets/; chmod 600 /run/agent-ledger/*.*
               /run/agent-ledger/secrets/*
           securityContext: &a1
             allowPrivilegeEscalation: false
@@ -76,6 +82,12 @@ spec:
               readOnly: true
             - name: secrets
               mountPath: /mnt/secrets
+              readOnly: true
+            - name: slack-tokens
+              mountPath: /mnt/slack
+              readOnly: true
+            - name: proxy-tls
+              mountPath: /mnt/tls
               readOnly: true
             - name: config
               mountPath: /run/agent-ledger
@@ -98,7 +110,11 @@ spec:
             - name: AGENT_LEDGER_ALLOWED_ORIGINS
               value: ""
             - name: AGENT_LEDGER_APPROVALS
-              value: none
+              value: slack
+            - name: AGENT_LEDGER_TLS
+              value: "on"
+            - name: AGENT_LEDGER_UPSTREAM_CONNECT_BUDGET_MS
+              value: "60000"
           ports:
             - containerPort: 8787
           resources:
@@ -108,16 +124,26 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
+          # The root retries upstreams and then the Slack probe, each under the 60 s budget, before it listens:
+          # 32 x 5 s = 160 s >= 2 x 60 s + 30 s (pin 6 "budget + 30 s", per retry loop).
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8787
+              scheme: HTTPS
+            periodSeconds: 5
+            failureThreshold: 32
           readinessProbe:
             httpGet:
               path: /healthz
               port: 8787
+              scheme: HTTPS
             periodSeconds: 5
           livenessProbe:
             httpGet:
               path: /healthz
               port: 8787
-            initialDelaySeconds: 15
+              scheme: HTTPS
             periodSeconds: 10
           volumeMounts:
             - name: config
@@ -144,3 +170,23 @@ spec:
                 path: ledger.password
               - key: demo.bearerToken
                 path: demo.bearerToken
+        # Slice 2b pin 5: the Slack tokens (bot xoxb-, app-level xapp-), staged into secrets/ as uid 65532, 0600.
+        - name: slack-tokens
+          secret:
+            secretName: slack-tokens
+            defaultMode: 288
+            items:
+              - key: approvals.botToken
+                path: approvals.botToken
+              - key: approvals.appToken
+                path: approvals.appToken
+        # ADR-017: the proxy's lab-CA server certificate (Secret type kubernetes.io/tls), staged into the config dir.
+        - name: proxy-tls
+          secret:
+            secretName: proxy-tls
+            defaultMode: 288
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key

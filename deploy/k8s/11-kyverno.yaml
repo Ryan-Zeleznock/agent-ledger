@@ -30,9 +30,11 @@ spec:
       message: Only approved Agent Ledger, Postgres 17 and BusyBox 1 images are allowed.
     - expression: "(object.spec.containers + (has(object.spec.initContainers) ? object.spec.initContainers : []) +
         (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers : [])).all(c,
-        !c.image.startsWith('ghcr.io/ryan-zeleznock/agent-ledger') ||
+        !(c.image.startsWith('ghcr.io/ryan-zeleznock/agent-ledger') ||
+        c.image.startsWith('docker.io/library/postgres:') ||
+        c.image.startsWith('docker.io/library/busybox:')) ||
         c.image.matches('@sha256:[0-9a-f]{64}$'))"
-      message: Agent Ledger images must be pinned by sha256 digest.
+      message: Agent Ledger, Postgres and BusyBox images must be pinned by sha256 digest.
     - expression: "(object.spec.containers + (has(object.spec.initContainers) ? object.spec.initContainers : []) +
         (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers : [])).all(c, !has(c.env) ||
         c.env.all(e, e.name != 'NODE_OPTIONS'))"
@@ -48,3 +50,7 @@ spec:
         (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers : [])).all(c, !has(c.envFrom)
         || size(c.envFrom) == 0)"
       message: Use explicitly named env entries so NODE_OPTIONS cannot be imported through envFrom.
+    # Slice 2b pin 9: automount=false stops automatic token injection, not an explicitly requested projection.
+    - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.projected) ||
+        !has(v.projected.sources) || v.projected.sources.all(s, !has(s.serviceAccountToken)))"
+      message: Projected ServiceAccount token volumes are forbidden.

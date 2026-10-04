@@ -3,3 +3,7 @@ upstreams:
   - name: demo
     transport: http
     url: http://demo-upstream.agent-ledger.svc.cluster.local:3001/mcp
+  # Slice 2b pin 9: no bearer (server-everything has no auth; NetworkPolicy 25-everything is its boundary).
+  - name: everything
+    transport: http
+    url: http://everything.agent-ledger.svc.cluster.local:3001/mcp

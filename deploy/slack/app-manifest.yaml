@@ -1,0 +1,29 @@
+# Slice 2b pin 11 step 3b (ADR-015): the Slack app for the ONE lab proxy. Ryan creates it in the Slack UI ("Create New App"
+# → "From a manifest"); nothing here runs in the cluster. Fields per https://docs.slack.dev/reference/app-manifest
+# (read 2026-10-04): display_information.name required, max 35 chars; bot_user.display_name max 80 chars;
+# interactivity.request_url is optional and NOT set (Socket Mode delivers the clicks).
+# Do NOT reuse this app for anything else: Slack sends each interactive payload to ANY open Socket Mode connection of the
+# app, so a second consumer silently eats approval clicks (they become timeouts: denied, but the demo looks broken).
+# Tokens after install: Bot User OAuth Token (xoxb-, scope chat:write) and an App-Level Token with connections:write
+# (xapp-). Both go into files under ~/agent-ledger-lab/.secrets/ (0600), never a shell command line or the vault.
+_metadata:
+  major_version: 1
+display_information:
+  name: Agent Ledger
+  description: Asks a reviewed approver before an AI agent's risky tool call runs; the click is recorded as evidence.
+features:
+  bot_user:
+    display_name: agent-ledger
+    always_online: false
+oauth_config:
+  scopes:
+    # chat:write only: the bot is /invited to one private channel, so chat:write.public is not needed. chat.postMessage,
+    # chat.update and chat.postEphemeral all need chat:write; auth.test needs no scope.
+    bot:
+      - chat:write
+settings:
+  socket_mode_enabled: true
+  interactivity:
+    is_enabled: true
+  org_deploy_enabled: false
+  token_rotation_enabled: false

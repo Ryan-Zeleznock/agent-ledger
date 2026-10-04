@@ -1,5 +1,9 @@
 # Ryan: review all five tool identities and update reviewedAt before applying.
 # whoami is deliberately absent: unreviewed must deny. Four reviewed rows, five exposed tools.
+# Slice 2b pin 7: `everything` (server-everything 2026.8.31, exposed `everything__<tool>`). storeArgs names copied from
+# the package's published zod schemas (echo: message; get-sum: a, b), re-checked against the live tools/list in step 6.
+# get-env (returns the process environment) and gzip-file-as-resource (fetches a URL) are RISKY → Slack. Every other
+# everything tool is unlisted → unreviewed → Slack.
 version: 1
 servers:
   demo:
@@ -20,6 +24,41 @@ servers:
         reviewedAt: 2026-10-04
         storeArgs: [a, b]
       wipe:
+        class: risky
+        reviewedBy: ryan
+        reviewedAt: 2026-10-04
+        storeArgs: []
+  everything:
+    trusted: false
+    tools:
+      echo:
+        class: read
+        reviewedBy: ryan
+        reviewedAt: 2026-10-04
+        storeArgs: [message]
+      get-sum:
+        class: read
+        reviewedBy: ryan
+        reviewedAt: 2026-10-04
+        storeArgs: [a, b]
+      get-tiny-image:
+        class: read
+        reviewedBy: ryan
+        reviewedAt: 2026-10-04
+      get-annotated-message:
+        class: read
+        reviewedBy: ryan
+        reviewedAt: 2026-10-04
+      get-structured-content:
+        class: read
+        reviewedBy: ryan
+        reviewedAt: 2026-10-04
+      get-env:
+        class: risky
+        reviewedBy: ryan
+        reviewedAt: 2026-10-04
+        storeArgs: []
+      gzip-file-as-resource:
         class: risky
         reviewedBy: ryan
         reviewedAt: 2026-10-04

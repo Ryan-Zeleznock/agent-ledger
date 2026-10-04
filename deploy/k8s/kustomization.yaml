@@ -9,6 +9,7 @@ resources:
   - 20-postgres.yaml
   - 30-proxy.yaml
   - 31-demo-upstream.yaml
+  - 32-everything.yaml
   - 40-integration.yaml
 generatorOptions:
   disableNameSuffixHash: true
@@ -17,6 +18,7 @@ configMapGenerator:
     files:
       - config/registry.yaml
       - config/upstreams.yaml
+      - config/approvals.yaml
   - name: postgres-init
     files:
       - config/001_init.sh
@@ -25,3 +27,9 @@ images:
   - name: ghcr.io/ryan-zeleznock/agent-ledger
     newTag: slice-2a
     digest: sha256:af00fb1533c9988367880f28a1b6365ec89f0744e51522882393c48a61814fe4
+  # Slice 2b pin 10: the `everything` upstream image (same repository, its own tag). The digest is a placeholder until
+  # Ryan builds it (HOMELAB step 4b) and records the Kaniko digest here. Listed AFTER the proxy entry on purpose.
+  - name: agent-ledger-everything
+    newName: ghcr.io/ryan-zeleznock/agent-ledger
+    newTag: everything-2026.8.31
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000

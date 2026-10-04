@@ -1,0 +1,51 @@
+# Slice 2b pin 10: builds deploy/upstreams/everything (its own `git archive` context, HOMELAB step 4b). Same pattern as job.yaml.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kaniko-agent-ledger-everything
+  namespace: build
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: kaniko-agent-ledger-everything
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      containers:
+        - name: kaniko
+          image: gcr.io/kaniko-project/executor:v1.23.2
+          args:
+            - --context=tar:///work/context.tar.gz
+            - --dockerfile=Dockerfile
+            - --destination=ghcr.io/ryan-zeleznock/agent-ledger:everything-2026.8.31
+            - --digest-file=/dev/termination-log
+            - --reproducible
+            - --cache=false
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          volumeMounts:
+            - name: context
+              mountPath: /work
+              readOnly: true
+            - name: auth
+              mountPath: /kaniko/.docker
+              readOnly: true
+      volumes:
+        - name: context
+          configMap:
+            name: agent-ledger-everything-context
+        - name: auth
+          secret:
+            secretName: ghcr-auth
+            items:
+              - key: .dockerconfigjson
+                path: config.json
