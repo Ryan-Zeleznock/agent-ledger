@@ -36,8 +36,10 @@ export const slack: SlackSeam = {
   SLACK_API_BASE_URL: a.SLACK_API_BASE_URL ?? "https://slack.com/api/",      // the pinned literal (pin 1)
   SLACK_PROXY_MAX_TIMEOUT_MS: a.SLACK_PROXY_MAX_TIMEOUT_MS ?? 240_000,       // the pinned literal (pin 1, §0 B)
   configureSlackApprovals: (cfg) => needA("configureSlackApprovals")(cfg),
-  probeSlack: (ch) => needA("probeSlack")(ch),
-  closeSlackApprovals: () => needA("closeSlackApprovals")(),
+  // async wrappers: a missing export must surface as a REJECTED promise, so callers' `.catch` paths (shutdown, refusal
+  // cleanup) still run; a synchronous throw would escape them (found by e2e row 0).
+  probeSlack: async (ch) => needA("probeSlack")(ch),
+  closeSlackApprovals: async () => needA("closeSlackApprovals")(),
 };
 /** Whether A's Slack implementation is present (the e2e self-skips its Slack steps until it is). */
 export const slackSeamPresent = (): boolean => typeof a.configureSlackApprovals === "function" && typeof a.probeSlack === "function" && typeof a.closeSlackApprovals === "function";
