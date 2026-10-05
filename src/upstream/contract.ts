@@ -4,7 +4,21 @@ import { MCP_SERVER_NAME_RE, RESERVED_SERVER_NAMES } from "../types/index.js";
 import type { SecretsProvider } from "../secrets/contract.js";
 import { notImplemented } from "../types/not-implemented.js";
 
-export interface UpstreamConfig { name: string; transport: "stdio" | "http"; command?: string; args?: string[]; url?: string; }
+export interface UpstreamConfig {
+  name: string; transport: "stdio" | "http"; command?: string; args?: string[]; url?: string;
+  /**
+   * ADR-018 §6 (additive): `true` allows sending this upstream's bearer over plaintext `http://` to a non-loopback host
+   * (an in-cluster Service behind a NetworkPolicy, say). Without it such a config is refused at connect.
+   */
+  insecure?: boolean;
+}
+/** ADR-018 §6: hosts a plaintext bearer may go to without `insecure: true` (the loopback interface only). */
+export function isLoopbackHost(hostname: string): boolean {
+  const h = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (h === "localhost" || h === "::1" || h === "0:0:0:0:0:0:0:1") return true;
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  return m !== null && Number(m[1]) === 127 && m.slice(1).every((o) => Number(o) <= 255);
+}
 /** A tool definition the client refused per the transport's `x-mcp-header` rules (excluded from `listTools()`); `reason` is value-free. */
 export interface RejectedTool { server: string; tool: string; reason: string; }
 export interface Upstream {
@@ -84,6 +98,11 @@ export async function connectUpstreams(config: UpstreamConfig[], secrets: Secret
     if (url.username || url.password) throw new Error(`upstream: ${u.name}: credentials in the URL are refused; use the secrets directory`);
     const found = await secrets.get(u.name);
     const bearer = typeof found["bearerToken"] === "string" && found["bearerToken"].length > 0 ? found["bearerToken"] : undefined;
+    if (u.insecure !== undefined && typeof u.insecure !== "boolean") throw new Error(`upstream: ${u.name}: insecure must be a boolean`);
+    // ADR-018 §6: never put a bearer on the wire in plaintext unless it stays on this host or the operator said so.
+    if (bearer !== undefined && url.protocol === "http:" && !isLoopbackHost(url.hostname) && u.insecure !== true) {
+      throw new Error(`upstream: ${u.name}: refusing to send a bearer over plaintext http:// to a non-loopback host; use https:// or set insecure: true on this upstream`);
+    }
     clients.set(u.name, new HttpClient(u.name, url.toString(), bearer, inflight, () => closed));
   }
   const tools: ToolInfo[] = [];

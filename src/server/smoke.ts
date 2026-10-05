@@ -46,9 +46,14 @@ export async function runSmoke(o: SmokeOptions, out: (line: string) => void): Pr
     ["demo__wipe denied: no channel", async () => { if (slack) return SKIP; const r = await call("demo__wipe", { target: "smoke" }); must(r["isError"] === true && toolText(r).includes(PROXY_NO_CHANNEL_REASON), describe(r)); }],
     ["demo__whoami denied: unreviewed", async () => { if (slack) return SKIP; const r = await call("demo__whoami", {}); must(r["isError"] === true && /unreviewed/.test(toolText(r)), describe(r)); }],
     ["no bearer → 401", async () => { const r = await post({ url: o.url, method: "server/discover" }); must(r.status === 401 && (r.headers.get("www-authenticate") ?? "").startsWith("Bearer"), `HTTP ${r.status}`); }],
-    ["wrong key → denied (unknown agent), not executed", async () => {
-      const r = await callRaw(`${o.key}-wrong`, "tools/call", { name: "demo__echo", arguments: { message: "hello" } });
-      must(r["isError"] === true && /unknown agent/.test(toolText(r)), describe(r));
+    // ADR-018 §1: the front authenticates first, so an unknown key never reaches identity-in-pipeline, policy or a method.
+    ["wrong key → 401 on tools/call (unknown agent, not executed)", async () => {
+      const r = await post({ url: o.url, token: `${o.key}-wrong`, method: "tools/call", params: { name: "demo__echo", arguments: { message: "hello" } } });
+      must(r.status === 401 && !r.text.includes(`${o.key}-wrong`), `HTTP ${r.status}`);
+    }],
+    ["wrong key → 401 on tools/list (no tool inventory)", async () => {
+      const r = await post({ url: o.url, token: `${o.key}-wrong`, method: "tools/list" });
+      must(r.status === 401 && !r.text.includes("demo__"), `HTTP ${r.status}`);
     }],
     ["missing Mcp-Name → 400 -32020", async () => {
       const r = await post({ url: o.url, token: o.key, method: "tools/call", params: { name: "demo__echo", arguments: { message: "x" } }, headers: { "mcp-name": null } });
@@ -63,10 +68,16 @@ export async function runSmoke(o: SmokeOptions, out: (line: string) => void): Pr
   }
   if (o.upstreamUrl !== undefined) {
     const upstream = o.upstreamUrl;
-    checks.push(["upstream direct, no token → 401", async () => { const r = await mcpPost({ url: upstream, method: "server/discover" }); must(r.status === 401, `HTTP ${r.status}`); }]);
-    checks.push(["upstream direct, the agent's key → unauthorized (the proxy key is not the upstream's credential)", async () => {
-      const r = await mcpCall(upstream, o.key, "tools/call", { name: "echo", arguments: { message: "x" } });
-      must(r["isError"] === true && toolText(r) === "unauthorized", describe(r));
+    // P3 (server audit 2026-10-05): each check claims exactly what it tests. A 401 with no token proves only that a
+    // bearer is required; the agent's key and a bogus key are checked separately, on tools/call AND tools/list.
+    checks.push(["upstream direct, no bearer → 401", async () => { const r = await mcpPost({ url: upstream, method: "server/discover" }); must(r.status === 401, `HTTP ${r.status}`); }]);
+    checks.push(["upstream direct, the agent's key → 401 on tools/call (the proxy key is not the upstream's credential)", async () => {
+      const r = await mcpPost({ url: upstream, token: o.key, method: "tools/call", params: { name: "echo", arguments: { message: "x" } } });
+      must(r.status === 401, `HTTP ${r.status}`);
+    }]);
+    checks.push(["upstream direct, the agent's key → 401 on tools/list (no upstream tool inventory)", async () => {
+      const r = await mcpPost({ url: upstream, token: o.key, method: "tools/list" });
+      must(r.status === 401, `HTTP ${r.status}`);
     }]);
   }
   for (const [name, run] of checks) {

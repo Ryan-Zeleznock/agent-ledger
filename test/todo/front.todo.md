@@ -16,3 +16,4 @@ Converted on 2026-10-03 (Fable, Slice 2a pins 3 and 5) in `test/front.test.ts` o
 - [x] Fable review 2026-10-04 P2-4 (coordinator override): disconnect retains admission until the handler settles; shutdown refuses new admission (503 while stopping).
 - [x] Fable review P2-5/6: global LRU and 32-session per-bearer cap replace capacity refusal; 1024 garbage bearers cannot lock out a real initialize; valid-session unknown methods get 200/-32601, all notifications get 202.
 - [x] Fable review P3-3/6: legacy initialize errors name legacy versions; reject missing, empty and non-Buffer TLS cert/key at construction.
+- [x] ADR-018 (server audit P2-1/P2-2, /cso LOWs): required `authenticate` before body and every method; 401 without echo; maxConnections; 10 s header and body deadlines; per-agent requests-in-flight cap; legacy sessions capped per agent, global capacity refuses instead of evicting.

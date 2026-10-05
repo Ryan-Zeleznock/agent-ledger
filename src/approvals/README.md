@@ -56,3 +56,31 @@ Display names are presentation, never allowlist identity. HTML/PDF retain the me
 Tests: `ADR-015 approver names` in `test/approvals.test.ts`; ledger projection, strict-read/hash round-trip, report
 escaping and legacy member-only rendering. Fake Slack supports `users.info` in both in-process and loopback fixtures.
 Live scope/reinstall and users.info compatibility are coordinator checks (no network in this build sandbox).
+
+## ADR-018 security round (2026-10-05): approvers see what they approve; per-agent limits
+
+Interface pin with Astra: the pipeline passes `requestApproval` the REDACTED stored projection (`hmac-sha256:` values
+intact). `preview.ts` renders only what it receives, never raw arguments. The card is: header (agent, tool, risk, rule,
+reason; a reason over 1500 characters is cut with a stated truncation), call context, the argument list, a summary
+context, the buttons. The argument list has one line per top-level field, sorted: clear values as JSON (strings quoted;
+control, format and line/paragraph separator characters shown as `\uXXXX`, so a value cannot fake a line or reorder
+text; `& < >` escaped), `hmac-sha256:<64 hex>` as "withheld: stored as a keyed digest", a complete `[REDACTED:<kind>]`
+as "withheld: redacted by the ledger (<kind>)". Values over 400 and names over 128 characters are cut with
+"[truncated: N of M characters shown]". Lines are packed into `plain_text` sections (no mrkdwn: nothing in an argument
+can format, link or mention) of at most 3000 characters; at most 40 sections. The summary states field, withheld and
+truncated counts and `sha256:<hex>` over the RFC 8785 (JCS) form of the arguments received, so the card can be tied to the
+ledger record. If the preview cannot fit, `requestApproval` returns `denied` (no approver, reason
+`agent-ledger: approval preview does not fit Slack's limits …; denied without asking (arguments digest …)`) without
+any Slack call; the pipeline records it. After a decision, `chat.update` keeps everything that was reviewed and replaces
+only the buttons. A reviewer who wants a field visible adds it to `storeArgs` (the same review that stores it in clear).
+
+Per-agent limits: at most `SLACK_MAX_PENDING_PER_AGENT` (4) pending approvals per agent; an identical pending request
+(same agent, server, tool and arguments digest) is not posted again. Both return `denied` at once with an
+`agent-ledger:` reason naming the cause (and, for a duplicate, the callId already pending); nothing reaches Slack.
+Collapsing is a refusal, never a shared approval: one click never authorizes two executions. Slots free on settlement.
+
+Slack limits [V], verified 2026-10-05: https://docs.slack.dev/reference/block-kit/blocks/section-block/ (section text
+max 3000 characters), https://docs.slack.dev/reference/block-kit/blocks/ (up to 50 blocks per message). [H]: Slack's
+formatting reference asks for `& < >` escaping; whether plain_text shows the entities literally was not confirmed by the
+text-object page; either way the value stays visible and inert.
+Tests: `test/approvals-preview.test.ts`.

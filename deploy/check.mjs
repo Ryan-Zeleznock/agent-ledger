@@ -17,7 +17,13 @@ const falco = YAML.parse(YAML.parse(fs.readFileSync('deploy/falco/values.yaml','
 const processRule = falco.find(rule=>rule.rule==='Agent Ledger proxy spawned a process');
 const shellRule = falco.find(rule=>rule.rule==='Shell in agent-ledger namespace');
 assert.match(processRule.condition,/container\.image\.repository endswith "ryan-zeleznock\/agent-ledger"/);
-assert.match(shellRule.condition,/not container\.image\.repository endswith "library\/busybox"/);
+// Server audit P3 (2026-10-05): exempt only the image's own node binary, and flag node spawned by node (child processes).
+assert.match(processRule.condition,/not proc\.exepath = "\/nodejs\/bin\/node"/);
+assert.match(processRule.condition,/proc\.pname = "node" or proc\.pexepath = "\/nodejs\/bin\/node"/);
+assert.doesNotMatch(processRule.condition,/not proc\.name = "node"/);
+// `busybox sh` runs as proc.name busybox; the BusyBox exemption is the stage-config init container only.
+assert.match(shellRule.condition,/proc\.name in \(sh, ash, bash, dash, busybox\)/);
+assert.match(shellRule.condition,/not \(container\.image\.repository endswith "library\/busybox" and container\.name = "stage-config"\)/);
 
 assert.equal(fs.readFileSync('deploy/sql/001_init.sql','utf8'), fs.readFileSync('deploy/k8s/config/001_init.sql','utf8'), 'SQL copy drift');
 const rendered = execFileSync('kubectl', ['kustomize', 'deploy/k8s'], {encoding:'utf8', timeout:30_000});
@@ -89,7 +95,7 @@ assert.deepEqual(proxy.volumes.find(v=>v.name==='proxy-tls').secret.items.map(i=
 const pe=nets.find(n=>n.metadata.name==='20-proxy-egress').spec.egress;
 const ipRules=pe.filter(r=>r.to.some(t=>t.ipBlock));
 assert.equal(ipRules.length,1);
-assert.deepEqual(ipRules[0].to,[{ipBlock:{cidr:'0.0.0.0/0',except:['10.0.0.0/8','172.16.0.0/12','192.168.0.0/16']}}]);
+assert.deepEqual(ipRules[0].to,[{ipBlock:{cidr:'0.0.0.0/0',except:['10.0.0.0/8','172.16.0.0/12','192.168.0.0/16','100.64.0.0/10','169.254.0.0/16']}}]);
 assert.deepEqual(ipRules[0].ports,[{protocol:'TCP',port:443}]);
 assert(pe.some(r=>r.to.some(t=>t.podSelector?.matchLabels?.app==='everything') && r.ports.length===1 && r.ports[0].port===3001));
 // everything: ingress only from the proxy on 3001, no egress at all; the Pod holds nothing secret.
@@ -131,6 +137,8 @@ assert.equal(registry.servers.everything.tools['gzip-file-as-resource'].class,'r
 assert.deepEqual(registry.servers.everything.tools.echo.storeArgs,['message']); assert.deepEqual(registry.servers.everything.tools['get-sum'].storeArgs,['a','b']);
 const ups=YAML.parse(fs.readFileSync('deploy/k8s/config/upstreams.yaml','utf8')).upstreams;
 assert.deepEqual(ups.find(u=>u.name==='everything'),{name:'everything',transport:'http',url:'http://everything.agent-ledger.svc.cluster.local:3001/mcp'});
+// ADR-018 §6: the demo upstream gets a bearer over in-cluster http://, so it must say insecure: true explicitly.
+assert.deepEqual(ups.find(u=>u.name==='demo'),{name:'demo',transport:'http',url:'http://demo-upstream.agent-ledger.svc.cluster.local:3001/mcp',insecure:true});
 assert(!ups.some(u=>u.name==='approvals'),'approvals is a reserved upstream name');
 const appr=YAML.parse(fs.readFileSync('deploy/k8s/config/approvals.yaml','utf8'));
 assert.deepEqual(Object.keys(appr.slack).sort(),['approvers','channelId','timeoutMs']); assert(appr.slack.timeoutMs<=240000);
@@ -140,6 +148,48 @@ const slackManifest=YAML.parse(fs.readFileSync('deploy/slack/app-manifest.yaml',
 assert.deepEqual(slackManifest.oauth_config.scopes.bot,['chat:write','users:read']);
 assert.equal(slackManifest.settings.socket_mode_enabled,true); assert.equal(slackManifest.settings.interactivity.is_enabled,true);
 assert.equal(slackManifest.settings.interactivity.request_url,undefined); assert.equal(slackManifest.settings.org_deploy_enabled,false); assert.equal(slackManifest.settings.token_rotation_enabled,false);
+// ---------- ADR-018 security round (server audit P2-5 and P3s, 2026-10-05) ----------
+// P2-5: every Dockerfile FROM (except a reference to an earlier stage) and every Kaniko executor is digest-pinned.
+const KANIKO='gcr.io/kaniko-project/executor:v1.23.2@sha256:9e69fd4330ec887829c780f5126dd80edc663df6def362cd22e79bcdf00ac53f';
+const dockerfiles=[];
+const walk=(dir)=>{for(const e of fs.readdirSync(dir,{withFileTypes:true})){if(['node_modules','.git','dist'].includes(e.name))continue;const p=`${dir}/${e.name}`;if(e.isDirectory())walk(p);else if(/^Dockerfile(\..+)?$|\.Dockerfile$/.test(e.name))dockerfiles.push(p);}};
+walk('.');
+assert(dockerfiles.includes('./Dockerfile')&&dockerfiles.includes('./deploy/upstreams/everything/Dockerfile'),`Dockerfiles found: ${dockerfiles}`);
+for(const df of dockerfiles){
+  const stages=new Set();
+  for(const line of fs.readFileSync(df,'utf8').split('\n').map(l=>l.trim()).filter(l=>/^FROM\s/i.test(l))){
+    const [, image, stage]=/^FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?$/i.exec(line)??[];
+    assert(image,`${df}: unparsable ${line}`);
+    if(!stages.has(image)) assert.match(image,/@sha256:[0-9a-f]{64}$/,`${df}: ${line} must be digest-pinned`);
+    if(stage) stages.add(stage);
+  }
+}
+const kanikoJobs=fs.readdirSync('deploy/kaniko').filter(f=>f.endsWith('.yaml'));
+assert(kanikoJobs.length>=2);
+for(const f of kanikoJobs){
+  const kj=YAML.parse(fs.readFileSync(`deploy/kaniko/${f}`,'utf8'));
+  for(const c of [...kj.spec.template.spec.containers,...kj.spec.template.spec.initContainers??[]]){
+    assert.match(c.image,/@sha256:[0-9a-f]{64}$/,`deploy/kaniko/${f}: ${c.name} must be digest-pinned`);
+    if(c.image.startsWith('gcr.io/kaniko-project/executor')) assert.equal(c.image,KANIKO);
+  }
+}
+// P3: the agent's api-key is its own Secret, mounted by the integration Job only.
+assert.equal(job.spec.template.spec.volumes.find(v=>v.name==='key').secret.secretName,'agent-key');
+for(const w of workloads) if(w.metadata.name!=='integration') assert(!(w.spec.template.spec.volumes??[]).some(v=>v.secret?.secretName==='agent-key'),`${w.metadata.name} must not mount agent-key`);
+assert(!(proxy.volumes.find(v=>v.name==='secrets').secret.items.some(i=>i.key==='api-key')));
+// P3: Kyverno binds our app labels to their ServiceAccounts and app=proxy to the proxy itself; negative proofs exist.
+assert(kyv.some(v=>v.expression.includes("object.spec.serviceAccountName == object.metadata.labels['app']")));
+assert(kyv.some(v=>v.expression.includes("object.metadata.labels['app'] != 'proxy'") && v.expression.includes("c.args == ['dist/server/main.js']")));
+for(const w of workloads) assert.equal(w.spec.template.spec.serviceAccountName,w.spec.template.metadata.labels.app,`${w.metadata.name}: app label must equal its ServiceAccount`);
+const badLabel=YAML.parse(fs.readFileSync('deploy/k8s/test/bad-pod-label.yaml','utf8'));
+assert.equal(badLabel.metadata.labels.app,'proxy'); assert.notEqual(badLabel.spec.serviceAccountName,'proxy');
+const badEphemeral=JSON.parse(fs.readFileSync('deploy/k8s/test/bad-ephemeral-container.json','utf8')).spec.ephemeralContainers[0];
+assert(!['ghcr.io/ryan-zeleznock/agent-ledger','docker.io/library/postgres:17.','docker.io/library/busybox:1.'].some(p=>badEphemeral.image.startsWith(p)),'the ephemeral negative proof must use a disallowed image');
+assert(fs.readFileSync('deploy/k8s/11-kyverno.yaml','utf8').includes('- pods/ephemeralcontainers'));
+// P3: the Postgres superuser cannot log in over TCP (pg_hba first line), set before any SQL runs.
+const initSh=fs.readFileSync('deploy/k8s/config/001_init.sh','utf8');
+assert(initSh.indexOf(`sed -i '1i host all postgres all reject' "$PGDATA/pg_hba.conf"`)>=0 && initSh.indexOf('1i host all postgres all reject')<initSh.indexOf('psql -X'));
+
 if(appr.slack.channelId==='C0000000000') console.log('APPROVALS PLACEHOLDER: Ryan sets the channel and approver ids in HOMELAB step 5b.');
 
 console.log(`Offline deployment invariants checked: ${docs.length} resources, ${workloads.length} workloads; no API calls.`);

@@ -27,7 +27,7 @@ async function start(o: { tools?: ToolInfo[]; origins?: string[]; bindHost?: str
     if (Object.hasOwn(o, "result")) return o.result as ToolResult;
     return { content: [{ type: "text", text: `ran ${incoming.server}/${incoming.tool} ${JSON.stringify(incoming.args)}` }], isError: false };
   });
-  const front = await startFront(handler, { mode: "http", port: 0, allowedOrigins: o.origins ?? ["https://ok.example"], tools: async () => o.tools ?? TOOLS, ...(o.bindHost ? { bindHost: o.bindHost } : {}), ...(o.maxInFlight !== undefined ? { maxInFlight: o.maxInFlight } : {}), ...(o.drainTimeoutMs !== undefined ? { drainTimeoutMs: o.drainTimeoutMs } : {}) });
+  const front = await startFront(handler, { mode: "http", authenticate: (b: string) => b, port: 0, allowedOrigins: o.origins ?? ["https://ok.example"], tools: async () => o.tools ?? TOOLS, ...(o.bindHost ? { bindHost: o.bindHost } : {}), ...(o.maxInFlight !== undefined ? { maxInFlight: o.maxInFlight } : {}), ...(o.drainTimeoutMs !== undefined ? { drainTimeoutMs: o.drainTimeoutMs } : {}) });
   running.push(front);
   return { url: `http://127.0.0.1:${front.port}${MCP_ENDPOINT_PATH}`, health: `http://127.0.0.1:${front.port}${HEALTH_PATH}`, port: front.port, calls, handler };
 }
@@ -61,9 +61,9 @@ describe("front: /healthz and routing", () => {
     await expect(fetch(f.health)).rejects.toThrow();
     const h = async () => ({ content: [], isError: false });
     await expect(startFront(h, { mode: "stdio", tools: async () => [] })).rejects.toThrow(/^not implemented: front\.startFront\(stdio\)/);
-    await expect(startFront(h, { mode: "http", port: 70000, allowedOrigins: [], tools: async () => [] })).rejects.toThrow(/port/);
-    await expect(startFront(h, { mode: "http", port: 0, allowedOrigins: "x" as unknown as string[], tools: async () => [] })).rejects.toThrow(/allowedOrigins/);
-    await expect(startFront("nope" as never, { mode: "http", port: 0, allowedOrigins: [], tools: async () => [] })).rejects.toThrow(/CallHandler/);
+    await expect(startFront(h, { mode: "http", authenticate: (b: string) => b, port: 70000, allowedOrigins: [], tools: async () => [] })).rejects.toThrow(/port/);
+    await expect(startFront(h, { mode: "http", authenticate: (b: string) => b, port: 0, allowedOrigins: "x" as unknown as string[], tools: async () => [] })).rejects.toThrow(/allowedOrigins/);
+    await expect(startFront("nope" as never, { mode: "http", authenticate: (b: string) => b, port: 0, allowedOrigins: [], tools: async () => [] })).rejects.toThrow(/CallHandler/);
   });
 });
 
@@ -220,7 +220,7 @@ describe("front: exposed-name table (pin 5)", () => {
     const h = async () => ({ content: [], isError: false });
     const collide: ToolInfo[] = [{ server: "a__b", name: "c" }, { server: "a", name: "b__c" }];
     expect(() => buildExposedTable(collide)).toThrow(/collision: a__b\/c and a\/b__c both map to a__b__c/);
-    await expect(startFront(h, { mode: "http", port: 0, allowedOrigins: [], tools: async () => collide })).rejects.toThrow(/collision/);
+    await expect(startFront(h, { mode: "http", authenticate: (b: string) => b, port: 0, allowedOrigins: [], tools: async () => collide })).rejects.toThrow(/collision/);
     expect(() => buildExposedTable([{ server: "s".repeat(64), name: "t".repeat(64) }])).toThrow(/not 1-128 characters/);
     expect(() => buildExposedTable([{ server: "ok", name: "has space" }])).toThrow(/not 1-128 characters/);
     expect(() => buildExposedTable([{ server: "ok" } as ToolInfo])).toThrow(/malformed ToolInfo/);
@@ -234,7 +234,7 @@ describe("front: exposed-name table (pin 5)", () => {
     expect(() => buildExposedTable([{ server: "a", name: "search" }, { server: "b", name: "search" }], "tool")).toThrow(/collision: a\/search and b\/search both map to search/);
     expect(() => buildExposedTable(TOOLS, "raw" as never)).toThrow(/naming must be/);
     const calls: IncomingCall[] = [];
-    const front = await startFront(async (c) => { calls.push(c); return { content: [], isError: false }; }, { mode: "http", port: 0, allowedOrigins: [], naming: "tool", tools: async () => TOOLS });
+    const front = await startFront(async (c) => { calls.push(c); return { content: [], isError: false }; }, { mode: "http", authenticate: (b: string) => b, port: 0, allowedOrigins: [], naming: "tool", tools: async () => TOOLS });
     running.push(front);
     const url = `http://127.0.0.1:${front.port}${MCP_ENDPOINT_PATH}`;
     expect(((await mcpCall(url, KEY, "tools/list"))["tools"] as { name: string }[]).map((t) => t.name)).toEqual(["a.b-c_D", "echo", "wipe"]);
@@ -303,7 +303,7 @@ describe("front F10: bounded admission of tools/call", () => {
     const boom = await start({ maxInFlight: 1, result: new Error("x") });
     expect((await mcpPost({ url: boom.url, token: KEY, method: "tools/call", params: { name: "demo__echo", arguments: {} } })).status).toBe(500);
     expect((await mcpPost({ url: boom.url, token: KEY, method: "tools/call", params: { name: "demo__echo", arguments: {} } })).status).toBe(500); // slot released after the throw
-    await expect(startFront(async () => ({ content: [], isError: false }), { mode: "http", port: 0, allowedOrigins: [], tools: async () => [], maxInFlight: 0 })).rejects.toThrow(/maxInFlight/);
+    await expect(startFront(async () => ({ content: [], isError: false }), { mode: "http", authenticate: (b: string) => b, port: 0, allowedOrigins: [], tools: async () => [], maxInFlight: 0 })).rejects.toThrow(/maxInFlight/);
   });
 });
 
