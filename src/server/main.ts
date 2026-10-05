@@ -294,9 +294,13 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env, override
       deps.log(line);
     }
   };
-  // 8. front
+  // 8. front. ADR-018 §1: the front authenticates every request through the same identity hash lookup BEFORE reading a
+  // body or answering any method; the pipeline re-resolves per call (defense in depth).
+  const authenticateBearer = async (bearer: string): Promise<string | undefined> => {
+    try { return await identity.resolveAgent({ kind: "api_key", value: bearer }); } catch { return undefined; }
+  };
   let front: RunningFront;
-  try { front = await startFront(handler, withTls({ mode: "http", port, bindHost, allowedOrigins, maxInFlight, drainTimeoutMs: SHUTDOWN_DRAIN_MS, tools: () => upstream.listTools() }, tls)); }
+  try { front = await startFront(handler, withTls({ mode: "http", port, bindHost, allowedOrigins, maxInFlight, drainTimeoutMs: SHUTDOWN_DRAIN_MS, tools: () => upstream.listTools(), authenticate: authenticateBearer }, tls)); }
   catch (e) {
     if (approvals.kind === "slack") await slack.closeSlackApprovals().catch(() => undefined);
     await upstream.close().catch(() => undefined); return refuse(`front: ${message(e)}`);

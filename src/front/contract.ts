@@ -35,7 +35,22 @@ export interface HttpFrontOptions extends FrontBase {
   maxInFlight?: number;
   /** Additive (fix round, F3): how long `stop()` waits for admitted invocations to settle before cutting their connections. Default DEFAULT_DRAIN_TIMEOUT_MS. */
   drainTimeoutMs?: number;
+  /**
+   * ADR-018 §1 (required for HTTP): resolves a presented bearer to an agent id, or `undefined` when unknown. The
+   * composition root wires IdentityService's hash lookup. It runs BEFORE the body is read and before ANY method is
+   * answered (tools/list, server/discover, legacy initialize, tools/call, DELETE); unknown or a throw → 401 without
+   * echoing anything. The pipeline still re-resolves identity per call (defense in depth).
+   */
+  authenticate: FrontAuthenticate;
+  /** ADR-018 §1: open TCP/TLS connections accepted (node `server.maxConnections`); further connections are dropped. Default DEFAULT_MAX_CONNECTIONS. */
+  maxConnections?: number;
+  /** ADR-018 §2: requests one agent may have in progress at once (from authentication to response, so body reads and tools/call both count); over it → 503. Default DEFAULT_MAX_IN_FLIGHT_PER_AGENT. */
+  maxInFlightPerAgent?: number;
+  /** ADR-018 §1 (slowloris): an authenticated request body must arrive completely within this; else 408 and the connection is cut. Default DEFAULT_BODY_TIMEOUT_MS. */
+  bodyTimeoutMs?: number;
 }
+/** ADR-018 §1: bearer → agentId, or undefined when unknown. A throw counts as unknown. */
+export type FrontAuthenticate = (bearer: string) => Promise<string | undefined> | string | undefined;
 export type FrontOptions = StdioFrontOptions | HttpFrontOptions;
 export const FRONT_LEGACY_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26"] as const;
 export const FRONT_MAX_LEGACY_SESSIONS = 1024;
@@ -45,6 +60,13 @@ export const DEFAULT_BIND_HOST = "127.0.0.1";
 export const DEFAULT_PORT = 8787;
 export const DEFAULT_MAX_IN_FLIGHT = 64;
 export const DEFAULT_DRAIN_TIMEOUT_MS = 5_000;
+/** ADR-018 defaults. Unauthenticated connections hold at most headers (node's 16 KiB cap) for HEADERS_TIMEOUT_MS. */
+export const DEFAULT_MAX_CONNECTIONS = 256;
+export const DEFAULT_MAX_IN_FLIGHT_PER_AGENT = 16;
+export const DEFAULT_BODY_TIMEOUT_MS = 10_000;
+export const HEADERS_TIMEOUT_MS = 10_000;
+/** After a refusal (401, 408), how long the connection may linger so the client can read the answer before it is cut. */
+export const REFUSED_LINGER_MS = 1_000;
 
 /**
  * `port` is the port actually bound (Slice 2a: tests bind 127.0.0.1:0, so the caller must be able to read it; the server
@@ -137,6 +159,14 @@ export function createFrontServer(handler: CallHandler, opts: FrontOptions): Ser
   const drainTimeoutMs = opts.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS;
   if (!Number.isInteger(drainTimeoutMs) || drainTimeoutMs < 0 || drainTimeoutMs > 600_000) throw new Error("front: drainTimeoutMs must be an integer 0-600000");
   if (typeof opts.tools !== "function") throw new Error("front: tools() is required");
+  if (typeof opts.authenticate !== "function") throw new Error("front: authenticate(bearer) is required (ADR-018: the front authenticates first)");
+  const authenticate = opts.authenticate;
+  const maxConnections = opts.maxConnections ?? DEFAULT_MAX_CONNECTIONS;
+  if (!Number.isInteger(maxConnections) || maxConnections < 1 || maxConnections > 100_000) throw new Error("front: maxConnections must be an integer 1-100000");
+  const maxPerAgent = opts.maxInFlightPerAgent ?? DEFAULT_MAX_IN_FLIGHT_PER_AGENT;
+  if (!Number.isInteger(maxPerAgent) || maxPerAgent < 1 || maxPerAgent > 100_000) throw new Error("front: maxInFlightPerAgent must be an integer 1-100000");
+  const bodyTimeoutMs = opts.bodyTimeoutMs ?? DEFAULT_BODY_TIMEOUT_MS;
+  if (!Number.isInteger(bodyTimeoutMs) || bodyTimeoutMs < 1 || bodyTimeoutMs > 600_000) throw new Error("front: bodyTimeoutMs must be an integer 1-600000");
   const allowed = new Set(opts.allowedOrigins);
   const serverInfo = { name: SERVER_NAME, version: packageVersion };
   let table: Map<string, ExposedTool>;
@@ -157,7 +187,12 @@ export function createFrontServer(handler: CallHandler, opts: FrontOptions): Ser
   const inflight = new Set<Promise<void>>(); // admitted tools/call invocations (F10 bound, F3 drain)
   let stopping = false;
   let admitted = 0;
-  const sessions = new Map<string, { tokenHash: Buffer; version: string; touched: number }>();
+  const sessions = new Map<string, { tokenHash: Buffer; agentId: string; version: string; touched: number }>();
+  const activeByAgent = new Map<string, number>(); // ADR-018 §2: requests in progress per authenticated agent
+  /** ADR-018 §1: the agent id for a bearer, or undefined (unknown, malformed result, or a throw). */
+  const resolveBearer = async (token: string): Promise<string | undefined> => {
+    try { const id = await authenticate(token); return typeof id === "string" && id.length > 0 ? id : undefined; } catch { return undefined; }
+  };
   const expire = () => { const now = Date.now(); for (const [id, session] of sessions) if (now - session.touched >= FRONT_LEGACY_SESSION_IDLE_MS) sessions.delete(id); };
   const ownedSession = (id: string | undefined, token: string) => {
     expire(); const session = id === undefined ? undefined : sessions.get(id);
@@ -165,11 +200,13 @@ export function createFrontServer(handler: CallHandler, opts: FrontOptions): Ser
   };
 
   const listener = (req: IncomingMessage, res: ServerResponse) => { void route(req, res).catch(() => { if (!res.headersSent) sendJson(res, 500, rpcError(null, JSONRPC_INTERNAL_ERROR, "internal error")); else res.destroy(); }); };
-  const server = opts.tls ? createHttpsServer({ ...opts.tls, minVersion: "TLSv1.2" }, listener) : createServer(listener);
+  // connectionsCheckingInterval: how often node enforces headersTimeout/requestTimeout (default 30 s is too coarse for a slowloris bound)
+  const server = opts.tls ? createHttpsServer({ ...opts.tls, minVersion: "TLSv1.2", connectionsCheckingInterval: 1_000 }, listener) : createServer({ connectionsCheckingInterval: 1_000 }, listener);
+  server.maxConnections = maxConnections;
   const originalClose = server.close.bind(server);
   server.close = ((callback?: (err?: Error) => void) => { stopping = true; sessions.clear(); return originalClose(callback); }) as typeof server.close;
-  server.requestTimeout = 120_000;
-  server.headersTimeout = 30_000;
+  server.headersTimeout = HEADERS_TIMEOUT_MS;
+  server.requestTimeout = Math.max(HEADERS_TIMEOUT_MS, bodyTimeoutMs) + HEADERS_TIMEOUT_MS; // backstop; readBody enforces bodyTimeoutMs itself
 
   async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     await ready;
@@ -185,8 +222,9 @@ export function createFrontServer(handler: CallHandler, opts: FrontOptions): Ser
       if (origin !== undefined && !allowed.has(origin)) { drain(req); sendJson(res, 403, rpcError(undefined, JSONRPC_INVALID_REQUEST, "Origin not allowed")); return; }
       const auth = req.headers.authorization;
       const match = typeof auth === "string" ? BEARER_RE.exec(auth) : null;
+      if (!match || (await resolveBearer(match[1]!)) === undefined) { unauthorized(req, res); return; }
       const id = header(req, "mcp-session-id");
-      if (!stopping && match && ownedSession(id, match[1]!)) { sessions.delete(id!); res.writeHead(204); res.end(); drain(req); return; }
+      if (!stopping && ownedSession(id, match[1]!)) { sessions.delete(id!); res.writeHead(204); res.end(); drain(req); return; }
       res.writeHead(405, { allow: "POST" }); res.end(); drain(req); return;
     }
     if (req.method !== "POST") { res.writeHead(405, { allow: "POST" }); res.end(); req.resume(); return; }
@@ -195,13 +233,25 @@ export function createFrontServer(handler: CallHandler, opts: FrontOptions): Ser
     if (origin !== undefined && !allowed.has(origin)) { drain(req); sendJson(res, 403, rpcError(undefined, JSONRPC_INVALID_REQUEST, "Origin not allowed")); return; }
     const auth = req.headers.authorization;
     const m = typeof auth === "string" ? BEARER_RE.exec(auth) : null;
-    if (!m) { drain(req); res.setHeader("www-authenticate", `Bearer realm="${SERVER_NAME}"`); sendJson(res, 401, rpcError(undefined, JSONRPC_INVALID_REQUEST, "unauthorized: a bearer token is required")); return; }
+    if (!m) { unauthorized(req, res); return; }
     const token = m[1]!;
+    // ADR-018 §1: authenticate BEFORE the body is read and before any method is answered.
+    const agentId = await resolveBearer(token);
+    if (agentId === undefined) { unauthorized(req, res); return; }
+    // ADR-018 §2: per-agent requests in progress (body read through response).
+    const active = activeByAgent.get(agentId) ?? 0;
+    if (active >= maxPerAgent) { drain(req); res.setHeader("retry-after", "1"); res.setHeader("connection", "close"); sendJson(res, 503, rpcError(undefined, JSONRPC_OVERLOADED, "overloaded: too many requests in flight for this agent")); return; }
+    activeByAgent.set(agentId, active + 1);
+    try { await routeAuthenticated(req, res, token, agentId); }
+    finally { const n = (activeByAgent.get(agentId) ?? 1) - 1; if (n <= 0) activeByAgent.delete(agentId); else activeByAgent.set(agentId, n); }
+  }
+
+  async function routeAuthenticated(req: IncomingMessage, res: ServerResponse, token: string, agentId: string): Promise<void> {
     const declared = Number(req.headers["content-length"] ?? "0");
     if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) { tooLarge(req, res); return; }
     const ct = (req.headers["content-type"] ?? "").split(";")[0]!.trim().toLowerCase();
     if (ct !== "application/json") { drain(req); sendJson(res, 415, rpcError(undefined, JSONRPC_INVALID_REQUEST, "Content-Type must be application/json")); return; }
-    const raw = await readBody(req, res);
+    const raw = await readBody(req, res, bodyTimeoutMs);
     if (raw === undefined) return; // 413 already sent
     if (stopping) { sendJson(res, 503, rpcError(undefined, JSONRPC_OVERLOADED, "shutting down")); return; }
     let msg: unknown;
@@ -247,12 +297,14 @@ export function createFrontServer(handler: CallHandler, opts: FrontOptions): Ser
       if (isNotification || typeof p["protocolVersion"] !== "string" || !isRecord(p["capabilities"])) { fail(400, JSONRPC_INVALID_PARAMS, "initialize requires protocolVersion and capabilities"); return; }
       expire();
       const tokenHash = createHash("sha256").update(token).digest();
+      // ADR-018: sessions are capped per authenticated AGENT; an agent only ever evicts its own least recently used one.
       let ownCount = 0, oldestOwned: string | undefined;
-      for (const [id, session] of sessions) if (timingSafeEqual(session.tokenHash, tokenHash)) { ownCount++; oldestOwned ??= id; }
+      for (const [id, session] of sessions) if (session.agentId === agentId) { ownCount++; oldestOwned ??= id; }
       if (ownCount >= FRONT_MAX_LEGACY_SESSIONS_PER_BEARER) sessions.delete(oldestOwned!);
-      if (sessions.size >= FRONT_MAX_LEGACY_SESSIONS) sessions.delete(sessions.keys().next().value!);
+      // Global capacity never evicts another agent's session: refuse instead (only authenticated agents get here).
+      if (sessions.size >= FRONT_MAX_LEGACY_SESSIONS) { res.setHeader("retry-after", "1"); fail(503, JSONRPC_OVERLOADED, "overloaded: legacy session capacity reached"); return; }
       const version = (FRONT_LEGACY_VERSIONS as readonly string[]).includes(p["protocolVersion"]) ? p["protocolVersion"] : FRONT_LEGACY_VERSIONS[0];
-      const id = randomUUID(); sessions.set(id, { tokenHash, version, touched: Date.now() });
+      const id = randomUUID(); sessions.set(id, { tokenHash, agentId, version, touched: Date.now() });
       res.setHeader("Mcp-Session-Id", id);
       sendJson(res, 200, { jsonrpc: "2.0", id: rid, result: { protocolVersion: version, capabilities: { tools: {} }, serverInfo, instructions: DISCOVER_INSTRUCTIONS } }); return;
     }
@@ -403,6 +455,22 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(text);
 }
 function drain(req: IncomingMessage): void { req.resume(); }
+/**
+ * ADR-018 §1: 401 without echo. The body is never buffered: the connection is marked close, the remaining bytes are
+ * discarded, and the socket is cut after REFUSED_LINGER_MS whatever the client is still sending.
+ */
+function unauthorized(req: IncomingMessage, res: ServerResponse): void {
+  res.setHeader("www-authenticate", `Bearer realm="${SERVER_NAME}"`);
+  res.setHeader("connection", "close");
+  sendJson(res, 401, rpcError(undefined, JSONRPC_INVALID_REQUEST, "unauthorized"));
+  cutSoon(req);
+}
+function cutSoon(req: IncomingMessage): void {
+  req.on("error", () => undefined);
+  req.resume();
+  const t = setTimeout(() => req.socket.destroy(), REFUSED_LINGER_MS); t.unref();
+  req.socket.once("close", () => clearTimeout(t));
+}
 /** Over this, an oversized request is cut instead of drained (draining exists so the client reads the 413 rather than EPIPE). */
 export const DRAIN_LIMIT_BYTES = 16 * 1024 * 1024;
 function tooLarge(req: IncomingMessage, res: ServerResponse): void {
@@ -417,18 +485,23 @@ function tooLarge(req: IncomingMessage, res: ServerResponse): void {
   req.on("error", () => { clearTimeout(timer); res.destroy(); });
   req.resume();
 }
-/** Reads at most MAX_BODY_BYTES; over that, answers 413 and resolves undefined. */
-function readBody(req: IncomingMessage, res: ServerResponse): Promise<string | undefined> {
+/** Reads at most MAX_BODY_BYTES within `timeoutMs`; over the size, answers 413; past the deadline, 408 and cut (ADR-018 slowloris). Both resolve undefined. */
+function readBody(req: IncomingMessage, res: ServerResponse, timeoutMs: number): Promise<string | undefined> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = []; let size = 0; let done = false;
+    const timer = setTimeout(() => {
+      if (done) return; done = true; chunks.length = 0;
+      res.setHeader("connection", "close"); sendJson(res, 408, rpcError(undefined, JSONRPC_INVALID_REQUEST, "request body timeout")); cutSoon(req); resolve(undefined);
+    }, timeoutMs);
+    timer.unref();
     req.on("data", (c: Buffer) => {
       if (done) return;
       size += c.length;
-      if (size > MAX_BODY_BYTES) { done = true; tooLarge(req, res); resolve(undefined); return; }
+      if (size > MAX_BODY_BYTES) { done = true; clearTimeout(timer); chunks.length = 0; tooLarge(req, res); resolve(undefined); return; }
       chunks.push(c);
     });
-    req.on("end", () => { if (!done) { done = true; resolve(Buffer.concat(chunks).toString("utf8")); } });
-    req.on("error", () => { if (!done) { done = true; res.destroy(); resolve(undefined); } });
+    req.on("end", () => { clearTimeout(timer); if (!done) { done = true; resolve(Buffer.concat(chunks).toString("utf8")); } });
+    req.on("error", () => { clearTimeout(timer); if (!done) { done = true; res.destroy(); resolve(undefined); } });
   });
 }
 

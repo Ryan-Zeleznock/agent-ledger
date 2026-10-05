@@ -12,7 +12,7 @@ const rpc = (method: string, params: unknown = {}, id: unknown = 1) => ({ jsonrp
 const modern = (method: string, params: Record<string, unknown> = {}) => ({ headers: { ...auth, 'mcp-protocol-version': '2026-07-28', 'mcp-method': method, ...(method === 'tools/call' ? { 'mcp-name': String(params.name) } : {}) }, body: rpc(method, { ...params, _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28', 'io.modelcontextprotocol/clientCapabilities': {} } }) });
 async function initialize(version = '2025-11-25', bearer = 'agent-one') { return inprocRequest(server, { headers: { authorization: `Bearer ${bearer}` }, body: rpc('initialize', { protocolVersion: version, capabilities: {}, clientInfo: { name: 'test', version: '1' } }) }); }
 const sessionRequest = (id: string, method: string, params: Record<string, unknown> = {}, version: string | undefined = '2025-11-25') => inprocRequest(server, { headers: { ...auth, 'mcp-session-id': id, ...(version ? { 'mcp-protocol-version': version } : {}) }, body: rpc(method, params) });
-beforeEach(() => { handler = vi.fn(async (_call: IncomingCall) => ({ content: [{ type: 'text', text: 'ok' }], isError: false })); server = front.createFrontServer(handler, { mode: 'http', allowedOrigins: [], tools: async () => tools }); });
+beforeEach(() => { handler = vi.fn(async (_call: IncomingCall) => ({ content: [{ type: 'text', text: 'ok' }], isError: false })); server = front.createFrontServer(handler, { mode: 'http', authenticate: (b: string) => b, allowedOrigins: [], tools: async () => tools }); });
 afterEach(() => { server.close(); server.closeAllConnections(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 describe('legacy and modern front on one endpoint', () => {
   it.each(['2025-11-25','2025-06-18','2025-03-26','2024-11-05'])('negotiates %s with a CSPRNG session', async version => {
@@ -59,12 +59,19 @@ describe('legacy and modern front on one endpoint', () => {
     clock.mockReturnValue(1000 + front.FRONT_LEGACY_SESSION_IDLE_MS); expect((await sessionRequest(sid, 'ping')).status).toBe(404);
     expect((await initialize()).status).toBe(200);
   });
-  it('P2-5 evicts global LRU sessions so 1024 garbage bearers cannot lock out a real agent', async () => {
-    const oldest = (await initialize('2025-11-25', 'garbage-first')).headers.get('mcp-session-id')!;
-    for (let n = 1; n < front.FRONT_MAX_LEGACY_SESSIONS; n++) expect((await initialize('2025-11-25', `garbage-${n}`)).status).toBe(200);
+  it('ADR-018: at global capacity a new agent gets 503 and no other agent\u2019s session is evicted', async () => {
+    const oldest = (await initialize('2025-11-25', 'agent-first')).headers.get('mcp-session-id')!;
+    for (let n = 1; n < front.FRONT_MAX_LEGACY_SESSIONS - 1; n++) expect((await initialize('2025-11-25', `agent-${n}`)).status).toBe(200);
     const r = await initialize(); expect(r.status).toBe(200);
+    const refused = await initialize('2025-11-25', 'agent-late'); expect(refused.status).toBe(503); expect(refused.body.error.code).toBe(front.JSONRPC_OVERLOADED);
     expect((await sessionRequest(r.headers.get('mcp-session-id')!, 'ping')).status).toBe(200);
-    expect((await inprocRequest(server, { headers: { authorization: 'Bearer garbage-first', 'mcp-session-id': oldest, 'mcp-protocol-version': '2025-11-25' }, body: rpc('ping') })).status).toBe(404);
+    expect((await inprocRequest(server, { headers: { authorization: 'Bearer agent-first', 'mcp-session-id': oldest, 'mcp-protocol-version': '2025-11-25' }, body: rpc('ping') })).status).toBe(200);
+  });
+  it('ADR-018 probe: 1024 initializes with unknown bearers are all 401 and cannot evict a real agent\u2019s session', async () => {
+    server.close(); server = front.createFrontServer(handler, { mode: 'http', authenticate: (b: string) => (b === 'agent-one' ? 'agent-one' : undefined), allowedOrigins: [], tools: async () => tools });
+    const sid = (await initialize()).headers.get('mcp-session-id')!;
+    for (let n = 0; n < front.FRONT_MAX_LEGACY_SESSIONS; n++) { const r = await initialize('2025-11-25', `attacker${n}`); expect(r.status).toBe(401); expect(r.headers.has('mcp-session-id')).toBe(false); }
+    expect((await sessionRequest(sid, 'tools/list')).status).toBe(200);
   });
   it('P2-5 enforces a 32-session per-bearer cap by evicting that bearer’s least recently used session', async () => {
     const ids: string[] = [];
@@ -106,7 +113,7 @@ describe('TLS and front P2s', () => {
   it.each(['default','example','examples','const','enum'])('ignores annotation-like data in %s', key => { expect(front.buildExposedTable([{ server: 'demo', name: 'data', inputSchema: { [key]: { 'x-mcp-header': 'data' } } }]).size).toBe(1); });
   it('serves HTTPS over duplexPair with TLS >= 1.2 and the same health and MCP routes', async () => {
     server.close(); const cert = readFileSync(new URL('./fixtures/tls/test-cert.pem', import.meta.url)), key = readFileSync(new URL('./fixtures/tls/test-key.pem', import.meta.url));
-    server = front.createFrontServer(handler, { mode: 'http', allowedOrigins: [], tools: async () => tools, tls: { cert, key } });
+    server = front.createFrontServer(handler, { mode: 'http', authenticate: (b: string) => b, allowedOrigins: [], tools: async () => tools, tls: { cert, key } });
     const health = openInprocRequest(server, { method: 'GET', path: '/healthz', tls: { ca: cert } }); expect((await health.response).body).toEqual({ ok: true }); expect(health.protocol).toMatch(/^TLSv1\.[23]$/);
     const r = await inprocRequest(server, { ...modern('tools/list'), tls: { ca: cert, minVersion: 'TLSv1.2', maxVersion: 'TLSv1.2' } }); expect(r.status).toBe(200);
   });
@@ -117,7 +124,7 @@ describe('front admission and shutdown', () => {
   it('P2-4 bounds running handlers across eras even when the client disconnects', async () => {
     server.close(); let release!: () => void; const gate = new Promise<void>(r => { release = r; });
     handler.mockImplementationOnce(async () => { await gate; return { content: [], isError: false }; });
-    server = front.createFrontServer(handler, { mode: 'http', allowedOrigins: [], tools: async () => tools, maxInFlight: 1 });
+    server = front.createFrontServer(handler, { mode: 'http', authenticate: (b: string) => b, allowedOrigins: [], tools: async () => tools, maxInFlight: 1 });
     const sid = (await initialize()).headers.get('mcp-session-id')!;
     const request = openInprocRequest(server, modern('tools/call', { name: 'demo__echo' }));
     const disconnected = request.response.catch(() => undefined); await turn(); expect(handler).toHaveBeenCalledOnce();
@@ -133,7 +140,7 @@ describe('front admission and shutdown', () => {
       server = this; const callback = args.at(-1); if (typeof callback === 'function') queueMicrotask(() => callback()); return this;
     } as Server['listen']);
     handler.mockImplementationOnce(async () => { await gate; return { content: [], isError: false }; });
-    const running = await front.startFront(handler, { mode: 'http', port: 0, allowedOrigins: [], tools: async () => tools });
+    const running = await front.startFront(handler, { mode: 'http', authenticate: (b: string) => b, port: 0, allowedOrigins: [], tools: async () => tools });
     expect(listen).toHaveBeenCalledWith(0, '127.0.0.1', expect.any(Function));
     const request = inprocRequest(server, modern('tools/call', { name: 'demo__echo' })); await turn();
     const stopped = running.stop();
@@ -187,14 +194,14 @@ describe('front transport boundary regressions', () => {
   });
   it('validates the exposed table before startFront can listen', async () => {
     const listen = vi.spyOn(Server.prototype, 'listen');
-    await expect(front.startFront(handler, { mode: 'http', allowedOrigins: [], tools: async () => [{ server: 'a__b', name: 'c' }, { server: 'a', name: 'b__c' }] })).rejects.toThrow('collision');
+    await expect(front.startFront(handler, { mode: 'http', authenticate: (b: string) => b, allowedOrigins: [], tools: async () => [{ server: 'a__b', name: 'c' }, { server: 'a', name: 'b__c' }] })).rejects.toThrow('collision');
     expect(listen).not.toHaveBeenCalled();
   });
   it('uses TLSv1.2 as the configured minimum and refuses invalid TLS material before listening', () => {
     server.close(); const cert = readFileSync(new URL('./fixtures/tls/test-cert.pem', import.meta.url)), key = readFileSync(new URL('./fixtures/tls/test-key.pem', import.meta.url));
-    server = front.createFrontServer(handler, { mode: 'http', allowedOrigins: [], tools: async () => [], tls: { cert, key } });
+    server = front.createFrontServer(handler, { mode: 'http', authenticate: (b: string) => b, allowedOrigins: [], tools: async () => [], tls: { cert, key } });
     expect((server as unknown as { minVersion: string }).minVersion).toBe('TLSv1.2');
-    expect(() => front.createFrontServer(handler, { mode: 'http', allowedOrigins: [], tools: async () => [], tls: { cert: Buffer.from('bad'), key } })).toThrow();
+    expect(() => front.createFrontServer(handler, { mode: 'http', authenticate: (b: string) => b, allowedOrigins: [], tools: async () => [], tls: { cert: Buffer.from('bad'), key } })).toThrow();
   });
 });
 
@@ -217,7 +224,7 @@ describe('Fable review legacy protocol and TLS regressions', () => {
   });
   it.each([null, {}, { cert: Buffer.alloc(0), key: Buffer.alloc(0) }, { cert: 'text', key: 'text' }, { cert: Buffer.from('cert') }, { key: Buffer.from('key') }])('P3-6 rejects malformed TLS options before construction: %j', tls => {
     const provider = vi.fn(async () => tools);
-    expect(() => front.createFrontServer(handler, { mode: 'http', allowedOrigins: [], tools: provider, tls: tls as never })).toThrow(/tls.*cert.*key/i);
+    expect(() => front.createFrontServer(handler, { mode: 'http', authenticate: (b: string) => b, allowedOrigins: [], tools: provider, tls: tls as never })).toThrow(/tls.*cert.*key/i);
     expect(provider).not.toHaveBeenCalled();
   });
 });

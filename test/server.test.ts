@@ -131,16 +131,18 @@ describe("server root: start, serve, record, log, stop (pin 8)", () => {
     expect(calls.map((x) => x["status"])).toEqual(["blocked", "blocked"]);
     expect(await createLedger("jsonl", l.ledgerPath).verify()).toEqual({ ok: true, checked: 4 });
   });
-  it("a wrong key is denied by identity with no record and a log line without agentId; the agent's key is NOT the upstream's credential (direct call → unauthorized)", async () => {
+  it("ADR-018: a wrong key gets 401 at the front (tools/call, tools/list, discover) with no record and no call line; the agent's key is NOT the upstream's credential (direct → 401)", async () => {
     const l = await lab();
     const { url, log } = await up(l);
-    const r = await mcpCall(url, "not-the-key", "tools/call", { name: "demo__echo", arguments: { message: "x" } });
-    expect(r["isError"]).toBe(true); expect(toolText(r)).toMatch(/unknown agent/);
+    for (const method of ["tools/call", "tools/list", "server/discover"]) {
+      const r = await mcpPost({ url, token: "not-the-key", method, params: method === "tools/call" ? { name: "demo__echo", arguments: { message: "x" } } : {} });
+      expect(r.status).toBe(401); expect(r.text).not.toContain("not-the-key"); expect(r.text).not.toContain("demo__");
+    }
     expect(records(l)).toEqual([]);
-    const line = log.find((x) => x["callId"] !== undefined)!;
-    expect(line).toMatchObject({ server: "demo", tool: "echo", status: "denied" }); expect(line["agentId"]).toBeUndefined(); expect(line["verdict"]).toBeUndefined();
-    const direct = await mcpCall(l.demoUrl, KEY, "tools/call", { name: "echo", arguments: { message: "x" } });
-    expect(direct).toMatchObject({ isError: true }); expect(toolText(direct)).toBe(DEMO_UNAUTHORIZED_TEXT);
+    expect(log.find((x) => x["callId"] !== undefined)).toBeUndefined();
+    const direct = await mcpPost({ url: l.demoUrl, token: KEY, method: "tools/call", params: { name: "echo", arguments: { message: "x" } } });
+    expect(direct.status).toBe(401);
+    expect((await mcpPost({ url: l.demoUrl, token: KEY, method: "tools/list" })).status).toBe(401);
     expect(toolText(await mcpCall(l.demoUrl, T, "tools/call", { name: "echo", arguments: { message: "x" } }))).toBe("x");
     leakFree(JSON.stringify(log), l);
   });
@@ -256,14 +258,16 @@ describe("smoke client (pin 8), in process against the root + demo upstream", ()
       expect(code).toBe(1); expect(lines.at(-1)).toBe("SMOKE FAIL demo__wipe denied: no channel"); expect(lines.at(-2)).toMatch(/^FAIL demo__wipe denied: no channel: Error: isError=true blocks=1 textBytes=\d+$/); // value-free (F1)
     } else {
       expect(code).toBe(0); expect(lines.at(-1)).toBe("SMOKE PASS");
-      expect(lines.filter((x) => x.startsWith("ok ")).length).toBe(13);
-      expect(lines).toContain("ok upstream direct, no token → 401");
-      expect(lines).toContain("ok upstream direct, the agent's key → unauthorized (the proxy key is not the upstream's credential)");
+      expect(lines.filter((x) => x.startsWith("ok ")).length).toBe(15);
+      expect(lines).toContain("ok upstream direct, no bearer → 401");
+      expect(lines).toContain("ok upstream direct, the agent's key → 401 on tools/call (the proxy key is not the upstream's credential)");
+      expect(lines).toContain("ok upstream direct, the agent's key → 401 on tools/list (no upstream tool inventory)");
+      expect(lines).toContain("ok wrong key → 401 on tools/call (unknown agent, not executed)");
+      expect(lines).toContain("ok wrong key → 401 on tools/list (no tool inventory)");
     }
     const wrong: string[] = [];
     expect(await runSmoke({ url, key: "not-the-key" }, (s) => wrong.push(s))).toBe(1);
-    expect(wrong.slice(0, 2)).toEqual(["ok discover lists 2026-07-28", "ok tools/list contains the five demo tools, sorted overall"]);
-    expect(wrong.at(-1)).toBe("SMOKE FAIL demo__echo ok");
+    expect(wrong.at(-1)).toBe("SMOKE FAIL discover lists 2026-07-28"); // ADR-018: an unknown key is refused before any method
     expect(l.demoLog.filter((x) => x["event"] === "call" && x["tool"] === "wipe")).toEqual([]);
     const d = tmp(); const keyFile = join(d, "api-key"); write(keyFile, `${KEY}\n`, 0o644);
     expect(parseSmokeArgs(["--url", url, "--key-file", keyFile, "--expect-upstream-401", l.demoUrl])).toEqual({ url, key: KEY, upstreamUrl: l.demoUrl });
