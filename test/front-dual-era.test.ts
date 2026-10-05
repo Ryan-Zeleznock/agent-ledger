@@ -103,7 +103,7 @@ describe('legacy and modern front on one endpoint', () => {
   });
   it('bridges our legacy upstream client through the actual front parser to the demo handler', async () => {
     vi.stubGlobal('fetch', frontFetch(server, true));
-    const up = await connectUpstreams([{ name: 'proxy', transport: 'http', url: 'http://inproc/mcp' }], { get: async () => ({ bearerToken: 'agent-one' }) });
+    const up = await connectUpstreams([{ name: 'proxy', transport: 'http', url: 'http://inproc/mcp', insecure: true }], { get: async () => ({ bearerToken: 'agent-one' }) });
     try { expect(up.eras).toEqual({ proxy: 'legacy' }); expect((await up.execute({ callId: 'outer', agentId: 'a', sessionId: 's', server: 'proxy', tool: 'demo__echo', args: { message: 'hello' }, receivedAt: new Date().toISOString() })).isError).toBe(false); expect(handler).toHaveBeenCalledOnce(); }
     finally { await up.close(); }
   });
