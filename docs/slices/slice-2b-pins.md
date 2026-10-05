@@ -580,3 +580,9 @@ to upstreams; ADR-014 execution isolation (Slice 3 candidate).
   `test/fixtures/tls/` (test-only self-signed pair, marked as such) before Astra starts.
 - **Package A is wide** (three modules). If it runs long, the coordinator may move the dual-era FRONT (pin 3, legacy
   part) to 2c: nothing in priorities 1-2 depends on it except Codex-through-proxy (12c, optional).
+
+## Amendment (coordinator, 2026-10-05)
+- Approver display names moved up from 2c (ADR-015 amendment accepted by Ryan 2026-10-05): bot scope `users:read`,
+  best-effort `users.info` after the decision settles, optional `ApprovalResult.approverName`; the member id stays the
+  identity checked against the allowlist. Legacy session recovery also matches the id-less 400 that server-everything
+  2026.8.31 returns. Lines above that defer names to 2c are superseded by this note.

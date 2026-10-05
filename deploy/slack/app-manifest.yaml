@@ -4,7 +4,7 @@
 # interactivity.request_url is optional and NOT set (Socket Mode delivers the clicks).
 # Do NOT reuse this app for anything else: Slack sends each interactive payload to ANY open Socket Mode connection of the
 # app, so a second consumer silently eats approval clicks (they become timeouts: denied, but the demo looks broken).
-# Tokens after install: Bot User OAuth Token (xoxb-, scope chat:write) and an App-Level Token with connections:write
+# Tokens after install: Bot User OAuth Token (xoxb-, scopes chat:write + users:read) and an App-Level Token with connections:write
 # (xapp-). Both go into files under ~/agent-ledger-lab/.secrets/ (0600), never a shell command line or the vault.
 _metadata:
   major_version: 1
@@ -17,10 +17,11 @@ features:
     always_online: false
 oauth_config:
   scopes:
-    # chat:write only: the bot is /invited to one private channel, so chat:write.public is not needed. chat.postMessage,
-    # chat.update and chat.postEphemeral all need chat:write; auth.test needs no scope.
+    # The bot is /invited to one private channel, so chat:write.public is not needed. chat.postMessage,
+    # chat.update and chat.postEphemeral need chat:write; users.info needs users:read (ADR-015 amendment).
     bot:
       - chat:write
+      - users:read
 settings:
   socket_mode_enabled: true
   interactivity:

@@ -71,7 +71,7 @@ it("finds exactly the session without a heartbeat, never a pre-1c record; heartb
   const monitoring = section(p.html, "cc7-2");
   expect(monitoring).toContain("Sessions without heartbeat (1)");
   expect(monitoring).toMatch(/missing-session<\/td><td>rec-3<\/td><td>2/);
-  expect(p.html).toContain("pre-1c, no agent session id");
+  expect(p.html).toContain("not recorded (server mode or pre-1c)");
   expect(section(p.html, "cc6-1")).not.toContain("SessionStart");
   expect(section(p.html, "cc8-1")).not.toContain("SessionStart");
   expect(p.html).toContain("Intents with no outcome observed (4)");
@@ -427,4 +427,44 @@ it('filed instrument: only approved named humans receive a stamp; exceptions ret
   const anonymous = await pack([unnamed, delegated, timeout, blank]);
   expect(anonymous.html).not.toContain('/* human-approval-mark */');
   expect(anonymous.pdf).not.toContain('0.4784 0.1216 0.1686 rg');
+});
+
+
+it("labels absent agent sessions conservatively in HTML/PDF/CSV without guessing from MCP names", async () => {
+  const proxy = rec(1); proxy.call.server = "everything"; proxy.call.tool = "echo";
+  const oldHook = rec(2); oldHook.call.server = "builtin:claude-code";
+  const hook = rec(3, "recorded-agent-session");
+  const p = await pack([proxy, oldHook, hook]);
+  for (const output of [p.html, p.pdfText.replace(/\s+/g, " "), p.csv]) {
+    expect(output).toContain("not recorded (server mode or pre-1c)");
+    expect(output).not.toContain("pre-1c, no agent session id");
+    expect(output).toContain("recorded-agent-session");
+  }
+  expect(section(p.html, "legend")).toContain("Records have no deployment-mode discriminator");
+  expect(p.csv.split("\n")[0]!.split(",")).toHaveLength(28);
+  expect(section(p.html, "cc6-1")).not.toContain("not applicable (server mode)");
+});
+
+it('renders the approver name with the stable member id and keeps it in the existing CSV approval JSON', async () => {
+  const r = rec(1); approve(r, 'approved'); Object.assign(r.approval!, { approver: 'U0C6UV8NMR7', approverName: 'Ryan Zeleznock' });
+  const p = await pack([r]);
+  expect(section(p.html, 'cc8-1')).toContain('approved, <bdi>Ryan Zeleznock</bdi> (U0C6UV8NMR7)');
+  expect(p.pdfText.replace(/\s+/g, ' ')).toContain('approved, Ryan Zeleznock (U0C6UV8NMR7)');
+  expect(p.csv).toContain('""approverName"":""Ryan Zeleznock""');
+  expect(p.csv.split('\n')[0]!.split(',')).toHaveLength(28);
+});
+it('escapes display names and preserves member-only reports when lookup is absent', async () => {
+  const named = rec(1); approve(named, 'denied'); Object.assign(named.approval!, { approverName: '<script>(é) & "name"</script>' });
+  const old = rec(2); approve(old, 'approved');
+  const p = await pack([named, old]); const cc8 = section(p.html, 'cc8-1');
+  expect(cc8).toContain('denied, <bdi>&lt;script&gt;(é) &amp; &quot;name&quot;&lt;/script&gt;</bdi> (reviewer)');
+  expect(cc8).not.toContain('<script>'); expect(cc8).toContain('approved, reviewer');
+  expect(p.pdfText.replace(/\s+/g, ' ')).toContain('denied, <script>(é) & "name"</script> (reviewer)');
+});
+
+it.each(['Alice\u202e', 'ריאן', 'Alice (U0AAAAAAAA)'])('isolates a stored display name from the member id in HTML: %s', async name => {
+  const r = rec(1); approve(r, 'approved'); Object.assign(r.approval!, { approver: 'U0C6UV8NMR7', approverName: name });
+  const p = await pack([r]);
+  expect(section(p.html, 'cc8-1')).toContain(`<td>approved, <bdi>${name}</bdi> (U0C6UV8NMR7)</td>`);
+  expect(p.csv).not.toContain('<bdi>'); expect(p.pdfText).not.toContain('<bdi>');
 });

@@ -1,5 +1,5 @@
 // Slice 2b pin 8: a REAL loopback Slack, Web API + Socket Mode, for the e2e (no dependency, no real Slack call).
-// node:http on 127.0.0.1:<ephemeral> serving POST /api/{auth.test, apps.connections.open, chat.postMessage, chat.update,
+// node:http on 127.0.0.1:<ephemeral> serving POST /api/{auth.test, users.info, apps.connections.open, chat.postMessage, chat.update,
 // chat.postEphemeral} and a WebSocket upgrade on /link with minimal RFC 6455 text framing (client frames must be masked,
 // server frames are not; no extensions, no subprotocol). Shapes follow docs.slack.dev (read 2026-10-04):
 // apps.connections.open → { ok, url }; first frame `hello` with connection_info.app_id; envelopes
@@ -115,6 +115,7 @@ export class FakeSlack {
     if (fail !== undefined) return { status: 200, body: { ok: false, error: fail } };
     switch (method) {
       case "auth.test": return { status: 200, body: { ok: true, url: "https://fake.slack.test/", team: "fake", user: "agent-ledger", team_id: this.teamId, user_id: this.botUserId, bot_id: "B0FAKEBOT01" } };
+      case "users.info": return { status: 200, body: { ok: true, user: { id: body["user"], profile: { real_name: "Ryan Zeleznock" } } } };
       case "apps.connections.open": {
         const ticket = randomBytes(12).toString("hex"); this.tickets.add(ticket);
         return { status: 200, body: { ok: true, url: `ws://127.0.0.1:${this.port}/link?ticket=${ticket}` } };

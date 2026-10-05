@@ -313,3 +313,7 @@ Primary-source diligence, 2026-10-03:
   automatically on transaction end; pg_locks can prove a real competing writer is waiting.
 - [V] [pool API](https://node-postgres.com/apis/pool): release checked-out clients; end drains the pool; listen for idle
   client errors. [H] These local tests cannot establish worker-disk durability or the deployed network boundary.
+
+ADR-015 amendment (2026-10-05): optional `approval.approverName` is a normal bounded string in both append projection and strict read. Existing records remain valid; the additive field is covered by the record hash. Tests: `ADR-015 optional approverName` and `round-trips and hashes optional approverName alongside older approvals`.
+
+Release compatibility (fixes-2b, ADR-015): older CLIs reject records containing `approval.approverName` as an unknown field during strict read/verification. Upgrade auditor/read-only CLIs to fixes-2b or later before reading ledgers written with names; the new CLI continues to accept older records without names.

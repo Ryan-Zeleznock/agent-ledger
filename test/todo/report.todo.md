@@ -41,3 +41,9 @@ Fable review fixes (2026-10-03):
 Reproduction: pre-fix `perl -e 'alarm shift; exec @ARGV' 900 npm run check` failed unit phase
 with 16 failures / 979 passed / 7 skipped; #6 gap demonstrated by a split-block fixture that
 passes the old assertion. #8 original mkdir reproduced as 0755 under umask 022. No finding disputed.
+
+- [x] Live 2026-10-05: absent session label uses conservative server-mode/pre-1c wording across HTML/PDF/CSV; legend explains missing discriminator; CSV columns unchanged.
+
+- [x] ADR-015 approverName: name + member id in HTML/PDF; escaped hostile text; old member-only fallback; unchanged CSV columns, name inside approval JSON.
+
+- [x] Fable fixes-2b P2-1: HTML bdi isolates names (including historical bidi controls) from stable member ids; escaped text and PDF/CSV unchanged.

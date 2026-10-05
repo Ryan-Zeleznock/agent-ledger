@@ -90,7 +90,7 @@ and sends notifications/initialized. Subsequent requests carry the negotiated ve
 headers/metadata. Legacy schemas' x-mcp-header annotations are validated and invalid tools enter `rejectedTools`, so
 they cannot prevent the front from starting; valid annotations are never mirrored into legacy request headers.
 This refines pin 2 per the coordinator's explicit P2-3 decision on 2026-10-04. Pagination and result validation stay shared.
-A session 404 triggers one shared reinitialization and one resend, even for concurrent callers. If reinitialization
+An exact session-invalid response (404/-32001/`Session not found`, or the reference-app 400 documented below) triggers one shared reinitialization and one resend, even for concurrent callers. If reinitialization
 fails, the next call retries the shared handshake before sending work. A partially initialized session is deleted;
 sessionless upstreams continue without unnecessary handshakes. Server-to-client
 requests fail immediately. Shutdown aborts calls then best-effort DELETEs each session within 2 s; failed startup also
@@ -112,3 +112,33 @@ Coordinator fix (2026-10-04): POST fetch, body reads and stream cancellation exp
 so the existing 30 s deadline also bounds non-cooperating injected transports/streams. A reflected 404/-32603 still
 selects legacy per pin 2; a silent initialize fails value-free as UpstreamUnavailable. The server regression fixture
 now explicitly refuses initialize instead of silently waiting beyond its 5 s test limit.
+
+## Live restart correction (2026-10-05)
+
+[V] Read-only primary source at `/private/tmp/claude-501/everything-e2e/node_modules/`:
+`@modelcontextprotocol/server-everything` 2026.8.31, `dist/transports/streamableHttp.js:45-51,80-94`:
+the POST router rejects an unknown session BEFORE calling the SDK with HTTP **400**, JSON-RPC code **-32000**,
+message **`Bad Request: No valid session ID provided`**. The source sets `id: req?.body?.id`, but the app
+registers no Express body parser: `req.body` is undefined and JSON serialization omits `id`. Fable
+confirmed the id-less response in a real-process restart probe on 2026-10-05. This is the live restart path.
+The SDK itself (`@modelcontextprotocol/sdk` **1.32.0**, `dist/esm/server/webStandardStreamableHttp.js:738-757`)
+returns **404 / -32001 / `Session not found`** for a mismatch on an initialized transport; a fresh uninitialized
+transport returns **400 / -32000 / `Bad Request: Server not initialized`**. Session validation precedes dispatch
+(lines 549-562). Thus the original hypothesis was right about the reference app's 400, but not its source layer.
+
+A legacy request carrying a session now recovers only on the exact SDK 404/-32001/`Session not found` or the exact
+reference-app 400 envelope (JSON-RPC 2.0, no result, exact code/message for that status). An absent or null id is
+accepted; a present non-null id must match the request. Other 400/404s remain errors, including the SDK's distinct
+uninitialized error. Discovery fallback remains unchanged.
+The existing shared handshake drops the stale session; each original request resends at most once. Body inspection
+uses the existing 4 MiB cap and 30 s deadline, and retains only a boolean; no response text/data enters diagnostics.
+`test/upstream-dual-era.test.ts` uses `LegacyUpstream.restart()` through Node's HTTP parser over stream pairs
+(no loopback), proving concurrent recovery, two accepted calls for two callers, bounded retry, unrelated/malformed
+400/404 refusal and size/time limits. Coordinator: repeat with the real reference process restarted under the proxy.
+
+
+Review corrections (Fable, 2026-10-05, P1-1/P3-1): the first matcher incorrectly required an echoed id and the first
+fixture echoed it, masking the real restart failure. `LegacyUpstream` now omits id on its reference-app 400;
+`FakeMcpFetch` uses SDK 404/-32001/`Session not found` with null id. Regressions cover absent/null/matching ids,
+present mismatches, exact 404 recovery, unrelated/malformed 404 refusal, and bounded 400/404 body inspection.
+Coordinator reruns `/private/tmp/claude-501/fx2b/probe.mjs` against the rebuilt `dist/`; the builder cannot run loopback.

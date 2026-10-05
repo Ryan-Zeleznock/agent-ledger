@@ -258,7 +258,7 @@ async function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise
 }
 
 class TransportFailure extends UpstreamError {}
-class HttpFailure extends UpstreamError { constructor(message: string, readonly status: number, readonly modernCode?: number) { super(message); } }
+class HttpFailure extends UpstreamError { constructor(message: string, readonly status: number, readonly modernCode?: number, readonly sessionInvalid = false) { super(message); } }
 
 /** One upstream over `fetch`. The bearer is a private field of this object, which never leaves the closure of `connectUpstreams`. */
 class HttpClient {
@@ -313,7 +313,7 @@ class HttpClient {
     const session = this.#session;
     try { return await this.requestOnce(method, params, mcpName, timeoutMs, allowInputRequired, extraHeaders); }
     catch (e) {
-      if (this.era !== "legacy" || !session || !(e instanceof HttpFailure) || e.status !== 404) throw e;
+      if (this.era !== "legacy" || !session || !(e instanceof HttpFailure) || !e.sessionInvalid) throw e;
       if (this.#initializing) await this.#initializing;
       else if (session === this.#session) await this.initialize();
       return this.requestOnce(method, params, mcpName, timeoutMs, allowInputRequired, extraHeaders);
@@ -351,16 +351,26 @@ class HttpClient {
       catch (e) { throw this.abortReason(controller, timedOut, e, method); }
       if (notification && res.status >= 200 && res.status < 300) { await abortable(res.body?.cancel().catch(() => undefined) ?? Promise.resolve(), controller.signal); return {}; }
       if (res.status !== 200) {
-        let code: number | undefined;
-        if (method === "server/discover" && res.status >= 400 && res.status < 500) {
+        let code: number | undefined; let sessionInvalid = false;
+        const legacySessionError = this.era === "legacy" && headers["mcp-session-id"] !== undefined && (res.status === 400 || res.status === 404);
+        if ((method === "server/discover" && res.status >= 400 && res.status < 500) || legacySessionError) {
           const chunks: Uint8Array[] = [];
           await this.readBody(res, controller, timedOut, method, c => { chunks.push(c); return false; });
           const data = tryJson(Buffer.concat(chunks).toString("utf8"));
+          // Both errors reject before dispatch: the reference app omits id (no Express body parser),
+          // while SDK validateSession uses null. A present, non-null id must still match this request.
+          // Retain only a boolean, never server text; unrelated 400/404 responses cannot trigger a resend.
+          sessionInvalid = legacySessionError && isRecord(data) && data["jsonrpc"] === "2.0" &&
+            (!Object.hasOwn(data, "id") || data["id"] === null || data["id"] === id) &&
+            !Object.hasOwn(data, "result") && isRecord(data["error"]) &&
+            (res.status === 400
+              ? data["error"]["code"] === -32000 && data["error"]["message"] === "Bad Request: No valid session ID provided"
+              : data["error"]["code"] === -32001 && data["error"]["message"] === "Session not found");
           if (isRecord(data) && data["jsonrpc"] === "2.0" && !Object.hasOwn(data, "result") && isRecord(data["error"]) && (MODERN_ERROR_CODES as readonly unknown[]).includes(data["error"]["code"])) code = data["error"]["code"] as number;
         } else await abortable(res.body?.cancel().catch(() => undefined) ?? Promise.resolve(), controller.signal);
         const message = `upstream ${this.name}: HTTP ${res.status} on ${method}${code === undefined ? "" : ` (JSON-RPC error ${code})`}`;
         if (res.status >= 500) throw new TransportFailure(message);
-        throw new HttpFailure(message, res.status, code);
+        throw new HttpFailure(message, res.status, code, sessionInvalid);
       }
       if (initialize) {
         const session = res.headers.get("mcp-session-id");

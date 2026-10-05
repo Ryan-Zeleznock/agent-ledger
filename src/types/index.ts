@@ -146,7 +146,7 @@ export type SecretRef = { kind: "env"; name: string } | { kind: "file"; path: st
  * - `slack`: a Slack app in **Socket Mode** (verified 2026-09-29, https://docs.slack.dev/apis/events-api/using-socket-mode/:
  *   "use the Events API and interactive features — without exposing a public HTTP Request URL"; interactive payloads
  *   arrive over the WebSocket; each envelope is acknowledged by `envelope_id`). `botToken` is the `xoxb-` token
- *   (scope `chat:write`, plus `chat:write.public` when the bot is not a channel member) used for `chat.postMessage` and
+ *   (scopes `chat:write` and `users:read` for decision-time names, plus `chat:write.public` when the bot is not a channel member) used for `chat.postMessage` and
  *   `chat.update`; `appToken` is the `xapp-` app-level token (scope `connections:write`) used for
  *   `apps.connections.open`. `approvers` is the allowlist of Slack user ids (`block_actions.user.id`) whose clicks
  *   count; anyone else's click is ignored and answered in-thread. The pipeline waits up to `timeoutMs`: no answer →
@@ -170,7 +170,7 @@ export type ApprovalChannel =
       channelId: string;            // Slack channel id (C…), never a name
       timeoutMs: number;            // how long a human has; must sit below the watchdog deadline (hooks: APPROVAL_MIN_MARGIN_MS)
       transport: "socket-mode";     // the only transport we specify: the homelab has no public Request URL
-      botToken: SecretRef;          // xoxb-…  chat:write (+ chat:write.public)
+      botToken: SecretRef;          // xoxb-…  chat:write + users:read (+ chat:write.public)
       appToken: SecretRef;          // xapp-…  connections:write
       approvers: readonly string[]; // Slack user ids allowed to approve or deny; must be non-empty
     }
@@ -192,6 +192,8 @@ export interface ApprovalResult {
   decision: (typeof APPROVAL_DECISIONS)[number];
   /** Slack user id of the human who clicked (approved | denied only). Never a display name. */
   approver?: string;
+  /** Best-effort Slack name observed at decision time (ADR-015 amendment); identity remains approver. */
+  approverName?: string;
   /** Why this decision: the approver's note, "no approver answered within N ms", "Slack unreachable: …", "Codex cannot ask and no Slack channel is configured". Stored. */
   reason?: string;
   decidedAt: string; channel: ApprovalChannel["kind"];

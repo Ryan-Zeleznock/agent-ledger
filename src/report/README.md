@@ -102,7 +102,7 @@ The six ordered sections are Executive summary, CC6.1 logical access, CC7.2 moni
 CC8.1 change management, Record evidence and Vocabulary. Tables are semantic HTML with column
 headers and grayscale print styles; PDF has the same titles/order. Expandable record details retain all non-empty fields; the compact index lists every record. CSV retains its original 25 columns, then appends `agent_session_id`,
 `evidence_class`, `anchor_status` in that order. Missing session ids display as
-"pre-1c, no agent session id"; missing anchor context displays "not supplied" in CSV.
+"not recorded (server mode or pre-1c)"; missing anchor context displays "not supplied" in CSV.
 
 Pin-7 fixtures are the integration boundary: heartbeat discrimination requires
 `policy.ruleId === "heartbeat:session-start"`, `call.tool === "SessionStart"` and a `builtin:`
@@ -183,7 +183,7 @@ The six numbered sections retain their pin-8 IDs and titles, and tables are numb
 section. The record index adds the chain margin (pack-local R-0001 sequence, previous-hash
 prefix, own-hash prefix). Adjacent selected records need not be adjacent in the whole ledger;
 full hashes and all non-empty source fields remain in initially open record details. The
-criterion tables retain exact pinned columns, plain escaped cells, full timestamps with
+criterion tables retain exact pinned columns, escaped cells, full timestamps with
 original offsets and full identifiers. Because the integration parser requires literal
 `<tr>` / `<td>` tags, scoped positional CSS applies exception tint and approval stamps
 without changing those tags. Oxblood marks only approved write/risky/unreviewed calls with a
@@ -209,3 +209,19 @@ and chain index. Chromium failed sandbox Mach-port registration, so HTML renderi
 layout and browser printing need coordinator visual verification. Print CSS removes the sheet
 shadow, repeats table headers and expands evidence details; evidence details also start open.
 The coordinator runs the full suite and e2e outside the sandbox. This build is not independent approval.
+
+
+Live-lab label correction (2026-10-05): `LedgerRecord`/`ToolCall` have no writer or mode discriminator.
+Both pipeline paths project the same fields and use `identity.startSession`; `agentSessionId` is absent in proxy
+mode AND old hook records. MCP server names, Slack decisions and handoff correlation do not prove provenance.
+Therefore HTML/PDF and the existing CSV `agent_session_id` label use the conservative wording above, with a
+Vocabulary explanation, instead of asserting `not applicable (server mode)`. CSV remains 28 columns.
+Test: `labels absent agent sessions conservatively in HTML/PDF/CSV without guessing from MCP names`.
+Coordinator owns the pin-8 wording amendment; no mode field or enforcement claim was added.
+
+ADR-015 amendment (2026-10-05): CC8.1 renders `approved, Ryan Zeleznock (U0C6UV8NMR7)` when a name is recorded, retaining the stable member id. Missing names keep the member-only rendering. HTML/PDF escape names through the existing renderer; CSV keeps its 28 columns and includes the additive name inside the existing `approval` JSON cell.
+
+
+Fable review P2-1 (2026-10-05): the HTML CC8.1 approval cell wraps only the escaped display name in `<bdi>`, leaving
+the member id outside its direction context. This also isolates controls in older stored names; PDF/CSV preserve their
+existing text representation. Tests cover RLO in historical names, ordinary RTL names, id-like name text and HTML escaping.

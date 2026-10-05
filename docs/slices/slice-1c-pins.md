@@ -357,3 +357,8 @@ PermissionDenied, but the deny JSON would be junk on stdout: step 1's snippet ch
   tighten "no outcome observed" to "turn ended without execution" (SessionEnd has a 1.5 s default budget; not this slice).
 - B's PDF changes are the largest hand-written surface; the escaping tests must cover the new tables, or an auditor
   opens a broken PDF.
+
+## Amendment (coordinator, 2026-10-05, after the live home-lab run)
+- Pin 8 / pin 7: records without `agentSessionId` are labelled **"not recorded (server mode or pre-1c)"**, not
+  "pre-1c, no agent session id": proxy (server-mode) records never carry an agent session id and no record field
+  distinguishes them reliably. Branch `fixes-2b`, reviewed by Fable.

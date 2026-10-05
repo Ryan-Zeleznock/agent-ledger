@@ -19,6 +19,8 @@ export interface LegacyUpstreamOptions {
   mode?: "json" | "sse" | "alternate";
   /** Optional bearer token the server demands (absent → no auth, like server-everything). */
   token?: string;
+  /** SDK reference app returns 400 for a session forgotten on restart; spec expiry is 404. */
+  unknownSessionStatus?: 400 | 404;
 }
 
 export class LegacyUpstream {
@@ -26,19 +28,21 @@ export class LegacyUpstream {
   /** session id → negotiated version; every id ever minted is kept in `minted` for the leak sweep. */
   readonly sessions = new Map<string, string>();
   readonly minted: string[] = [];
-  private server!: Server; private port = 0; private n = 0;
+  readonly server: Server = createServer((req, res) => { void this.handle(req, res); });
+  private port = 0; private n = 0;
   constructor(private readonly o: LegacyUpstreamOptions = {}) {}
   get url(): string { return `http://127.0.0.1:${this.port}/mcp`; }
   toolCalls(): string[] { return this.log.filter((l) => l.method === "tools/call").map((l) => l.tool ?? "?"); }
 
   async start(): Promise<void> {
-    this.server = createServer((req, res) => { void this.handle(req, res); });
     await new Promise<void>((r) => this.server.listen(0, "127.0.0.1", () => r()));
     this.port = (this.server.address() as AddressInfo).port;
   }
   async stop(): Promise<void> { this.server.closeAllConnections(); await new Promise<void>((r) => this.server.close(() => r())); }
   /** Simulates session expiry: the next request with that id gets 404 (the client must re-initialize). */
   expire(sessionId: string): void { this.sessions.delete(sessionId); }
+  /** A restarted process has forgotten every previously issued session. */
+  restart(): void { this.sessions.clear(); }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const chunks: Buffer[] = [];
@@ -83,7 +87,10 @@ export class LegacyUpstream {
       return send(200, { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: negotiated, capabilities: { tools: { listChanged: false } }, serverInfo: { name: "legacy-fixture", version: "1.0.0" }, instructions: "hand-written 2025-11-25 fixture" } }, { "mcp-session-id": id });
     }
     const negotiated = this.sessions.get(session);
-    if (negotiated === undefined) return err(404, -32001, "Session not found", msg.id ?? null);
+    // Reference app has no Express body parser: its req.body?.id is omitted from the 400 JSON (Fable live probe).
+    if (negotiated === undefined) return this.o.unknownSessionStatus === 400
+      ? send(400, { jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: No valid session ID provided" } })
+      : err(404, -32001, "Session not found", msg.id ?? null);
     if (pv !== undefined ? pv !== negotiated : negotiated !== "2025-03-26") return err(400, -32000, "Bad Request: Unsupported protocol version", msg.id ?? null);
     if (msg.id === undefined) return send(202);                                          // a notification (notifications/initialized)
     switch (msg.method) {

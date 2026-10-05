@@ -43,6 +43,7 @@ const vocabulary = [
   "CC8.1 change management: writes and risky/unknown actions, approval requests, approvals and denials. A shell call is not necessarily a production change.",
   "delegated = asked in the terminal; not a recorded human approval. An intent with no outcome means execution was not observed; denial, cancellation or lost telemetry cannot be distinguished.",
   "An empty evidence_class identifies a heartbeat/handoff, an orphan without a classifiable cause, or a blocked outcome whose cause is not recorded; consult the raw outcome. It does not mean allowed or successful execution.",
+  "Agent session id: not recorded (server mode or pre-1c) means the record has no agent runtime session id. Records have no deployment-mode discriminator, so a missing id cannot identify a proxy writer or establish record age.",
   "Codex hook outcome ok means the tool ran and returned; it does not prove success.",
   "HMAC-SHA256 digest = argument withheld, not the clear argument. Keyed comparison requires the separately held per-ledger key; the pack never includes that key.",
   `Handoff matching uses callId and a non-handoff MCP intent; collector provenance is absent from the schema, so this is correlation, not proof of proxy identity. Grace: ${HANDOFF_RECONCILE_GRACE_MS} ms after range end.`,
@@ -61,7 +62,14 @@ const isHeartbeat = (r: LedgerRecord) => hasHeartbeatRule(r) && hasHeartbeatCall
 const isToolIntent = (r: LedgerRecord) => r.phase === "intent" && !r.handoff && !isHeartbeat(r);
 const agentSession = (r: LedgerRecord): string | undefined =>
   "agentSessionId" in r.call && typeof r.call.agentSessionId === "string" ? r.call.agentSessionId : undefined;
-const sessionLabel = (r: LedgerRecord) => agentSession(r) ?? "pre-1c, no agent session id";
+// No deployment-mode/provenance field exists; MCP names and missing hook ids cannot identify the writer.
+const missingSessionLabel = "not recorded (server mode or pre-1c)";
+const sessionLabel = (r: LedgerRecord) => agentSession(r) ?? missingSessionLabel;
+function approvalLabel(r: LedgerRecord): string {
+  const a = r.approval; if (!a) return "not recorded";
+  const member = a.approver ? (a.approverName?.trim() ? `${a.approverName} (${a.approver})` : a.approver) : "not recorded";
+  return `${a.decision}, ${member}`;
+}
 const denial = "A manual denial at the Claude Code permission prompt fires no hook event (Claude Code hooks reference, read 2026-10-01), so 'asked, no outcome observed' cannot distinguish a user's denial from a cancelled call, an interrupted session or lost telemetry. Only auto-mode denials are recorded (`permission-denied:auto-mode`).";
 
 function anchorLine(context?: ReportContext): string {
@@ -190,7 +198,7 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
         const utc = new Date(value).toISOString();
         return dates.length === 1 ? utc.slice(11) : utc.replace("T", " ");
       }
-      return isId(headers[i]!) && value !== "pre-1c, no agent session id" ? short(display(value)).replace("…", "...") : display(value);
+      return isId(headers[i]!) && value !== missingSessionLabel ? short(display(value)).replace("…", "...") : display(value);
     }));
     const exceptionRows = values.map((_, i) => sourceRecords[i] ? (headers.includes("verdict") ? sourceRecords[i]!.policy.verdict === "deny" : exception(sourceRecords[i]!)) : /Record anomalies|Sessions without heartbeat|Launch-environment warnings|Orphan outcomes|Unreconciled handoffs|Intents with no outcome/.test(caption));
     const approvalColumn = headers.indexOf("approval (decision, approver)");
@@ -201,19 +209,24 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
       if (approvalRows[i]) tableStyles.push(`/* human-approval-mark */ .${tableId} tbody tr:nth-child(${i + 1}) td:nth-child(${approvalColumn + 1}){color:var(--human-approval);outline:1.5px solid var(--human-approval);outline-offset:-4px;padding:8px 16px}`);
     });
     pdf.push({ kind: "table", headers, rows: pdfRows, caption: dateCaption.replaceAll(" · ", " / "), exceptionRows, approvalRows, approvalColumn });
-    const cell = (value: string, name: string) => {
+    const cell = (value: string, name: string, source?: LedgerRecord) => {
+      const approval = source?.approval;
+      if (name === "approval (decision, approver)" && approval?.approver && approval.approverName?.trim()) {
+        // Isolate even historical names containing bidi controls; the stable member id stays outside.
+        return `<td>${esc(display(approval.decision))}, <bdi>${esc(display(approval.approverName))}</bdi> (${esc(display(approval.approver))})</td>`;
+      }
       if (name === "Chain") return `<td class="chain-margin">${esc(value).replaceAll("\n", "<br>")}</td>`;
       if (pinned) return `<td>${esc(display(value))}</td>`;
       if (isTime(name) && Number.isFinite(Date.parse(value))) {
         const utc = new Date(value).toISOString();
         return `<td class="time"><time datetime="${esc(value)}" title="${esc(value)}">${dates.length === 1 ? utc.slice(11) : utc.replace("T", " ")}</time></td>`;
       }
-      if (isId(name) && value !== "pre-1c, no agent session id") return `<td>${mono(value)}</td>`;
+      if (isId(name) && value !== missingSessionLabel) return `<td>${mono(value)}</td>`;
       return `<td${/^\d+$/.test(value) ? ' class="number"' : ""}>${esc(display(value))}</td>`;
     };
-    // Pinned cells stay plain text. Wrapper classes style columns without changing their parsed values.
+    // Pinned cells retain their text; approval names alone get bidi isolation. Wrapper classes style columns.
     const columnClasses = pinned ? headers.map((name, i) => isTime(name) ? `time-${i + 1}` : isId(name) ? `id-${i + 1}` : name === "tool_records" ? `number-${i + 1}` : "").filter(Boolean).join(" ") : "";
-    return `<div class="table-scroll ${tableId}${columnClasses ? ` ${columnClasses}` : ""}"><table><caption>${esc(dateCaption)}</caption><thead><tr>${headers.map(h => `<th scope="col">${esc(h)}</th>`).join("")}</tr></thead><tbody>${values.length ? values.map(row => `<tr>${row.map((value, i) => cell(value, headers[i]!)).join("")}</tr>`).join("\n") : `<tr><td colspan="${headers.length}">None</td></tr>`}</tbody></table></div>`;
+    return `<div class="table-scroll ${tableId}${columnClasses ? ` ${columnClasses}` : ""}"><table><caption>${esc(dateCaption)}</caption><thead><tr>${headers.map(h => `<th scope="col">${esc(h)}</th>`).join("")}</tr></thead><tbody>${values.length ? values.map((row, rowIndex) => `<tr>${row.map((value, i) => cell(value, headers[i]!, sourceRecords[rowIndex])).join("")}</tr>`).join("\n") : `<tr><td colspan="${headers.length}">None</td></tr>`}</tbody></table></div>`;
   };
   const detailTable = (title: string, headers: string[], values: string[][]) => values.length ? heading(`${title} (${values.length})`) + table(headers, values, title) : "";
   const checks: [string, number][] = [["Record anomalies", recordAnomalies.size], ["Sessions without heartbeat", missing.length], ["Launch-environment warnings", warnings.length], ["Orphan outcomes", orphans.length], ["Unreconciled handoffs", handoffs.length], ["Intents with no outcome observed", unobserved.length]];
@@ -261,7 +274,7 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
       detailTable("Orphan outcomes", ["record_id", "call_id", "agent_session_id", "finding"], orphans.map(r => [r.id, r.call.callId, sessionLabel(r), heartbeatSessions.has(agentSession(r) ?? "") ? "intent gap" : "orphan outcome"])) +
       detailTable("Unreconciled handoffs", ["call_id", "proxy_server_name", "hook_record_id", "handed_off_at"], handoffs.map(h => [h.callId, h.proxyServerName, h.hookRecordId, h.handedOffAt])) +
       detailTable("Intents with no outcome observed", ["record_id", "call_id"], unobserved.map(r => [r.id, r.call.callId]))),
-    section("cc8-1", "CC8.1 change management", () => text(["[V] Scope: controlled, authorized changes (AICPA TSC, printed p. 44). [H] Mapping: write/risky/unreviewed tool decisions; a shell call need not be a production change."]) + table(["written_at", "agent_session_id", "server/tool", "risk", "approval (decision, approver)", "outcome (status, errorClass)", "evidence_class"], tools.filter(r => r.policy.risk !== "read").map(r => [r.writtenAt, sessionLabel(r), `${r.call.server}/${r.call.tool}`, r.policy.risk, r.approval ? `${r.approval.decision}, ${r.approval.approver ?? "not recorded"}` : "not recorded", outcomes.get(r.call.callId)?.outcome ? json(outcomes.get(r.call.callId)!.outcome) : "no outcome observed", label(r)]), "Change decisions", true, tools.filter(r => r.policy.risk !== "read")) + text([denial])),
+    section("cc8-1", "CC8.1 change management", () => text(["[V] Scope: controlled, authorized changes (AICPA TSC, printed p. 44). [H] Mapping: write/risky/unreviewed tool decisions; a shell call need not be a production change."]) + table(["written_at", "agent_session_id", "server/tool", "risk", "approval (decision, approver)", "outcome (status, errorClass)", "evidence_class"], tools.filter(r => r.policy.risk !== "read").map(r => [r.writtenAt, sessionLabel(r), `${r.call.server}/${r.call.tool}`, r.policy.risk, approvalLabel(r), outcomes.get(r.call.callId)?.outcome ? json(outcomes.get(r.call.callId)!.outcome) : "no outcome observed", label(r)]), "Change decisions", true, tools.filter(r => r.policy.risk !== "read")) + text([denial])),
     section("records", "Record evidence", () => {
       // Presentation derives from the unchanged CSV projection; retain every non-empty source field.
       const compact = table(["Chain", "Time", "Phase", "Tool", "Decision", "Evidence class", "Criteria"], records.map((r, i) => [`${reference(i)}\nprev ${display(r.prevHash).slice(0, 12)}\nhash ${display(r.hash).slice(0, 12)}`, r.writtenAt, r.phase, r.call.tool, isHeartbeat(r) ? "health record" : r.handoff ? "handoff" : r.policy.verdict, label(r), rows[i]![16]!]), "Record index; full fields follow in numbered details", false, records);

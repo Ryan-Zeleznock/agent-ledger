@@ -8,6 +8,8 @@ export const SLACK_PROXY_MAX_TIMEOUT_MS = 240_000;
 export const SLACK_HTTP_TIMEOUT_MS = 10_000;
 // Kept local: only the pipeline may import another module; frozen hooks timing margin is 5 s.
 const APPROVAL_MIN_MARGIN_MS = 5_000;
+const NAME_LOOKUP_TIMEOUT_MS = 1_000;
+const NAME_RESPONSE_MAX_BYTES = 64 * 1024;
 const SETTLED_FEEDBACK_MS = 30_000;
 const MAX_SETTLED_FEEDBACK = 1024;
 export interface WebSocketLike {
@@ -61,28 +63,63 @@ export async function validateSlackChannelImpl(c: SlackChannel): Promise<string[
   return problems;
 }
 class SlackFailure extends Error { constructor(readonly step: string, readonly retryMs?: number) { super(step); } }
-async function api(method: string, token: string, body: unknown): Promise<Record<string, any>> {
+async function api(method: string, token: string, body: unknown, timeoutMs = SLACK_HTTP_TIMEOUT_MS): Promise<Record<string, any>> {
   const controller = new AbortController(); let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
       (async () => {
         const res = await (config.fetch ?? fetch)(`${config.apiBaseUrl ?? SLACK_API_BASE_URL}${method}`, {
-          method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json; charset=utf-8' },
-          body: JSON.stringify(body), redirect: 'error', signal: controller.signal,
+          method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': method === 'users.info' ? 'application/x-www-form-urlencoded' : 'application/json; charset=utf-8' },
+          body: method === 'users.info' && record(body) ? new URLSearchParams({ user: body.user }).toString() : JSON.stringify(body), redirect: 'error', signal: controller.signal,
         });
         if (res.status === 429) {
           const retry = res.headers.get('retry-after'); await res.body?.cancel();
           throw new SlackFailure(`${method}: ratelimited`, retry !== null && /^\d+(\.\d+)?$/.test(retry) ? Number(retry) * 1000 : undefined);
         }
         if (res.status !== 200) { await res.body?.cancel(); throw new SlackFailure(`${method}: error`); }
-        const data: unknown = await res.json();
+        const data: unknown = method === 'users.info' ? await readMemberResponse(res, controller.signal) : await res.json();
         if (!record(data) || data.ok !== true) throw new SlackFailure(`${method}: ${record(data) && typeof data.error === 'string' && /^[a-z_]{1,64}$/.test(data.error) ? data.error : 'error'}`);
         return data;
       })(),
-      new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new SlackFailure(`${method}: error`)); }, SLACK_HTTP_TIMEOUT_MS); }),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new SlackFailure(`${method}: error`)); }, timeoutMs); }),
     ]);
   } catch (e) { throw e instanceof SlackFailure ? e : new SlackFailure(`${method}: error`); }
   finally { clearTimeout(timer); }
+}
+/** Bound profile data independently of other Slack replies; never copy errors or extra fields to evidence. */
+async function readMemberResponse(res: Response, signal: AbortSignal): Promise<unknown> {
+  if (Number(res.headers.get('content-length')) > NAME_RESPONSE_MAX_BYTES || !res.body) {
+    void res.body?.cancel().catch(() => undefined); throw new SlackFailure('users.info: error');
+  }
+  const reader = res.body.getReader(); const chunks: Uint8Array[] = []; let size = 0;
+  const cancel = () => { void reader.cancel().catch(() => undefined); };
+  signal.addEventListener('abort', cancel, { once: true });
+  try {
+    if (signal.aborted) throw new SlackFailure('users.info: error');
+    for (;;) {
+      const { done, value } = await reader.read(); if (done) break;
+      size += value.byteLength; if (size > NAME_RESPONSE_MAX_BYTES) throw new SlackFailure('users.info: error');
+      chunks.push(value);
+    }
+    return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
+  } finally { signal.removeEventListener('abort', cancel); cancel(); reader.releaseLock(); }
+}
+async function approverName(member: string, r: Router, nonce: string, budgetMs: number): Promise<string | undefined> {
+  try {
+    const data = await api('users.info', r.bot, { user: member }, Math.max(0, Math.min(NAME_LOOKUP_TIMEOUT_MS, budgetMs)));
+    if (!record(data.user) || data.user.id !== member) return undefined;
+    const profile = record(data.user.profile) ? data.user.profile : {};
+    for (const value of [profile.real_name, data.user.real_name, profile.display_name]) {
+      if (typeof value !== 'string') continue;
+      // Reject before trimming: Cc/Cf include C1, bidi overrides/isolates and zero-width format controls.
+      // Do not fall back to another profile field after a control-bearing name.
+      if (/[\p{Cc}\p{Cf}]/u.test(value)) return undefined;
+      const name = value.trim();
+      if (name && name.length <= 256 && Buffer.from(name, 'utf8').toString('utf8') === name &&
+          ![r.bot, r.app, nonce].some(secret => secret && name.includes(secret))) return name;
+    }
+  } catch { /* Best effort, value-free: the already settled decision is never revised. */ }
+  return undefined;
 }
 function result(callId: string, decision: ApprovalResult['decision'], reason: string, approver?: string): ApprovalResult {
   return { callId, decision, reason, channel: 'slack', decidedAt: new Date(now()).toISOString(), ...(approver ? { approver } : {}) };
@@ -256,7 +293,13 @@ export async function requestApprovalImpl(call: ToolCall, policy: PolicyDecision
     };
     const entry: PendingApproval = { callId, nonce, messageTs: '', channelId: channel.channelId, state: 'pending', settle(outcome) {
       if (entry.state !== 'pending') return false;
-      entry.state = 'settled'; settled = outcome; clearTimeout(timer); r.remove(entry); update(); resolve(outcome); return true;
+      entry.state = 'settled'; settled = outcome; clearTimeout(timer); r.remove(entry); update();
+      // Lock/remove first: competing clicks, shutdown and the approval timer cannot change this decision.
+      // Enrichment fits inside the remaining wait (at most 1 s), and only the returned copy gets the name.
+      if (outcome.approver && (outcome.decision === 'approved' || outcome.decision === 'denied')) {
+        void approverName(outcome.approver, r, nonce, expires - now()).then(name => resolve(name === undefined ? outcome : { ...outcome, approverName: name }));
+      } else resolve(outcome);
+      return true;
     } };
     const timer = setTimeout(() => entry.settle(result(callId, 'timeout', `no approver answered within ${wait} ms`)), wait);
     r.register(entry);

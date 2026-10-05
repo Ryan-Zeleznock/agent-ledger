@@ -15,3 +15,6 @@ Converted on 2026-10-03 (Fable, Slice 2a pin 4) in `test/upstream.test.ts`, agai
 - [ ] 2c: stdio transport; tool-list refresh / listChanged
 - [x] (Astra verification P2, 2026-10-03) F7: a complete CR-delimited SSE event waits for another byte/EOF (`src/upstream/contract.ts` SseParser): process CR immediately and suppress a following LF; test CR-only streams with the terminal event last.
 - [x] (Astra verification P2 N1, 2026-10-03) `x-mcp-header` traversal also walks `default`/`example`/`const` data and rejects valid tools: traverse schema-valued keywords only (same fix in `src/front/contract.ts` buildExposedTable).
+- [x] Live 2026-10-05 restart: exact reference-app 400/-32000 session rejection and 404 recover single-flight once; other/malformed 400s refuse; value-free and bounded body inspection.
+
+- [x] Fable fixes-2b P1-1/P3-1: real id-less 400 fixture; absent/null/matching ids recover; mismatches and unrelated 404s refuse; exact SDK 404 and bounded body tests.
