@@ -167,13 +167,21 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
   const pdf: PdfBlock[] = [];
   const text = (lines: string[]) => { pdf.push({ kind: "text", lines: lines.map(display) }); return lines.map(s => `<p>${esc(display(s))}</p>`).join("\n"); };
   const heading = (title: string) => { pdf.push({ kind: "heading", lines: [title] }); return `<h3>${esc(title)}</h3>`; };
-  const short = (value: string) => value.length > 20 ? `${value.slice(0, 12)}…${value.slice(-6)}` : value;
+  const short = (value: string) => value.length > 20 && !value.includes("HMAC-SHA256 digest") ? `${value.slice(0, 12)}…${value.slice(-6)}` : value;
   const mono = (value: string, compact = true) => `<code title="${esc(display(value))}">${esc(compact ? short(display(value)) : display(value))}</code>`;
   const isId = (name: string) => /(?:_id|_hash)$/.test(name) || ["hash", "first_tool_record"].includes(name);
   const isTime = (name: string) => ["written_at", "handed_off_at", "Time"].includes(name);
   const table = (headers: string[], values: string[][], caption = "Evidence") => {
-    pdf.push({ kind: "table", headers, rows: values.map(row => row.map(display)) });
     const dates = [...new Set(values.flatMap(row => row.filter((value, i) => isTime(headers[i]!) && Number.isFinite(Date.parse(value))).map(value => new Date(value).toISOString().slice(0, 10))))];
+    const dateCaption = `${caption}${dates.length ? ` · Dates (UTC): ${dates.join(", ")}` : ""}`;
+    const pdfRows = values.map(row => row.map((value, i) => {
+      if (isTime(headers[i]!) && Number.isFinite(Date.parse(value))) {
+        const utc = new Date(value).toISOString();
+        return dates.length === 1 ? utc.slice(11) : utc.replace("T", " ");
+      }
+      return isId(headers[i]!) && value !== "pre-1c, no agent session id" ? short(display(value)).replace("…", "...") : display(value);
+    }));
+    pdf.push({ kind: "table", headers, rows: pdfRows, caption: dateCaption.replace(" · ", " / ") });
     const cell = (value: string, name: string) => {
       if (isTime(name) && Number.isFinite(Date.parse(value))) {
         const utc = new Date(value).toISOString();
@@ -190,9 +198,19 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
     ["summary", "Executive summary", `${findings.length} findings`], ["cc6-1", "CC6.1 logical access", `${tools.length} intents`],
     ["cc7-2", "CC7.2 monitoring", `${checks.length} anomaly checks; ${heartbeats.length} heartbeats`],
     ["cc8-1", "CC8.1 change management", `${tools.filter(r => r.policy.risk !== "read").length} intents`],
-    ["records", "Record evidence", `${records.length} records`], ["legend", "Vocabulary", "definitions and limitations"]
+    ["records", "Record evidence", `${records.length} records`], ["legend", "Vocabulary", `${vocabulary.length + 4} entries`]
   ];
-  const section = (id: string, title: string, body: () => string) => { pdf.push({ kind: "heading", lines: [title] }); return `<section id="${id}"><h2>${title}</h2>${body()}</section>`; };
+  pdf.push(
+    { kind: "heading", lines: ["SOC 2 evidence pack", "Agent Ledger"] },
+    { kind: "text", lines: [summary[1]!, summary[2]!, `Observed ledger head: ${short(display(head)).replace("…", "...")}`].map(display) },
+    { kind: "heading", lines: ["Evidence status"] },
+    { kind: "text", lines: [chain, anchor, `Findings: ${findings.length}`].map(display) },
+    { kind: "text", lines: [`Scope: ${records.length} selected records; criteria CC6.1, CC7.2 and CC8.1. Candidate evidence mapping, not an audit opinion.`] },
+    { kind: "heading", lines: ["Trust boundary"] }, { kind: "text", lines: [trust] },
+    { kind: "pagebreak" }, { kind: "contents", entries: contents.map(([id, title, count]) => ({ id: id!, title: title!, count: count! })) },
+    { kind: "pagebreak" }
+  );
+  const section = (id: string, title: string, body: () => string) => { pdf.push({ kind: "heading", id, lines: [title] }); return `<section id="${id}"><h2>${title}</h2>${body()}</section>`; };
   const sections = [
     section("summary", "Executive summary", () => {
       pdf.push({ kind: "text", lines: summary.map(display) });
@@ -219,11 +237,19 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
       detailTable("Intents with no outcome observed", ["record_id", "call_id"], unobserved.map(r => [r.id, r.call.callId]))),
     section("cc8-1", "CC8.1 change management", () => text(["[V] Scope: controlled, authorized changes (AICPA TSC, printed p. 44). [H] Mapping: write/risky/unreviewed tool decisions; a shell call need not be a production change."]) + table(["written_at", "agent_session_id", "server/tool", "risk", "approval (decision, approver)", "outcome (status, errorClass)", "evidence_class"], tools.filter(r => r.policy.risk !== "read").map(r => [r.writtenAt, sessionLabel(r), `${r.call.server}/${r.call.tool}`, r.policy.risk, r.approval ? `${r.approval.decision}, ${r.approval.approver ?? "not recorded"}` : "not recorded", outcomes.get(r.call.callId)?.outcome ? json(outcomes.get(r.call.callId)!.outcome) : "no outcome observed", label(r)])) + text([denial])),
     section("records", "Record evidence", () => {
-      // Keep the complete PDF blocks until its separate layout pass; CSV rows are never edited for presentation.
+      // Presentation derives from the unchanged CSV projection; retain every non-empty source field.
       const compact = table(["Time", "Phase", "Tool", "Decision", "Evidence class", "Criteria"], records.map((r, i) => [r.writtenAt, r.phase, r.call.tool, isHeartbeat(r) ? "health record" : r.handoff ? "handoff" : r.policy.verdict, label(r), rows[i]![16]!]), "Record index; full fields follow in numbered details");
       return compact + rows.map((row, i) => {
-        const fields = columns.slice(0, 21).map((name, n) => [name, row[n]!] as const).filter(([, value]) => value !== "" && value !== "{}" && value !== "[]" && value !== "null");
-        pdf.push({ kind: "record", lines: columns.slice(0, 21).map((c, n) => `${c}: ${row[n]}`) });
+        const fields = [...columns.slice(0, 20).map((name, n) => [name, row[n]!] as const), ["agent_session_id", display(agentSession(records[i]!) ?? "")] as const, ["evidence_class", row[26]!] as const, ["received_at", row[20]!] as const].filter(([name, value]) => value !== "" && !(name === "arguments_labeled" && Object.keys(records[i]!.call.args).length === 0));
+        const lines: string[] = [];
+        for (const [name, value] of fields) {
+          const line = `${name}: ${value}`;
+          const previous = lines.at(-1);
+          // Keep record boundaries explicit; combine short interior fields without dropping evidence.
+          if (previous && !previous.startsWith("record_id:") && name !== "received_at" && previous.length + line.length < 100) lines[lines.length - 1] = `${previous} | ${line}`;
+          else lines.push(line);
+        }
+        pdf.push({ kind: "record", lines });
         return `<details id="record-${i + 1}"><summary>Record ${i + 1} · ${esc(records[i]!.phase)} · ${esc(display(records[i]!.call.tool))} · ${mono(records[i]!.id)}</summary><dl class="record-fields">${fields.map(([name, value]) => `<dt>${name}</dt><dd>${isId(name) ? mono(value, false) : esc(value)}</dd>`).join("")}</dl></details>`;
       }).join("\n");
     }),

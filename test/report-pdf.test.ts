@@ -38,3 +38,17 @@ it("review #6 repro: the old presence-only assertion accepts a split record", ()
   expect(page).toContain("received_at:");
   expect((page.match(/record_id:/g) ?? []).length).not.toBe((page.match(/received_at:/g) ?? []).length);
 });
+
+it("design: wraps at word boundaries and retains complete timestamps, UUIDs and hashes", () => {
+  const tokens = ['2026-10-04T15:33:07.993Z', '123e4567-e89b-12d3-a456-426614174000', 'a'.repeat(64), 'permission-denied:auto-mode'];
+  const pdf = textPdf([{ kind: 'text', lines: [Array(4).fill(tokens.join(' ')).join(' ')] }, { kind: 'table', headers: ['time', 'record_id', 'hash', 'cause'], rows: [tokens] }], 'PASS');
+  assertStructure(pdf);
+  const lines = printedLines(pdf.toString('ascii'));
+  for (const token of tokens) expect(lines.some(line => line.includes(token))).toBe(true);
+  // Each prose run is a whole sequence of source tokens, never a partial timestamp/hash.
+  const prose = lines.slice(0, lines.indexOf('time')).filter(Boolean);
+  expect(prose.join('')).toBe(Array(4).fill(tokens.join(' ')).join(' '));
+  for (const line of prose.slice(0, -1)) expect(line).toMatch(/\s$/);
+  for (const token of tokens) expect(lines.slice(lines.indexOf('time'))).toContain(token);
+  expect(pdf.toString('ascii')).toContain('/BaseFont /Helvetica');
+});

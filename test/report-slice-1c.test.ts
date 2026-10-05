@@ -35,11 +35,11 @@ function approve(r: LedgerRecord, decision: ApprovalResult["decision"], channel:
 function pdfText(raw: string): string {
   return [...raw.matchAll(/\(((?:\\.|[^\\)])*)\) Tj/g)].map(m => m[1]!.replace(/\\267/g, "·").replace(/\\([\\()])/g, "$1").replace(/\\u([0-9a-f]{4})/g, (_, n: string) => String.fromCharCode(parseInt(n, 16)))).join("\n");
 }
-async function pack(records: LedgerRecord[], context?: ReportContext) {
+async function pack(records: LedgerRecord[], context?: ReportContext, selectedRange = range) {
   const dir = await mkdtemp(join(tmpdir(), "pack-1c-")); dirs.push(dir);
   const ledger: LedgerStore = { append: vi.fn(), head: async () => records.at(-1)?.hash ?? "0", verify: async () => ({ ok: true, checked: records.length }),
     async *read(r) { for (const x of records) if (Date.parse(x.writtenAt) >= Date.parse(r.from) && Date.parse(x.writtenAt) <= Date.parse(r.to)) yield x; } };
-  await generateReport(ledger, range, dir, context);
+  await generateReport(ledger, selectedRange, dir, context);
   const html = await readFile(join(dir, "report.html"), "utf8");
   const pdf = await readFile(join(dir, "report.pdf"), "ascii");
   return { html, pdf, pdfText: pdfText(pdf), csv: await readFile(join(dir, "records.csv"), "utf8") };
@@ -115,7 +115,7 @@ it("escapes new table cells and appended CSV columns, labels digests and preserv
 it("paginates aligned tables with repeated headers, larger titles, footers and unsplit fitting record blocks", async () => {
   const p = await pack(Array.from({ length: 45 }, (_, i) => rec(i, `session-${i}`)));
   const pages = [...p.pdf.matchAll(/stream\n([\s\S]*?)endstream/g)].map(m => pdfText(m[1]!));
-  expect(p.pdf).toMatch(/\/F1 1[2-8] Tf/);
+  expect(p.pdf).toMatch(/\/F[13] 1[2-8] Tf/);
   expect(p.pdf).toContain("Agent Ledger evidence pack \\267 page");
   pages.forEach((page, i) => expect(page).toContain(`Agent Ledger evidence pack · page ${i + 1} / ${pages.length} · chain PASS`));
   expect(pages.filter(page => page.includes("rule_id")).length).toBeGreaterThan(1);
@@ -228,4 +228,53 @@ it("design: CSV bytes remain frozen across presentation changes", async () => {
   r.call.args = { digest: `hmac-sha256:${'a'.repeat(64)}`, clear: '"x",é\n=SUM(A1)' };
   const p = await pack([heartbeat(1, 'healthy'), r, result(r, 'ok')], { anchor: { status: 'head', latest: { hash: r.hash, at: range.from } } });
   expect(createHash('sha256').update(p.csv).digest('hex')).toBe('14a75575c75df78c86ff72a6945ee767381172dfc008d344bbd97300ad47c206');
+});
+it("design: PDF starts with dedicated cover and contents pages", async () => {
+  const p = await pack([rec(1)]);
+  const pages = [...p.pdf.matchAll(/stream\n([\s\S]*?)endstream/g)].map(m => pdfText(m[1]!));
+  expect(p.pdf).toContain('/BaseFont /Helvetica');
+  expect(pages[0]).toContain('SOC 2 evidence pack');
+  for (const text of ['Range', 'Chain verification: PASS', 'Anchor:', 'Findings:', 'Scope:', 'best-effort gating']) expect(pages[0]).toContain(text);
+  expect(pages[1]).toContain('Contents');
+  for (const title of ['Executive summary', 'CC6.1 logical access', 'CC7.2 monitoring', 'CC8.1 change management', 'Record evidence', 'Vocabulary']) expect(pages[1]).toContain(title);
+  expect(pages[2]).toContain('Executive summary');
+});
+it("design: contents page numbers resolve to real section headings and record details preserve false/zero", async () => {
+  const r = rec(1, 'a-session-id-that-is-long-enough-to-shorten'); r.call.args = { enabled: false, count: 0 };
+  const p = await pack([r]);
+  expect(section(p.html, 'records')).toContain('&quot;enabled&quot;:false,&quot;count&quot;:0');
+  expect(section(p.html, 'records')).toContain('<dt>agent_session_id</dt>');
+  expect(p.pdfText).toContain('a-session-id-that-is-long-enough-to-shorten');
+  expect(p.pdfText).toContain('"enabled":false,"count":0');
+  const pages = [...p.pdf.matchAll(/stream\n([\s\S]*?)endstream/g)].map(m => pdfText(m[1]!));
+  for (const title of ['Executive summary', 'CC6.1 logical access', 'CC7.2 monitoring', 'CC8.1 change management', 'Record evidence', 'Vocabulary']) {
+    const contentsLines = pages[1]!.split('\n');
+    const number = Number(contentsLines[contentsLines.indexOf(title) + 1]);
+    expect(number).toBeGreaterThanOrEqual(3);
+    expect(pages[number - 1]!.split('\n')).toContain(title);
+  }
+});
+it("design: multi-date tables retain row dates and original timestamp offsets", async () => {
+  const r = rec(1); r.writtenAt = '2026-09-30T23:30:00-10:00';
+  const p = await pack([rec(2), r], undefined, { from: range.from, to: '2026-10-01T13:00:00Z' });
+  const records = section(p.html, 'records');
+  expect(records).toContain('Dates (UTC): 2026-09-30, 2026-10-01');
+  expect(records).toContain('datetime="2026-09-30T23:30:00-10:00"');
+  expect(records).toContain('>2026-10-01 09:30:00.000Z</time>');
+  expect(records).toContain('>2026-09-30 12:00:01.000Z</time>');
+});
+it.each(['{}', '[]', 'null'])("design: non-empty literal %s remains evidence in record details", async value => {
+  const r = rec(1); r.call.declaredPlan = value;
+  const p = await pack([r]);
+  expect(section(p.html, 'records')).toContain(`<dt>declared_plan</dt><dd>${value}</dd>`);
+  expect(p.pdfText).toContain(`declared_plan: ${value}`);
+});
+it("design: appended record-detail identifiers still label HMAC values", async () => {
+  const r = rec(1, `hmac-sha256:${'d'.repeat(64)}`);
+  const p = await pack([r]);
+  for (const output of [p.html, p.pdfText, p.csv]) {
+    expect(output).not.toContain('hmac-sha256:');
+    expect(output).toContain('HMAC-SHA256 digest (argument withheld)');
+    expect(output).toContain('d'.repeat(64));
+  }
 });

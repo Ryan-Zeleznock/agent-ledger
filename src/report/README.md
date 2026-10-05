@@ -73,10 +73,20 @@ HTML escapes all record text and has no scripts or remote assets. CSV uses quote
 quotes, and prefixes formula-leading cells with an apostrophe; that presentation prefix is not part
 of the original value. Exported text is evidence presentation, not a byte-for-byte rehashable ledger.
 
-PDF is a dependency-free, paginated PDF 1.4 text document using Courier. Non-ASCII characters are
-shown as reversible `\uXXXX` UTF-16 escapes, each kept whole when wrapping; HTML/CSV retain Unicode. It wraps long text without
-truncating records, uses larger section headings and landscape aligned tables with repeated headers,
-and keeps each record block together when it fits on a page. Each page footer includes the chain result. No PDF/A, embedded fonts or signatures are claimed. Output files use exclusive
+PDF is a dependency-free, paginated PDF 1.4 document using standard Helvetica for prose,
+Helvetica Bold for headings and Courier only for identifier/hash fields. It starts with a cover
+(title, range, generation time, verdicts, scope and trust boundary), then a contents page with
+resolved page numbers. Table columns use measured content widths, repeated captions/headers,
+hairline rules and zebra rows. Times use UTC with dates in captions. Record details retain every
+non-empty field, including full identifiers; short interior fields share lines to reduce repetition.
+
+Wrapping happens at whitespace boundaries, never inside timestamps, hashes or Unicode escapes.
+Non-ASCII ledger characters remain reversible `\uXXXX` UTF-16 escapes; HTML/CSV retain Unicode.
+Table IDs are abbreviated with `...`, with complete values in record details. An unbroken token
+wider than its available line is fitted by reducing its font size, preserving all evidence bytes;
+very long unbroken values can consequently be small and should be read in HTML/CSV. Fitting
+record blocks stay on one page; oversized blocks continue. Each footer includes the chain result.
+No PDF/A, embedded fonts or signatures are claimed. Output files use exclusive
 creation with mode 0600; use a fresh output directory for each pack. HTML is written last. I/O errors
 can leave an incomplete pack; a failed invocation must not be distributed as a completed export.
 All history/outputs are held in memory. Session and outcome lookups use maps/sets; the unchanged
@@ -165,6 +175,14 @@ tables retain each row's date. Full IDs/hashes remain in titles and record detai
 print rules preserve text statuses, repeat table headers, and expose details in browsers supporting
 `::details-content`; browser print behavior requires coordinator visual verification. No remote assets.
 
-The redesign request explicitly supersedes pin 8's original raw-block presentation; fields,
+The redesign request explicitly supersedes pin 8's original Courier-only PDF and raw-block presentation; fields,
 verbatim caveats, classifications, CSV bytes and section order are preserved. The CSV regression
 fingerprint was captured before changing the renderer, including hostile strings and HMAC data.
+
+Validation for the redesign: report tests cover cover/contents page boundaries and resolved page
+numbers, complete word/token wrapping, non-empty details (including false/zero), status/contents
+HTML structure, conditional anomaly tables, multi-date captions, Unicode/hostile input escaping,
+CSV byte stability and PDF xref/stream/page references. A synthetic 24-record PDF was parsed and
+rasterized with local Poppler for visual inspection. HTML browser rendering, responsive behavior
+and browser print expansion were not visually verified in the sandbox. Full suite/e2e remains
+with the coordinator; this is a build handoff, not independent approval.
