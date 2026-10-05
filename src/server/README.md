@@ -129,3 +129,17 @@ lines, five names, allowed calls recorded with clear/hashed args, wipe/whoami ne
 with no record, direct upstream call with the agent's key refused, pinned per-call log keys, refusal matrix with
 leak checks, Postgres URL password encoding and redaction, demo handler and `demoMain`); `test/e2e-slice-2a.test.ts`
 (real processes from a private build root, steps 1-12 of the pins' integration seams; `smoke.js` PASS/FAIL).
+
+## ADR-018 security round (2026-10-05)
+
+- The root wires `authenticate` into the front: `identity.resolveAgent({ kind: "api_key", value })`, any throw →
+  unknown → 401 before the body or any method. The pipeline still resolves identity per call.
+- `AGENT_LEDGER_TLS=off` with a non-loopback `AGENT_LEDGER_BIND_HOST` is refused (server audit P3); the explicit value
+  `off-non-loopback` allows it and the `warning` line records `override` and `bindHost` (Compose only). Loopback is
+  127.0.0.0/8, `::1`, `localhost`.
+- `listening` carries `configSha256`: SHA-256 of `registry.yaml`, `agents.yaml`, `upstreams.yaml` (and
+  `approvals.yaml` in slack mode) as read at start; never contents.
+- The demo upstream's front authenticates its one client (the proxy's bearer) first; any other bearer is 401.
+- Smoke: a wrong key is checked as 401 on tools/call and tools/list; `--expect-upstream-401` checks no bearer, the
+  agent's key on tools/call and on tools/list (15 checks with it, 12 without).
+Tests: `test/server-2b.test.ts` "security round P3s", `test/server.test.ts` ADR-018 row, `test/e2e-slice-2a.test.ts` 7-9.

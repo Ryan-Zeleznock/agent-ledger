@@ -331,3 +331,26 @@ describe("server root 2b fix round F2: the start budget bounds each WHOLE attemp
     expect(seen).toEqual([30_000, 28_500, 26_000, 21_500]);
   });
 });
+
+describe("server root: security round P3s (server audit 2026-10-05)", () => {
+  it("AGENT_LEDGER_TLS=off with a non-loopback bind is refused; off-non-loopback is the explicit override (logged); loopback binds keep plain off", async () => {
+    const l = await lab();
+    l.env[ENV.bindHost] = "192.0.2.1"; l.env[ENV.tls] = "off";
+    await refusal(l, /AGENT_LEDGER_TLS=off with AGENT_LEDGER_BIND_HOST="192\.0\.2\.1" would serve bearer tokens in plaintext/);
+    l.env[ENV.tls] = "off-non-loopback";
+    const log = await refusal(l, /^front: /); // past the TLS rule; this TEST-NET address cannot be bound, so no test binds a real interface
+    expect(log[0]).toMatchObject({ event: "warning", tls: "off", bindHost: "192.0.2.1", override: "off-non-loopback" });
+    for (const host of ["127.0.0.1", "localhost"]) {
+      l.env[ENV.bindHost] = host; l.env[ENV.tls] = "off";
+      const { log: ok } = await up(l); expect(ok.find((x) => x["event"] === "listening")).toMatchObject({ tls: "off", bindHost: host });
+    }
+  });
+  it("the listening line carries the SHA-256 of registry.yaml, agents.yaml, upstreams.yaml (and approvals.yaml in slack mode), never their contents", async () => {
+    const l = await lab();
+    const { log } = await up(l);
+    const listening = log.find((x) => x["event"] === "listening")!;
+    const h = (f: string) => createHash("sha256").update(readFileSync(join(l.dir, f), "utf8"), "utf8").digest("hex");
+    expect(listening["configSha256"]).toEqual({ "registry.yaml": h("registry.yaml"), "agents.yaml": h("agents.yaml"), "upstreams.yaml": h("upstreams.yaml") });
+    expect(JSON.stringify(log)).not.toContain(readFileSync(join(l.dir, "agents.yaml"), "utf8").slice(0, 40));
+  });
+});

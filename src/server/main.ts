@@ -1,9 +1,10 @@
 // Slice 2a pin 8 (ADR-013): the server-mode composition root. `node dist/server/main.js` in the home-lab cluster.
 // Environment contract: AGENT_LEDGER_CONFIG_DIR, AGENT_LEDGER_LEDGER_URL, AGENT_LEDGER_PORT, AGENT_LEDGER_BIND_HOST,
 // AGENT_LEDGER_ALLOWED_ORIGINS, AGENT_LEDGER_APPROVALS (none|slack, Slice 2b pin 6), AGENT_LEDGER_MAX_INFLIGHT (additive,
-// fix round F10), AGENT_LEDGER_TLS (on|off, required; ADR-017), AGENT_LEDGER_UPSTREAM_CONNECT_BUDGET_MS (Slice 2b pin 6);
+// fix round F10), AGENT_LEDGER_TLS (on|off, required; ADR-017; off-non-loopback: server audit P3), AGENT_LEDGER_UPSTREAM_CONNECT_BUDGET_MS (Slice 2b pin 6);
 // nothing else is read (NODE_OPTIONS is checked, never read).
 import { realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ApprovalChannel, IncomingCall, LedgerRecord, ToolResult, UnsealedRecord } from "../types/index.js";
@@ -49,6 +50,17 @@ export const SHUTDOWN_GRACE_MS = 10_000;
 /** How long `stop()` lets admitted calls finish against the upstream before aborting them (inside SHUTDOWN_GRACE_MS; F3). */
 export const SHUTDOWN_DRAIN_MS = 5_000;
 export const HMAC_KEY_BYTES = 32;
+/** Server audit P3: the explicit override for plaintext on a non-loopback bind (Compose behind a 127.0.0.1 publish). */
+export const TLS_OFF_NON_LOOPBACK = "off-non-loopback" as const;
+/** Loopback binds: 127.0.0.0/8, ::1, localhost. */
+export function isLoopbackBind(host: string): boolean {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, "");
+  return h === "localhost" || h === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
+/** Server audit P3: SHA-256 of a config file as read at start (logged on `listening`, so an edited ConfigMap is visible). */
+function fileSha256(path: string): string | undefined {
+  try { return createHash("sha256").update(readConfigFile(path), "utf8").digest("hex"); } catch { return undefined; }
+}
 
 /** A refused start: the reason is already logged (one JSON line, no URL, no value); the process exits 1. */
 export class StartupRefused extends Error { override name = "StartupRefused"; }
@@ -121,8 +133,12 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env, override
   const maxInFlight = Number(maxInFlightRaw);
   const approvalsKind = env[ENV.approvals];
   if (approvalsKind !== "none" && approvalsKind !== "slack") refuse(`${ENV.approvals} must be "none" or "slack" (got ${approvalsKind === undefined ? "nothing" : JSON.stringify(approvalsKind).slice(0, 32)})`);
-  const tlsMode = env[ENV.tls];
-  if (tlsMode !== "on" && tlsMode !== "off") refuse(`${ENV.tls} must be "on" or "off" (got ${tlsMode === undefined ? "nothing: no silent plaintext, ADR-017" : JSON.stringify(tlsMode).slice(0, 32)})`);
+  const tlsRaw = env[ENV.tls];
+  if (tlsRaw !== "on" && tlsRaw !== "off" && tlsRaw !== TLS_OFF_NON_LOOPBACK) refuse(`${ENV.tls} must be "on" or "off" (got ${tlsRaw === undefined ? "nothing: no silent plaintext, ADR-017" : JSON.stringify(tlsRaw).slice(0, 32)})`);
+  // Server audit P3 (2026-10-05): plaintext on a non-loopback interface needs the explicit value `off-non-loopback`
+  // (Compose publishes the container's 0.0.0.0 on the host's 127.0.0.1 only; that is the one sanctioned use).
+  if (tlsRaw === "off" && !isLoopbackBind(bindHost)) refuse(`${ENV.tls}=off with ${ENV.bindHost}=${JSON.stringify(bindHost).slice(0, 64)} would serve bearer tokens in plaintext beyond this host; use on, bind 127.0.0.1, or set ${ENV.tls}=${TLS_OFF_NON_LOOPBACK} if a loopback-only publish wraps it`);
+  const tlsMode: "on" | "off" = tlsRaw === "on" ? "on" : "off";
   const budgetRaw = env[ENV.connectBudget] ?? String(DEFAULT_CONNECT_BUDGET_MS);
   if (!/^\d{1,6}$/.test(budgetRaw) || Number(budgetRaw) > MAX_CONNECT_BUDGET_MS) refuse(`${ENV.connectBudget} must be an integer 0-${MAX_CONNECT_BUDGET_MS}`);
   const connectBudgetMs = Number(budgetRaw);
@@ -164,7 +180,7 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env, override
     if (!/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(key.toString("latin1"))) refuse(`${CONFIG_FILES.tlsKey}: must be a PEM private key`);
     tls = { cert, key };
   } else {
-    deps.log({ ts: now(), event: "warning", tls: "off" });
+    deps.log({ ts: now(), event: "warning", tls: "off", ...(tlsRaw === TLS_OFF_NON_LOOPBACK ? { bindHost, override: TLS_OFF_NON_LOOPBACK } : {}) });
   }
   /**
    * Pin 6 backoff: attempt, and on failure wait 1, 2, 4, 8, 16, 16, … s while the budget allows; the last reason is
@@ -305,7 +321,13 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env, override
     if (approvals.kind === "slack") await slack.closeSlackApprovals().catch(() => undefined);
     await upstream.close().catch(() => undefined); return refuse(`front: ${message(e)}`);
   }
-  deps.log({ ts: now(), event: "listening", port: front.port, bindHost, approvals: approvals.kind, tls: tlsMode, allowedOrigins: allowedOrigins.length, maxInFlight });
+  // Server audit P3: which reviewed configuration this process serves (the registry and approvers live in an editable
+  // ConfigMap). Hashes of the files' bytes; agents.yaml holds only key digests, never keys.
+  const configSha256: Record<string, string> = {};
+  for (const f of [CONFIG_FILES.registry, CONFIG_FILES.agents, CONFIG_FILES.upstreams, ...(approvalsConfig !== undefined ? [CONFIG_FILES.approvals] : [])]) {
+    const h = fileSha256(join(dir, f)); if (h !== undefined) configSha256[f] = h;
+  }
+  deps.log({ ts: now(), event: "listening", port: front.port, bindHost, approvals: approvals.kind, tls: tlsMode, allowedOrigins: allowedOrigins.length, maxInFlight, configSha256 });
   let stopped = false;
   return {
     port: front.port, head,
