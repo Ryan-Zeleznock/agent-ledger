@@ -137,7 +137,7 @@ assert.deepEqual(Object.keys(appr.slack).sort(),['approvers','channelId','timeou
 const integ=job.spec.template.spec.containers[0].args[1];
 for(const flag of ["'--approvals','slack'","'--ca-file','/mnt/ca/ca.crt'","'--expect-legacy','everything'","'https://proxy.agent-ledger.svc:8787/mcp'"]) assert(integ.includes(flag),`integration smoke needs ${flag}`);
 const slackManifest=YAML.parse(fs.readFileSync('deploy/slack/app-manifest.yaml','utf8'));
-assert.deepEqual(slackManifest.oauth_config.scopes.bot,['chat:write']);
+assert.deepEqual(slackManifest.oauth_config.scopes.bot,['chat:write','users:read']);
 assert.equal(slackManifest.settings.socket_mode_enabled,true); assert.equal(slackManifest.settings.interactivity.is_enabled,true);
 assert.equal(slackManifest.settings.interactivity.request_url,undefined); assert.equal(slackManifest.settings.org_deploy_enabled,false); assert.equal(slackManifest.settings.token_rotation_enabled,false);
 if(appr.slack.channelId==='C0000000000') console.log('APPROVALS PLACEHOLDER: Ryan sets the channel and approver ids in HOMELAB step 5b.');

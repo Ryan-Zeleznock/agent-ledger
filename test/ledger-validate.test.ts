@@ -154,3 +154,17 @@ describe("projectUnsealed / projectStored (Astra #1, #9)", () => {
     expect(() => projectStored({ id: "only", prevHash: "0", parentRecordId: null, hash: "a".repeat(64) })).toThrow(ValidationError);
   });
 });
+
+describe('ADR-015 optional approverName', () => {
+  const approval = { callId: 'call-1', decision: 'approved', approver: 'U0C6UV8NMR7', approverName: 'Ryan Zeleznock', channel: 'slack', decidedAt: '2026-09-30T12:00:00Z' };
+  it('preserves the additive name on projection and strict read while retaining old records', () => {
+    expect(projectUnsealed({ ...unsealed(1), approval }).approval).toEqual(approval);
+    const stored = { ...sealedWithoutHash(1), approval, hash: 'a'.repeat(64) };
+    expect(projectStored(stored).approval).toEqual(approval);
+    const { approverName: _, ...old } = approval;
+    expect(projectStored({ ...stored, approval: old }).approval).toEqual(old);
+  });
+  it.each([42, {}, 'x'.repeat(16385), '\uD800'])('rejects invalid name scalars', name => {
+    expect(() => projectUnsealed({ ...unsealed(1), approval: { ...approval, approverName: name } })).toThrow(ValidationError);
+  });
+});

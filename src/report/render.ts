@@ -65,6 +65,11 @@ const agentSession = (r: LedgerRecord): string | undefined =>
 // No deployment-mode/provenance field exists; MCP names and missing hook ids cannot identify the writer.
 const missingSessionLabel = "not recorded (server mode or pre-1c)";
 const sessionLabel = (r: LedgerRecord) => agentSession(r) ?? missingSessionLabel;
+function approvalLabel(r: LedgerRecord): string {
+  const a = r.approval; if (!a) return "not recorded";
+  const member = a.approver ? (a.approverName?.trim() ? `${a.approverName} (${a.approver})` : a.approver) : "not recorded";
+  return `${a.decision}, ${member}`;
+}
 const denial = "A manual denial at the Claude Code permission prompt fires no hook event (Claude Code hooks reference, read 2026-10-01), so 'asked, no outcome observed' cannot distinguish a user's denial from a cancelled call, an interrupted session or lost telemetry. Only auto-mode denials are recorded (`permission-denied:auto-mode`).";
 
 function anchorLine(context?: ReportContext): string {
@@ -264,7 +269,7 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
       detailTable("Orphan outcomes", ["record_id", "call_id", "agent_session_id", "finding"], orphans.map(r => [r.id, r.call.callId, sessionLabel(r), heartbeatSessions.has(agentSession(r) ?? "") ? "intent gap" : "orphan outcome"])) +
       detailTable("Unreconciled handoffs", ["call_id", "proxy_server_name", "hook_record_id", "handed_off_at"], handoffs.map(h => [h.callId, h.proxyServerName, h.hookRecordId, h.handedOffAt])) +
       detailTable("Intents with no outcome observed", ["record_id", "call_id"], unobserved.map(r => [r.id, r.call.callId]))),
-    section("cc8-1", "CC8.1 change management", () => text(["[V] Scope: controlled, authorized changes (AICPA TSC, printed p. 44). [H] Mapping: write/risky/unreviewed tool decisions; a shell call need not be a production change."]) + table(["written_at", "agent_session_id", "server/tool", "risk", "approval (decision, approver)", "outcome (status, errorClass)", "evidence_class"], tools.filter(r => r.policy.risk !== "read").map(r => [r.writtenAt, sessionLabel(r), `${r.call.server}/${r.call.tool}`, r.policy.risk, r.approval ? `${r.approval.decision}, ${r.approval.approver ?? "not recorded"}` : "not recorded", outcomes.get(r.call.callId)?.outcome ? json(outcomes.get(r.call.callId)!.outcome) : "no outcome observed", label(r)]), "Change decisions", true, tools.filter(r => r.policy.risk !== "read")) + text([denial])),
+    section("cc8-1", "CC8.1 change management", () => text(["[V] Scope: controlled, authorized changes (AICPA TSC, printed p. 44). [H] Mapping: write/risky/unreviewed tool decisions; a shell call need not be a production change."]) + table(["written_at", "agent_session_id", "server/tool", "risk", "approval (decision, approver)", "outcome (status, errorClass)", "evidence_class"], tools.filter(r => r.policy.risk !== "read").map(r => [r.writtenAt, sessionLabel(r), `${r.call.server}/${r.call.tool}`, r.policy.risk, approvalLabel(r), outcomes.get(r.call.callId)?.outcome ? json(outcomes.get(r.call.callId)!.outcome) : "no outcome observed", label(r)]), "Change decisions", true, tools.filter(r => r.policy.risk !== "read")) + text([denial])),
     section("records", "Record evidence", () => {
       // Presentation derives from the unchanged CSV projection; retain every non-empty source field.
       const compact = table(["Chain", "Time", "Phase", "Tool", "Decision", "Evidence class", "Criteria"], records.map((r, i) => [`${reference(i)}\nprev ${display(r.prevHash).slice(0, 12)}\nhash ${display(r.hash).slice(0, 12)}`, r.writtenAt, r.phase, r.call.tool, isHeartbeat(r) ? "health record" : r.handoff ? "handoff" : r.policy.verdict, label(r), rows[i]![16]!]), "Record index; full fields follow in numbered details", false, records);

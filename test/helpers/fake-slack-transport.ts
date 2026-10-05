@@ -19,12 +19,14 @@ export class FakeSlackTransport {
   }
   fetch = (async (url: string | URL | Request, init?: RequestInit) => {
     const method = String(url).split('/').at(-1)!;
-    const body = JSON.parse(String(init?.body ?? '{}'));
+    const raw = String(init?.body ?? '{}');
+    const body = new Headers(init?.headers).get('content-type')?.includes('application/x-www-form-urlencoded') ? Object.fromEntries(new URLSearchParams(raw)) : JSON.parse(raw);
     this.calls.push({ method, body, headers: new Headers(init?.headers) });
     const scripted = this.replies.get(method)?.shift();
     if (scripted) return scripted();
     const result = method === 'auth.test' ? { team_id: this.teamId, user_id: 'U0000000000' }
       : method === 'apps.connections.open' ? { url: 'wss://wss-primary.slack.com/socket' }
+      : method === 'users.info' ? { user: { id: body.user, profile: { real_name: 'Ryan Zeleznock' } } }
       : method === 'chat.postMessage' ? { channel: body.channel, ts: `${++this.sequence}.001` } : {};
     return Response.json({ ok: true, ...result });
   }) as typeof fetch;

@@ -172,6 +172,7 @@ afterAll(async () => {
 describe.sequential("Slice 2b harness self-tests (always run: the fakes are proven before A integrates)", () => {
   it("fake Slack Web API: token checked then dropped (wrong/missing/wrong-type → ok:false), auth.test ids, chat.postMessage ts; no token in any recorded body", async () => {
     const api = (m: string, token: string | undefined, body: unknown = {}) => fetch(`${slack.apiBaseUrl}${m}`, { method: "POST", headers: { "content-type": "application/json; charset=utf-8", ...(token ? { authorization: `Bearer ${token}` } : {}) }, body: JSON.stringify(body) }).then((r) => r.json() as Promise<Record<string, unknown>>);
+    expect(await api("users.info", BOT, { user: APPROVER })).toMatchObject({ ok: true, user: { id: APPROVER, profile: { real_name: "Ryan Zeleznock" } } });
     expect(await api("auth.test", BOT)).toMatchObject({ ok: true, team_id: slack.teamId, user_id: slack.botUserId });
     expect(await api("auth.test", "xoxb-wrong")).toEqual({ ok: false, error: "invalid_auth" });
     expect(await api("apps.connections.open", BOT)).toEqual({ ok: false, error: "not_allowed_token_type" });
@@ -294,7 +295,7 @@ describe.sequential("Slice 2b end to end: Slack approvals + the legacy-era bridg
     slack.click(message, { action: "approve", userId: APPROVER });
     const r = await pending;
     expect(r["isError"]).toBe(false); expect(toolText(r)).toBe("nothing was wiped: demo tool");
-    expect(intentOf(callId)?.approval).toMatchObject({ callId, decision: "approved", approver: APPROVER, channel: "slack", reason: `slack: Approve clicked by ${APPROVER}` });
+    expect(intentOf(callId)?.approval).toMatchObject({ callId, decision: "approved", approver: APPROVER, approverName: "Ryan Zeleznock", channel: "slack", reason: `slack: Approve clicked by ${APPROVER}` });
     expect(outcomeOf(callId)?.outcome).toMatchObject({ status: "ok" });
     await slack.waitFor(() => slack.callsOf("chat.update").length === 1, 5_000, "chat.update");
     expect(slack.callsOf("chat.update")[0]!.body).toMatchObject({ channel: CHANNEL, ts: message.ts });
@@ -305,7 +306,7 @@ describe.sequential("Slice 2b end to end: Slack approvals + the legacy-era bridg
     slack.click(message, { action: "deny", userId: APPROVER });
     const r = await pending;
     expect(r["isError"]).toBe(true);
-    expect(intentOf(callId)?.approval).toMatchObject({ decision: "denied", approver: APPROVER, channel: "slack", reason: `slack: Deny clicked by ${APPROVER}` });
+    expect(intentOf(callId)?.approval).toMatchObject({ decision: "denied", approver: APPROVER, approverName: "Ryan Zeleznock", channel: "slack", reason: `slack: Deny clicked by ${APPROVER}` });
     expect(outcomeOf(callId)?.outcome).toMatchObject({ status: "blocked" });
     expect(legacy.toolCalls()).not.toContain("env");
   });
@@ -412,7 +413,7 @@ describe.sequential("Slice 2b end to end: Slack approvals + the legacy-era bridg
     expect(intentOf(callId)?.approval).toMatchObject({ decision: "unavailable", reason: "Slack unreachable: proxy shutting down" });
     expect(outcomeOf(callId)?.outcome).toMatchObject({ status: "blocked" });
   });
-  step("12. verify exit 0; the CC8.1 table shows approved, <U> + executed after ask (4), denied: Slack denied (5), denied: Slack timeout (6), denied: Slack unavailable (11); leak sweep over ledger, outputs, the fake's bodies and the pack", MAIN, async () => {
+  step("12. verify exit 0; the CC8.1 table shows approved, <name> (<U>) + executed after ask (4), denied: Slack denied (5), denied: Slack timeout (6), denied: Slack unavailable (11); leak sweep over ledger, outputs, the fake's bodies and the pack", MAIN, async () => {
     const env = { ...base };
     // Demo order (docs/DEMO.md, Slice 1c): anchor the head first, so verify can exit 0 (exit 3 = chain ok, no anchor).
     const anchor = await run(process.execPath, [cli, "anchor", "--dir", ledgerDir], { cwd: sandbox, env });
@@ -433,7 +434,7 @@ describe.sequential("Slice 2b end to end: Slack approvals + the legacy-era bridg
     expect(cls(callIds["unavailable"]!)).toEqual(["denied: Slack unavailable"]);
     const html = readFileSync(out.htmlPath, "utf8");
     const cc81 = html.split('<section id="cc8-1">')[1]!.split("</section>")[0]!;
-    expect(cc81).toContain(`approved, ${APPROVER}`); expect(cc81).toContain("executed after ask");
+    expect(cc81).toContain(`approved, Ryan Zeleznock (${APPROVER})`); expect(cc81).toContain("executed after ask");
     // leak sweep
     const nonces = slack.posted.flatMap((m) => JSON.stringify(m.body).match(/:[0-9a-f]{32}"/g) ?? []).map((s) => s.slice(1, -1));
     expect(nonces.length).toBeGreaterThan(0);

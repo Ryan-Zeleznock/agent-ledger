@@ -444,3 +444,20 @@ it("labels absent agent sessions conservatively in HTML/PDF/CSV without guessing
   expect(p.csv.split("\n")[0]!.split(",")).toHaveLength(28);
   expect(section(p.html, "cc6-1")).not.toContain("not applicable (server mode)");
 });
+
+it('renders the approver name with the stable member id and keeps it in the existing CSV approval JSON', async () => {
+  const r = rec(1); approve(r, 'approved'); Object.assign(r.approval!, { approver: 'U0C6UV8NMR7', approverName: 'Ryan Zeleznock' });
+  const p = await pack([r]);
+  expect(section(p.html, 'cc8-1')).toContain('approved, Ryan Zeleznock (U0C6UV8NMR7)');
+  expect(p.pdfText.replace(/\s+/g, ' ')).toContain('approved, Ryan Zeleznock (U0C6UV8NMR7)');
+  expect(p.csv).toContain('""approverName"":""Ryan Zeleznock""');
+  expect(p.csv.split('\n')[0]!.split(',')).toHaveLength(28);
+});
+it('escapes display names and preserves member-only reports when lookup is absent', async () => {
+  const named = rec(1); approve(named, 'denied'); Object.assign(named.approval!, { approverName: '<script>(é) & "name"</script>' });
+  const old = rec(2); approve(old, 'approved');
+  const p = await pack([named, old]); const cc8 = section(p.html, 'cc8-1');
+  expect(cc8).toContain('denied, &lt;script&gt;(é) &amp; &quot;name&quot;&lt;/script&gt; (reviewer)');
+  expect(cc8).not.toContain('<script>'); expect(cc8).toContain('approved, reviewer');
+  expect(p.pdfText.replace(/\s+/g, ' ')).toContain('denied, <script>(é) & "name"</script> (reviewer)');
+});

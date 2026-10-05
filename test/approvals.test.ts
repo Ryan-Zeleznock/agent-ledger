@@ -174,3 +174,79 @@ describe('Fable review recovery and feedback regressions', () => {
     expect((await a.requestApproval(call, policy, channel)).reason).toBe('Slack unreachable: websocket'); expect(fake.sockets).toHaveLength(0);
   });
 });
+
+describe('ADR-015 approver names', () => {
+  it.each(['approved', 'denied'] as const)('looks up the winning member at decision time for %s', async decision => {
+    const p = a.requestApproval(call, policy, channel); await flush();
+    expect(fake.calls.some(c => c.method === 'users.info')).toBe(false);
+    const actions = fake.posts()[0]!.body.blocks.find((b: any) => b.type === 'actions');
+    fake.click(0, { actions: [{ ...actions.elements[decision === 'approved' ? 0 : 1], block_id: actions.block_id }] });
+    expect(a.getSlackApprovalRouter(channel).pendingCount).toBe(0);
+    expect(await p).toMatchObject({ decision, approver: 'U0123456789', approverName: 'Ryan Zeleznock' });
+    const lookups = fake.calls.filter(c => c.method === 'users.info');
+    expect(lookups).toHaveLength(1); expect(lookups[0]!.body).toEqual({ user: 'U0123456789' });
+    expect(lookups[0]!.headers.get('authorization')).toBe('Bearer xoxb-test-secret');
+    expect(lookups[0]!.headers.get('content-type')).toContain('application/x-www-form-urlencoded');
+  });
+  it.each(['missing_scope', 'rate_limit', 'network', 'malformed', 'wrong_member', 'empty', 'oversize', 'invalid_unicode', 'reflected_token'])('omits the name on %s and preserves the decision without response values', async failure => {
+    fake.replies.set('users.info', [() => {
+      if (failure === 'network') throw Error('xoxb-test-secret');
+      if (failure === 'rate_limit') return new Response('xoxb-test-secret', { status: 429, headers: { 'retry-after': '30' } });
+      if (failure === 'missing_scope') return Response.json({ ok: false, error: 'missing_scope', detail: 'xoxb-test-secret' });
+      if (failure === 'malformed') return new Response('xoxb-test-secret');
+      return Response.json({ ok: true, user: { id: failure === 'wrong_member' ? 'Uwrong' : 'U0123456789', profile: {
+        real_name: failure === 'empty' ? '  ' : failure === 'oversize' ? 'x'.repeat(257) : failure === 'invalid_unicode' ? '\uD800' : 'xoxb-test-secret',
+      } } });
+    }]);
+    const p = a.requestApproval(call, policy, channel); await flush(); fake.click(); const r = await p;
+    expect(r).toMatchObject({ decision: 'approved', approver: 'U0123456789' }); expect(r).not.toHaveProperty('approverName');
+    expect(JSON.stringify(r)).not.toContain('xoxb-test-secret'); expect(fake.calls.filter(c => c.method === 'users.info')).toHaveLength(1);
+  });
+  it('bounds a non-cooperating name lookup and locks the winner before competing clicks, timeout or shutdown', async () => {
+    fake.replies.set('users.info', [() => new Promise(() => {})]);
+    const p = a.requestApproval(call, policy, { ...channel, timeoutMs: 500 }); await flush();
+    const decidedAt = new Date().toISOString(); fake.click(); fake.click(0, { user: { id: 'U0987654321', team_id: fake.teamId } });
+    await a.closeSlackApprovals(); await vi.advanceTimersByTimeAsync(500);
+    expect(await p).toMatchObject({ decision: 'approved', approver: 'U0123456789', decidedAt });
+    expect(await p).not.toHaveProperty('approverName'); expect(fake.calls.filter(c => c.method === 'users.info')).toHaveLength(1);
+  });
+  it('bounds stalled users.info response bodies to one second', async () => {
+    fake.replies.set('users.info', [() => new Response(new ReadableStream({ start() {}, cancel() {} }))]);
+    const p = a.requestApproval(call, policy, channel); await flush(); fake.click(); await flush();
+    await vi.advanceTimersByTimeAsync(1000); expect(await p).toMatchObject({ decision: 'approved' });
+    expect(await p).not.toHaveProperty('approverName');
+  });
+  it('does not query member profiles for unauthorized clicks, timeouts or shutdown', async () => {
+    const p = a.requestApproval(call, policy, channel); await flush();
+    fake.click(0, { user: { id: 'U1111111111', team_id: fake.teamId } });
+    await vi.advanceTimersByTimeAsync(channel.timeoutMs); expect((await p).decision).toBe('timeout');
+    expect(fake.calls.filter(c => c.method === 'users.info')).toHaveLength(0);
+  });
+});
+
+it.each([
+  { profile: { real_name: '  Ryan Zeleznock  ', display_name: 'Ryan' }, real_name: 'Other' },
+  { profile: {}, real_name: 'Ryan Zeleznock' },
+  { profile: { display_name: 'Ryan Zeleznock' } },
+])('uses a bounded real/display name snapshot without caching: %j', async fields => {
+  fake.replies.set('users.info', [() => Response.json({ ok: true, user: { id: 'U0123456789', ...fields } }),
+    () => Response.json({ ok: true, user: { id: 'U0123456789', real_name: 'Updated Name' } })]);
+  const first = a.requestApproval(call, policy, channel); await flush(); fake.click();
+  expect(await first).toHaveProperty('approverName', 'Ryan Zeleznock');
+  const second = a.requestApproval({ ...call, callId: 'second' }, policy, channel); await flush(); fake.click(1);
+  expect(await second).toHaveProperty('approverName', 'Updated Name');
+});
+it.each([true, false])('omits names from a profile response exceeding 64 KiB, declared=%s', async declared => {
+  fake.replies.set('users.info', [() => Response.json({ ok: true, user: { id: 'U0123456789', real_name: 'Ryan Zeleznock' }, padding: 'x'.repeat(65536) },
+    declared ? { headers: { 'content-length': '70000' } } : {})]);
+  const p = a.requestApproval(call, policy, channel); await flush(); fake.click();
+  expect(await p).toMatchObject({ decision: 'approved' }); expect(await p).not.toHaveProperty('approverName');
+});
+it('discards late lookup completion after its deadline instead of mutating the returned approval', async () => {
+  let finish!: (r: Response) => void;
+  fake.replies.set('users.info', [() => new Promise(resolve => { finish = resolve; })]);
+  const p = a.requestApproval(call, policy, channel); await flush(); fake.click(); await flush();
+  await vi.advanceTimersByTimeAsync(1000); const settled = await p; expect(settled).not.toHaveProperty('approverName');
+  finish(Response.json({ ok: true, user: { id: 'U0123456789', real_name: 'Late Name' } })); await flush();
+  expect(settled).not.toHaveProperty('approverName'); expect(settled.decision).toBe('approved');
+});

@@ -441,3 +441,16 @@ describe("createLedger('jsonl'): read(range)", () => {
     await expect((async () => { for await (const _r of bad) void _r; })()).rejects.toThrow(/range/);
   });
 });
+
+it('round-trips and hashes optional approverName alongside older approvals', async () => {
+  const ledger = createLedger('jsonl', path);
+  const approval = { callId: 'call-1', decision: 'approved' as const, approver: 'U0C6UV8NMR7', channel: 'slack' as const, decidedAt: '2026-09-30T12:00:00Z' };
+  await ledger.append({ ...unsealed(1), approval });
+  const named = await ledger.append({ ...unsealed(2), approval: { ...approval, callId: 'call-2', ...{ approverName: 'Ryan Zeleznock' } } });
+  expect(named.approval).toHaveProperty('approverName', 'Ryan Zeleznock');
+  const read = []; for await (const r of ledger.read({ from: '2020-01-01T00:00:00Z', to: '2099-01-01T00:00:00Z' })) read.push(r);
+  expect(read[0]!.approval).not.toHaveProperty('approverName'); expect(read[1]!.approval).toEqual(named.approval);
+  expect(await ledger.verify()).toEqual({ ok: true, checked: 2 });
+  const changed = parsed(); Object.assign(changed[1]!.approval!, { approverName: 'Changed Name' }); rewrite(changed);
+  expect((await ledger.verify()).ok).toBe(false);
+});

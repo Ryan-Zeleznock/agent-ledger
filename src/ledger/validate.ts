@@ -171,7 +171,7 @@ const noExtra = (o: Record<string, unknown>, allowed: readonly string[], field: 
 // lenient append would DROP the field and the strict read would REJECT it, so the heartbeat/session checks would compute on nothing.
 const CALL_KEYS = ["callId", "sessionId", "agentId", "agentSessionId", "onBehalfOf", "declaredPlan", "server", "tool", "args", "receivedAt"] as const;
 const POLICY_KEYS = ["verdict", "ruleId", "reason", "risk"] as const;
-const APPROVAL_KEYS = ["callId", "decision", "approver", "reason", "decidedAt", "channel"] as const;
+const APPROVAL_KEYS = ["callId", "decision", "approver", "approverName", "reason", "decidedAt", "channel"] as const;
 const OUTCOME_KEYS = ["status", "errorClass", "durationMs"] as const;
 const HANDOFF_KEYS = ["kind", "proxyServerName"] as const;
 const UNSEALED_KEYS = ["id", "phase", "call", "policy", "approval", "outcome", "handoff"] as const;
@@ -199,7 +199,7 @@ export function projectApproval(v: unknown, field: string, mode: Mode = LENIENT)
     callId: str(a.callId, `${field}.callId`), decision: oneOf(a.decision, APPROVAL_DECISIONS, `${field}.decision`),
     decidedAt: instant(a.decidedAt, `${field}.decidedAt`),
     channel: oneOf(a.channel, APPROVAL_CHANNEL_KINDS, `${field}.channel`),
-  }, { approver: optStr(a, "approver", field), reason: optStr(a, "reason", field) });
+  }, { approver: optStr(a, "approver", field), approverName: optStr(a, "approverName", field), reason: optStr(a, "reason", field) });
 }
 export function projectOutcome(v: unknown, field: string, mode: Mode = LENIENT): Outcome {
   const o = obj(v, field);

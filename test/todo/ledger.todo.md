@@ -106,3 +106,5 @@ Coordinator acceptance, 2026-10-03: external Unix socket via AGENT_LEDGER_TEST_P
 1118 unit passed / 7 existing skips and 79 timing passed. First run also passed typecheck/build. Test databases
 remaining: zero. Timings were not supplied. No production/test/manifest behavior changed after these verified runs.
 Postgres-specific revert-check remains undemonstrated; the pre-implementation attempt failed at sandbox setup.
+
+- [x] ADR-015 approverName: additive bounded scalar accepted by append/strict-read, old records valid, name covered by JSONL hash. Coordinator reruns Postgres parity.

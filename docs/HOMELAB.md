@@ -125,9 +125,12 @@ Undo: `kubectl -n agent-ledger delete secret ghcr-pull`. Remove the temporary cr
 
 Changes: one new Slack app in your workspace, one private channel, two token files on the Mac. ADR-015.
 1. https://api.slack.com/apps → **Create New App** → **From a manifest** → your workspace → paste
-   `deploy/slack/app-manifest.yaml` (name "Agent Ledger", bot `agent-ledger`, bot scope `chat:write` only, Socket Mode on,
+   `deploy/slack/app-manifest.yaml` (name "Agent Ledger", bot `agent-ledger`, bot scopes `chat:write` + `users:read`, Socket Mode on,
    interactivity on with no Request URL, org deploy off, token rotation off) → Create.
-2. **Install to Workspace** → copy the **Bot User OAuth Token** (`xoxb-…`).
+2. **Install to Workspace** → copy the **Bot User OAuth Token** (`xoxb-…`). For an existing app, add
+   `users:read` under OAuth & Permissions → Bot Token Scopes, then **Reinstall to Workspace** to grant it.
+   If Slack issues a new bot token, replace the private token file and refresh the `slack-tokens` Secret (step 5b).
+   The member-id allowlist is unchanged; `users.info` only supplies a best-effort name at decision time.
 3. **Basic Information → App-Level Tokens → Generate Token and Scopes**, scope **`connections:write`** → copy the `xapp-…` token.
 4. Create a **private** channel `#agent-ledger-approvals`; in it run `/invite @agent-ledger`. Channel details → copy the
    channel id (`C…` or `G…`). For each approver: profile → ⋯ → **Copy member ID** (`U…`/`W…`).
@@ -140,8 +143,8 @@ mkdir -p "$LAB_EVIDENCE/.secrets" && chmod 700 "$LAB_EVIDENCE/.secrets"
 ```
 
 Verify: `stat -f '%Sp %N' "$LAB_EVIDENCE"/.secrets/slack-*` shows `-rw-------` for both; `cut -c1-5` of each file prints
-`xoxb-` and `xapp-` respectively (prefix only); the app's Socket Mode page shows "enabled". Never paste a token into a
-shell command line, chat, the vault or a log. **This app is dedicated to the ONE lab proxy**: Slack sends each click to any
+`xoxb-` and `xapp-` respectively (prefix only); the app's Socket Mode page shows "enabled" and OAuth & Permissions
+lists both bot scopes after reinstall. Never paste a token into a shell command line, chat, the vault or a log. **This app is dedicated to the ONE lab proxy**: Slack sends each click to any
 of the app's open Socket Mode connections, so any second consumer (another proxy, a test script, a Codex hook) eats clicks.
 Undo: Slack app settings → **Delete App** (revokes both tokens), delete the channel if unwanted, `rm` the two token files.
 
@@ -815,8 +818,8 @@ records. Anchors prove history but are **not** database backups. Rebuilding empt
 **2b:** TLS uses a lab CA, not a public one (trusted via `NODE_EXTRA_CA_CERTS`; cert-manager/public CA is 2c); the
 `everything` upstream has no auth of its own (NetworkPolicy `25-everything` is its boundary); Slack egress is any public
 IPv4 on 443 (FQDN policy is 2c); ONE proxy replica per Slack app (a second Socket Mode consumer eats clicks); approvers
-are Slack member ids (display names need `users:read`, 2c); a client that gives up while an approval is pending does
-not cancel it: an approval that arrives later still executes and is recorded (the pipeline has no abort input; 2c);
+are Slack member ids (display names are best-effort `users.info` snapshots; missing scope, timeout or lookup failure
+leaves the name absent without changing the decision); a client that gives up while an approval is pending does not cancel it: an approval that arrives later still executes and is recorded (the pipeline has no abort input; 2c);
 decide-only (Codex hook) Slack is 2c (ADR-015). 2a residuals below still apply except where 2b closed them (TLS,
 legacy-era upstreams, Slack approvals, BusyBox/Postgres digests). One Postgres replica on one node's disk; the Kaniko project is archived;
 no approval channel means risky calls are denied, not approved.
@@ -827,8 +830,8 @@ without a recorded approval".
 
 That claim applies to the governed tools (the `demo` and `everything` upstreams) and the credential/network boundary
 proved above. With Slice 2b a risky call runs ONLY after an allowlisted Slack approver clicks Approve, and the intent
-record names that approver (`approved, U…`); a deny, a timeout, Slack being unreachable or a proxy shutdown are
-recorded denials (step 12b, step 13). The demo's risky actions are harmless (`demo__wipe` wipes nothing; `get-env`
+record names that approver (`approved, Ryan Zeleznock (U…)`, or `approved, U…` if lookup fails); a deny, a timeout,
+Slack being unreachable or a proxy shutdown are recorded denials (step 12b, step 13). The demo's risky actions are harmless (`demo__wipe` wipes nothing; `get-env`
 runs in a Pod whose environment holds nothing secret). It does not turn local hooks into enforcement or defend against
 cluster/DB admins. The local test database is 16; the cluster Job closes the 17.11/runtime gap.
 
@@ -838,6 +841,6 @@ BusyBox, Postgres and the `everything` build/runtime bases are pinned by index d
 invented by this runbook.
 
 Still open after 2b (2c): decide-only (Codex hook) Slack approvals; FQDN-scoped Slack egress and Cilium L7 policies;
-cert-manager or a public CA; approver display names; cancelling a pending approval when the client gives up; stdio
+cert-manager or a public CA; cancelling a pending approval when the client gives up; stdio
 front and upstream; versioned migrations; database password files and scram local auth; a separate integration key;
 a maintained image builder replacing archived Kaniko.

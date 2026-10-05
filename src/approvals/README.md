@@ -35,5 +35,22 @@ https://docs.slack.dev/reference/methods/chat.postMessage/ and https://docs.slac
 No network research or live Slack validation was possible in Astra's sandbox. Fake transport acceptance tests are in
 `test/approvals*.test.ts`; the coordinator owns live/loopback validation and cross-review.
 
-Residuals: server mode only; one dedicated Slack app and one proxy process (ADR-015). Decide-only hook Slack, display
-names, and cancellation when an agent disconnects are deferred to 2c. A message update may fail after a recorded decision.
+Residuals: server mode only; one dedicated Slack app and one proxy process (ADR-015). Decide-only hook Slack
+and cancellation when an agent disconnects are deferred to 2c. A message update may fail after a recorded decision.
+
+
+## ADR-015 name amendment (accepted 2026-10-05)
+
+A valid click settles and removes the pending entry synchronously, preserving the winning member id, decision,
+reason and decision timestamp. Before returning the immutable result, one best-effort `users.info` POST (form-encoded
+`user`, bot bearer; scope `users:read`) adds optional `approverName`. The lookup has at most **1 second**, capped by
+the remaining approval wait; it never retries. Both fetch and body parsing race that deadline, even for injected
+transports that ignore abort. The response body is capped at 64 KiB. No failure can revise the decision or emit response
+values; failure/absent/invalid names simply omit the field. Only a matching returned user id is accepted; prefer profile
+real_name, then user real_name, then profile display_name. Names are trimmed, well-formed, control-free, ≤256 characters,
+and cannot contain the known tokens or nonce. No profile cache: names reflect each decision's lookup, not later edits.
+Display names are presentation, never allowlist identity. HTML/PDF retain the member id; CSV uses existing approval JSON.
+
+Tests: `ADR-015 approver names` in `test/approvals.test.ts`; ledger projection, strict-read/hash round-trip, report
+escaping and legacy member-only rendering. Fake Slack supports `users.info` in both in-process and loopback fixtures.
+Live scope/reinstall and users.info compatibility are coordinator checks (no network in this build sandbox).

@@ -218,3 +218,5 @@ Therefore HTML/PDF and the existing CSV `agent_session_id` label use the conserv
 Vocabulary explanation, instead of asserting `not applicable (server mode)`. CSV remains 28 columns.
 Test: `labels absent agent sessions conservatively in HTML/PDF/CSV without guessing from MCP names`.
 Coordinator owns the pin-8 wording amendment; no mode field or enforcement claim was added.
+
+ADR-015 amendment (2026-10-05): CC8.1 renders `approved, Ryan Zeleznock (U0C6UV8NMR7)` when a name is recorded, retaining the stable member id. Missing names keep the member-only rendering. HTML/PDF escape names through the existing renderer; CSV keeps its 28 columns and includes the additive name inside the existing `approval` JSON cell.
