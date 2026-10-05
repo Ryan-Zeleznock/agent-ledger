@@ -112,3 +112,22 @@ Coordinator fix (2026-10-04): POST fetch, body reads and stream cancellation exp
 so the existing 30 s deadline also bounds non-cooperating injected transports/streams. A reflected 404/-32603 still
 selects legacy per pin 2; a silent initialize fails value-free as UpstreamUnavailable. The server regression fixture
 now explicitly refuses initialize instead of silently waiting beyond its 5 s test limit.
+
+## Live restart correction (2026-10-05)
+
+[V] Read-only primary source at `/private/tmp/claude-501/everything-e2e/node_modules/`:
+`@modelcontextprotocol/server-everything` 2026.8.31, `dist/transports/streamableHttp.js:45-51,80-94`:
+the POST router rejects an unknown session BEFORE calling the SDK with HTTP **400**, JSON-RPC code **-32000**,
+message **`Bad Request: No valid session ID provided`**, and the request id. This is the live restart path.
+The SDK itself (`@modelcontextprotocol/sdk` **1.32.0**, `dist/esm/server/webStandardStreamableHttp.js:738-757`)
+returns **404 / -32001 / `Session not found`** for a mismatch on an initialized transport; a fresh uninitialized
+transport returns **400 / -32000 / `Bad Request: Server not initialized`**. Session validation precedes dispatch
+(lines 549-562). Thus the original hypothesis was right about the reference app's 400, but not its source layer.
+
+A legacy request carrying a session now recovers on 404 or the exact reference-app 400 envelope (matching request id,
+2.0, no result, exact code/message). Other 400s remain errors, including the SDK's distinct uninitialized error.
+The existing shared handshake drops the stale session; each original request resends at most once. Body inspection
+uses the existing 4 MiB cap and 30 s deadline, and retains only a boolean; no response text/data enters diagnostics.
+`test/upstream-dual-era.test.ts` uses `LegacyUpstream.restart()` through Node's HTTP parser over stream pairs
+(no loopback), proving concurrent recovery, two accepted calls for two callers, bounded retry, unrelated/malformed
+400 refusal and size/time limits. Coordinator: repeat with the real reference process restarted under the proxy.

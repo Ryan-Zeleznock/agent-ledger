@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { LegacyUpstream } from './helpers/legacy-upstream.js';
+import { frontFetch } from './helpers/inproc-http.js';
 import { FakeMcpFetch } from './helpers/fake-mcp-fetch.js';
 import { connectUpstreams, headerParams, SseParser, type Upstream } from '../src/upstream/contract.js';
 import type { ToolCall } from '../src/types/index.js';
@@ -237,4 +239,58 @@ describe('Fable review legacy recovery and schema regressions', () => {
     }) as typeof fetch);
     const up = await connect(); expect((await up.execute(call)).isError).toBe(false);
   });
+});
+
+
+describe('live legacy restart regression', () => {
+  it.each([400, 404] as const)('recovers once single-flight after the legacy server forgets sessions (HTTP %s)', async status => {
+    const legacy = new LegacyUpstream({ unknownSessionStatus: status, mode: 'alternate' });
+    vi.stubGlobal('fetch', frontFetch(legacy.server));
+    const up = await connect(); legacy.restart();
+    const results = await Promise.all([up.execute(call), up.execute(call)]);
+    expect(results.every(r => !r.isError)).toBe(true);
+    expect(legacy.log.filter(r => r.method === 'initialize')).toHaveLength(2);
+    expect(legacy.log.filter(r => r.method === 'tools/call' && r.status === status)).toHaveLength(2);
+    expect(legacy.log.filter(r => r.method === 'tools/call' && r.status === 200)).toHaveLength(2);
+    expect(legacy.toolCalls().filter(t => t === 'echo')).toHaveLength(2);
+  });
+  it('stops after one resend of the exact reference-app 400 without exposing response values', async () => {
+    const up = await connect();
+    fake.script = r => r.body.method === 'tools/call' ? Response.json({ jsonrpc: '2.0', id: r.body.id,
+      error: { code: -32000, message: 'Bad Request: No valid session ID provided', data: 'upstream-secret' } }, { status: 400 }) : undefined;
+    await expect(up.execute(call)).rejects.toThrow('HTTP 400 on tools/call');
+    expect(fake.seen.filter(r => r.body.method === 'initialize')).toHaveLength(2);
+    expect(fake.seen.filter(r => r.body.method === 'tools/call')).toHaveLength(2);
+  });
+  it.each([
+    { code: -32000, message: 'Bad Request: Unsupported protocol version' },
+    { code: -32000, message: 'Bad Request: Server not initialized' },
+    { code: -32602, message: 'Bad Request: No valid session ID provided' },
+    { code: -32000, message: 'Bad Request: No valid session ID provided upstream-secret' },
+  ])('does not retry other 400 errors: %j', async error => {
+    const up = await connect(); fake.script = r => r.body.method === 'tools/call'
+      ? Response.json({ jsonrpc: '2.0', id: r.body.id, error }, { status: 400 }) : undefined;
+    await expect(up.execute(call)).rejects.toThrow(/^upstream demo: HTTP 400 on tools\/call$/);
+    expect(fake.seen.filter(r => r.body.method === 'initialize')).toHaveLength(1);
+    expect(fake.seen.filter(r => r.body.method === 'tools/call')).toHaveLength(1);
+  });
+  it.each(['bad-id', 'result', 'bad-json'])('does not recover a malformed session-error envelope: %s', async shape => {
+    const up = await connect(); fake.script = r => r.body.method === 'tools/call' ? new Response(shape === 'bad-json' ? 'upstream-secret' : JSON.stringify({
+      jsonrpc: '2.0', id: shape === 'bad-id' ? 999 : r.body.id,
+      error: { code: -32000, message: 'Bad Request: No valid session ID provided' }, ...(shape === 'result' ? { result: {} } : {}),
+    }), { status: 400 }) : undefined;
+    await expect(up.execute(call)).rejects.toThrow(/^upstream demo: HTTP 400 on tools\/call$/);
+    expect(fake.seen.filter(r => r.body.method === 'initialize')).toHaveLength(1);
+  });
+});
+
+it('bounds legacy 400 body inspection by the existing response cap and deadline', async () => {
+  const up = await connect();
+  fake.script = r => r.body.method === 'tools/call' ? new Response('private-value', { status: 400, headers: { 'content-length': String(4 * 1024 * 1024 + 1) } }) : undefined;
+  await expect(up.execute(call)).rejects.toThrow('response exceeds');
+  vi.useFakeTimers();
+  fake.script = r => r.body.method === 'tools/call' ? new Response(new ReadableStream({ start() {}, cancel() {} }), { status: 400 }) : undefined;
+  const p = expect(up.execute(call)).rejects.toMatchObject({ name: 'UpstreamTimeout' });
+  await vi.advanceTimersByTimeAsync(30_000); await p;
+  expect(fake.seen.filter(r => r.body.method === 'initialize')).toHaveLength(1);
 });
