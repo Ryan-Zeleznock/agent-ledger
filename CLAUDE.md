@@ -9,3 +9,8 @@ Rules:
 - Shared shapes live only in `src/types/`. Only `src/pipeline/` imports other modules.
 - Log your session and handoffs in the vault, not here.
 - `npm run typecheck && npm test` must pass before any commit.
+
+## Design System
+Read DESIGN.md before visual or UI work: it defines the fonts, colors, spacing, and
+aesthetic direction ("The Filed Instrument"). Don't deviate without explicit approval.
+In QA or review mode, flag code that doesn't match DESIGN.md.

@@ -162,38 +162,50 @@ CLI and merged e2e seams require coordinator integration and independent review.
 Regression tests: `test/report-slice-1c.test.ts`, `test/report-pdf.test.ts`. Fable's full review
 is retained at `docs/reviews/2026-10-03-fable-slice-1c-pack-review.md`; fixes need his scoped verification.
 
-## Auditor layout (2026-10-04 design audit)
+## The Filed Instrument (DESIGN.md, 2026-10-04)
 
-HTML leads with chain/anchor/findings status expressed in text as well as color, followed by
-a definition grid and the unchanged trust-boundary callout. The status band is additional:
-all pinned summary lines, including chain/anchor and the full observed head, remain contiguous
-escaped text runs below it. Contents links retain all six pin-8
-section IDs and include record/check counts. Monitoring lists every anomaly check even at zero,
-and emits detail tables only for populated checks. Heartbeat counts remain explicit.
+The offline HTML uses DESIGN.md's white 1080px sheet, 64px desktop / 24px mobile padding,
+iron-gall ink, ruled tables and square corners. The exhibit cover has a right-hand registration
+block, followed by the round bronze chain seal, verbatim chain/anchor lines and full head hash.
+The trust boundary is on the cover without a side border. No entity, policy version/reviewer or
+mode attestation exists in the frozen report API; registration labels these as unavailable.
+The pack identifier is an `AL-` prefix plus the generation timestamp, not a ledger attestation.
 
-Charter/Iowan/Cambria/Georgia are offline prose fonts chosen for long-form reading; system sans
-labels and tables distinguish navigation from evidence. Prose is limited to 72ch inside a 1180px
-page. Only IDs/hashes use monospace; time/count columns use tabular numerals. Criterion tables
-retain the exact pinned columns/order and plain escaped cell values, including full timestamps
-with their original offsets and full identifiers. Wrapper classes and CSS provide column styling
-without changing the cells consumed by the e2e checks. Only the compact record index normalizes
-times to UTC (dates in captions and multi-date rows); header/record summaries may shorten IDs. Grayscale
-print rules preserve text statuses, repeat table headers, and expose details in browsers supporting
-`::details-content`; browser print behavior requires coordinator visual verification. No remote assets.
+Source Serif 4 serves headings/prose, IBM Plex Sans Condensed serves labels/tables, and
+JetBrains Mono serves identifiers/hashes with ligatures disabled. All four vendored WOFF2
+files are embedded as base64 `@font-face`; no remote resource or runtime font file is needed.
+Regenerate the committed TypeScript module with `node scripts/gen-embedded-fonts.mjs`, or
+check freshness with `node scripts/gen-embedded-fonts.mjs --check`. `tsc` carries the module
+into the build. The original OFL notices stay in `fonts/`; short attributions and all three
+full notices travel inside the HTML. Vendored font payload: **101,464 bytes** before base64.
 
-The redesign request explicitly supersedes pin 8's original Courier-only PDF and raw-block presentation; fields,
-verbatim caveats, classifications, CSV bytes and section order are preserved. The CSV regression
-fingerprint was captured before changing the renderer, including hostile strings and HMAC data.
+The six numbered sections retain their pin-8 IDs and titles, and tables are numbered per
+section. The record index adds the chain margin (pack-local R-0001 sequence, previous-hash
+prefix, own-hash prefix). Adjacent selected records need not be adjacent in the whole ledger;
+full hashes and all non-empty source fields remain in initially open record details. The
+criterion tables retain exact pinned columns, plain escaped cells, full timestamps with
+original offsets and full identifiers. Because the integration parser requires literal
+`<tr>` / `<td>` tags, scoped positional CSS applies exception tint and approval stamps
+without changing those tags. Oxblood marks only approved write/risky/unreviewed calls with a
+non-blank named approver. Delegated asks, unnamed approvals and automated decisions stay
+monochrome. Exceptions carry their written decision/finding; statuses remain readable in grayscale.
 
-Validation for the redesign: report tests cover cover/contents page boundaries and resolved page
-numbers, complete word/token wrapping, non-empty details (including false/zero), status/contents
-HTML structure, conditional anomaly tables, multi-date captions, Unicode/hostile input escaping,
-CSV byte stability and PDF xref/stream/page references. A synthetic 24-record PDF was parsed and
-rasterized with local Poppler for visual inspection. HTML browser rendering, responsive behavior
-and browser print expansion were not visually verified in the sandbox. Full suite/e2e remains
-with the coordinator; this is a build handoff, not independent approval.
+PDF uses standard Times-Roman / Times-Bold for prose/headings, Helvetica / Helvetica-Bold
+for table text/labels, and Courier for identifiers/hashes. Its cover mirrors the exhibit,
+including registration, round seal and full head. Only the seal and named approvals use
+color; exception rows use a gray tint. Tables repeat numbered captions and headers on each
+page, and fitting record blocks stay together. The dependency-free PDF writer retains its
+reversible Unicode escaping, word/token wrapping, xref/stream checks and numbered footer.
 
-Coordinator regression fix (uncommitted pending outside-sandbox confirmation): report tests now
-exercise the same `section`/`under`/`tableRows` parsing as Slice 1c steps 8–10 and Slice 2a step 10,
-check criterion values against CSV, and use the e2e PDF extractor for section order and the
-contiguous anchor/denial lines. The e2e tests themselves are unchanged.
+Pin-8 wording, evidence classes, denial caveat, anchor text, hostile-value escaping and the
+CSV projection are unchanged. The pre-redesign CSV SHA-256 fixture still passes. Report tests
+also mirror the coordinator's `section` / `under` / `tableRows` integration parsers and PDF
+extractor; the integration tests themselves are unchanged.
+
+Validation: typecheck, compiled build and 86 report tests pass. A synthetic 12-record HTML
+pack is **199,182 bytes** including fonts, licenses and full evidence; an empty pack is
+**167,160 bytes**. Size grows with the selected records and field lengths. Local Poppler raster inspection covered the PDF cover, approval table
+and chain index. Chromium failed sandbox Mach-port registration, so HTML rendering, responsive
+layout and browser printing need coordinator visual verification. Print CSS removes the sheet
+shadow, repeats table headers and expands evidence details; evidence details also start open.
+The coordinator runs the full suite and e2e outside the sandbox. This build is not independent approval.

@@ -3,6 +3,7 @@ import { resolve, join } from "node:path";
 import type { DateRange, LedgerRecord } from "../types/index.js";
 import type { LedgerStore } from "../ledger/contract.js";
 import type { ReportFiles, ReportContext, UnreconciledHandoff } from "./contract.js";
+import { embeddedFontCss, fontLicenseNotices } from "./embedded-fonts.js";
 import { textPdf, type PdfBlock } from "./pdf.js";
 
 export const HANDOFF_RECONCILE_GRACE_MS = 60_000;
@@ -165,13 +166,22 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
     return [r.id, r.phase, r.writtenAt, r.call.callId, r.call.agentId, r.call.sessionId, r.call.server, r.call.tool, json(r.call.args), json(r.policy), json(r.approval), json(r.outcome), json(r.handoff), r.parentRecordId ?? "", r.prevHash, r.hash, criteria.join("; "), anomalies.join("; "), r.call.onBehalfOf ?? "", r.call.declaredPlan ?? "", r.call.receivedAt, verify.ok ? "PASS" : "FAIL", String(verify.checked), verify.brokenAt ?? "", trust, sessionLabel(r), label(r), context?.anchor?.status ?? "not supplied"].map(display);
   });
   const pdf: PdfBlock[] = [];
+  let sectionNumber = 0, tableNumber = 0;
+  const tableStyles: string[] = [];
+  const reference = (i: number) => `R-${String(i + 1).padStart(4, "0")}`;
+  const namedApproval = (r: LedgerRecord) => r.policy.risk !== "read" && r.approval?.decision === "approved" && Boolean(r.approval.approver?.trim());
+  const anomalousRecords = new Set(records.filter((_, i) => rows[i]![17]).map(r => r.id));
+  const exception = (r: LedgerRecord) => /denied|error|despite deny/.test(label(r)) || r.policy.verdict === "deny" ||
+    ["denied", "timeout", "unavailable", "no-channel"].includes(r.approval?.decision ?? "") || anomalousRecords.has(r.id);
   const text = (lines: string[]) => { pdf.push({ kind: "text", lines: lines.map(display) }); return lines.map(s => `<p>${esc(display(s))}</p>`).join("\n"); };
   const heading = (title: string) => { pdf.push({ kind: "heading", lines: [title] }); return `<h3>${esc(title)}</h3>`; };
   const short = (value: string) => value.length > 20 && !value.includes("HMAC-SHA256 digest") ? `${value.slice(0, 12)}…${value.slice(-6)}` : value;
   const mono = (value: string, compact = true) => `<code title="${esc(display(value))}">${esc(compact ? short(display(value)) : display(value))}</code>`;
   const isId = (name: string) => /(?:_id|_hash)$/.test(name) || ["hash", "first_tool_record"].includes(name);
   const isTime = (name: string) => ["written_at", "handed_off_at", "Time"].includes(name);
-  const table = (headers: string[], values: string[][], caption = "Evidence", pinned = true) => {
+  const table = (headers: string[], values: string[][], caption = "Evidence", pinned = true, sourceRecords: LedgerRecord[] = []) => {
+    const tableId = `table-${sectionNumber}-${++tableNumber}`;
+    caption = `Table ${sectionNumber}.${tableNumber} · ${caption}`;
     const dates = [...new Set(values.flatMap(row => row.filter((value, i) => isTime(headers[i]!) && Number.isFinite(Date.parse(value))).map(value => new Date(value).toISOString().slice(0, 10))))];
     const dateCaption = `${caption}${dates.length ? ` · Dates (UTC): ${dates.join(", ")}` : ""}`;
     const pdfRows = values.map(row => row.map((value, i) => {
@@ -182,8 +192,17 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
       }
       return isId(headers[i]!) && value !== "pre-1c, no agent session id" ? short(display(value)).replace("…", "...") : display(value);
     }));
-    pdf.push({ kind: "table", headers, rows: pdfRows, caption: dateCaption.replace(" · ", " / ") });
+    const exceptionRows = values.map((_, i) => sourceRecords[i] ? (headers.includes("verdict") ? sourceRecords[i]!.policy.verdict === "deny" : exception(sourceRecords[i]!)) : /Record anomalies|Sessions without heartbeat|Launch-environment warnings|Orphan outcomes|Unreconciled handoffs|Intents with no outcome/.test(caption));
+    const approvalColumn = headers.indexOf("approval (decision, approver)");
+    const approvalRows = values.map((_, i) => approvalColumn >= 0 && Boolean(sourceRecords[i] && namedApproval(sourceRecords[i]!)));
+    // The e2e parser requires literal <tr>/<td> tags in pinned tables. Style by position only.
+    values.forEach((_, i) => {
+      if (exceptionRows[i]) tableStyles.push(`.${tableId} tbody tr:nth-child(${i + 1}) td{background:var(--exception-tint)}`);
+      if (approvalRows[i]) tableStyles.push(`/* human-approval-mark */ .${tableId} tbody tr:nth-child(${i + 1}) td:nth-child(${approvalColumn + 1}){color:var(--human-approval);outline:1.5px solid var(--human-approval);outline-offset:-4px;padding:8px 16px}`);
+    });
+    pdf.push({ kind: "table", headers, rows: pdfRows, caption: dateCaption.replaceAll(" · ", " / "), exceptionRows, approvalRows, approvalColumn });
     const cell = (value: string, name: string) => {
+      if (name === "Chain") return `<td class="chain-margin">${esc(value).replaceAll("\n", "<br>")}</td>`;
       if (pinned) return `<td>${esc(display(value))}</td>`;
       if (isTime(name) && Number.isFinite(Date.parse(value))) {
         const utc = new Date(value).toISOString();
@@ -194,7 +213,7 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
     };
     // Pinned cells stay plain text. Wrapper classes style columns without changing their parsed values.
     const columnClasses = pinned ? headers.map((name, i) => isTime(name) ? `time-${i + 1}` : isId(name) ? `id-${i + 1}` : name === "tool_records" ? `number-${i + 1}` : "").filter(Boolean).join(" ") : "";
-    return `<div class="table-scroll${columnClasses ? ` ${columnClasses}` : ""}"><table><caption>${esc(caption)}${dates.length ? ` · Dates (UTC): ${dates.join(", ")}` : ""}</caption><thead><tr>${headers.map(h => `<th scope="col">${esc(h)}</th>`).join("")}</tr></thead><tbody>${values.length ? values.map(row => `<tr>${row.map((value, i) => cell(value, headers[i]!)).join("")}</tr>`).join("\n") : `<tr><td colspan="${headers.length}">None</td></tr>`}</tbody></table></div>`;
+    return `<div class="table-scroll ${tableId}${columnClasses ? ` ${columnClasses}` : ""}"><table><caption>${esc(dateCaption)}</caption><thead><tr>${headers.map(h => `<th scope="col">${esc(h)}</th>`).join("")}</tr></thead><tbody>${values.length ? values.map(row => `<tr>${row.map((value, i) => cell(value, headers[i]!)).join("")}</tr>`).join("\n") : `<tr><td colspan="${headers.length}">None</td></tr>`}</tbody></table></div>`;
   };
   const detailTable = (title: string, headers: string[], values: string[][]) => values.length ? heading(`${title} (${values.length})`) + table(headers, values, title) : "";
   const checks: [string, number][] = [["Record anomalies", recordAnomalies.size], ["Sessions without heartbeat", missing.length], ["Launch-environment warnings", warnings.length], ["Orphan outcomes", orphans.length], ["Unreconciled handoffs", handoffs.length], ["Intents with no outcome observed", unobserved.length]];
@@ -202,30 +221,33 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
     ["summary", "Executive summary", `${findings.length} findings`], ["cc6-1", "CC6.1 logical access", `${tools.length} intents`],
     ["cc7-2", "CC7.2 monitoring", `${checks.length} anomaly checks; ${heartbeats.length} heartbeats`],
     ["cc8-1", "CC8.1 change management", `${tools.filter(r => r.policy.risk !== "read").length} intents`],
-    ["records", "Record evidence", `${records.length} records`], ["legend", "Vocabulary", `${vocabulary.length + 4} entries`]
+    ["records", "Record evidence", `${records.length} records`], ["legend", "Vocabulary", `${vocabulary.length + 5} entries`]
   ];
+  // ReportContext has no entity, policy version, reviewer or deployment-mode attestation.
+  const registration = [["Pack", `AL-${generated}`], ["Period", `${range.from} to ${range.to}`],
+    ["Records", String(records.length)], ["Policy version / reviewer", "Not recorded in ledger schema"], ["Mode", "Not attested; see trust boundary"]];
+  const scope = `Scope: ${records.length} selected records; criteria CC6.1, CC7.2 and CC8.1. Candidate evidence mapping, not an audit opinion.`;
   pdf.push(
-    { kind: "heading", lines: ["SOC 2 evidence pack", "Agent Ledger"] },
-    { kind: "text", lines: [summary[1]!, summary[2]!, `Observed ledger head: ${short(display(head)).replace("…", "...")}`].map(display) },
-    { kind: "heading", lines: ["Evidence status"] },
-    { kind: "text", lines: [chain, anchor, `Findings: ${findings.length}`].map(display) },
-    { kind: "text", lines: [`Scope: ${records.length} selected records; criteria CC6.1, CC7.2 and CC8.1. Candidate evidence mapping, not an audit opinion.`] },
-    { kind: "heading", lines: ["Trust boundary"] }, { kind: "text", lines: [trust] },
-    { kind: "pagebreak" }, { kind: "contents", entries: contents.map(([id, title, count]) => ({ id: id!, title: title!, count: count! })) },
+    { kind: "cover", title: "SOC 2 evidence pack", entity: "Agent Ledger / Entity not supplied", scope, registration, chain: display(chain), anchor: display(anchor), head: display(head), trust, findings: findings.length },
+    { kind: "pagebreak" }, { kind: "contents", entries: contents.map(([id, title, count], i) => ({ id: id!, title: `${i + 1}. ${title}`, count: count! })) },
     { kind: "pagebreak" }
   );
-  const section = (id: string, title: string, body: () => string) => { pdf.push({ kind: "heading", id, lines: [title] }); return `<section id="${id}"><h2>${title}</h2>${body()}</section>`; };
+  const section = (id: string, title: string, body: () => string) => {
+    sectionNumber++; tableNumber = 0;
+    const numbered = `${sectionNumber}. ${title}`;
+    pdf.push({ kind: "heading", id, lines: [numbered] });
+    return `<section id="${id}"><h2>${title}</h2>${body()}</section>`;
+  };
   const sections = [
     section("summary", "Executive summary", () => {
       pdf.push({ kind: "text", lines: summary.map(display) });
-      const anchorStatus = context?.anchor?.status;
-      const status = `<div class="status-band" aria-label="Evidence status"><div class="${verify.ok ? "ok" : "flag"}"><strong>Chain verification: ${verify.ok ? "PASS" : "FAIL"}</strong><span>Checked ${verify.checked} records (whole ledger); brokenAt: ${esc(display(verify.brokenAt ?? "none"))}</span></div><div class="${anchorStatus === "head" ? "ok" : "flag"}"><strong>Anchor status: ${esc(anchorStatus ?? "not supplied")}</strong><span>${esc(display(anchor))}</span></div><div class="${findings.length ? "flag" : "ok"}"><strong>Findings: ${findings.length}</strong><span>${findings.length ? "Review the findings below" : "No findings"}</span></div></div>`;
+      const status = `<p class="findings-status">Findings: ${findings.length} · ${findings.length ? "Review the findings below" : "No findings"}</p>`;
       const facts = [["Records", summary[0]!], ["Range", summary[1]!], ["Generated", summary[2]!], ["Observed ledger head", summary[3]!], ["Chain verification", chain], ["Anchor", anchor], ["Sessions / heartbeats", summary[7]!], ["Intents by risk", summary[8]!], ["Asks / approvals", summary[9]!], ["Denials by cause", summary[10]!], ["Outcomes", summary[11]!]];
       const grid = `<dl class="facts">${facts.map(([key, value]) => `<div><dt>${key}</dt><dd${key === "Observed ledger head" ? ` class="ledger-head" title="${esc(display(head))}"` : ""}>${esc(display(value!))}</dd></div>`).join("")}</dl>`;
       pdf.push({ kind: "heading", lines: ["Findings"] }, { kind: "text", lines: (findings.length ? findings : ["No findings"]).map(display) });
       return status + grid + `<aside class="trust-boundary" aria-label="Trust boundary"><strong>Trust boundary</strong><p>${esc(trust)}</p></aside><h3>Findings</h3><ul>${(findings.length ? findings : ["No findings"]).map(s => `<li>${esc(display(s))}</li>`).join("")}</ul>`;
     }),
-    section("cc6-1", "CC6.1 logical access", () => text(["[V] Scope: logical access protections (AICPA TSC, printed p. 33). [H] Mapping: recorded identities and policy decisions."]) + table(["written_at", "agent_session_id", "agent_id", "server/tool", "risk", "verdict", "rule_id"], tools.map(r => [r.writtenAt, sessionLabel(r), r.call.agentId, `${r.call.server}/${r.call.tool}`, r.policy.risk, r.policy.verdict, r.policy.ruleId]))),
+    section("cc6-1", "CC6.1 logical access", () => text(["[V] Scope: logical access protections (AICPA TSC, printed p. 33). [H] Mapping: recorded identities and policy decisions."]) + table(["written_at", "agent_session_id", "agent_id", "server/tool", "risk", "verdict", "rule_id"], tools.map(r => [r.writtenAt, sessionLabel(r), r.call.agentId, `${r.call.server}/${r.call.tool}`, r.policy.risk, r.policy.verdict, r.policy.ruleId]), "Access decisions", true, tools)),
     section("cc7-2", "CC7.2 monitoring", () => text(["[V] Scope: monitor operations and analyze anomalies (AICPA TSC, printed p. 39). [H] Mapping: chain, anchor, heartbeat and findings.", chain, anchor]) +
       heading("Anomaly checks") + (() => {
         pdf.push({ kind: "text", lines: checks.map(([name, count]) => `${name} (${count}): ${count ? "FLAG" : "OK"}`) });
@@ -239,10 +261,10 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
       detailTable("Orphan outcomes", ["record_id", "call_id", "agent_session_id", "finding"], orphans.map(r => [r.id, r.call.callId, sessionLabel(r), heartbeatSessions.has(agentSession(r) ?? "") ? "intent gap" : "orphan outcome"])) +
       detailTable("Unreconciled handoffs", ["call_id", "proxy_server_name", "hook_record_id", "handed_off_at"], handoffs.map(h => [h.callId, h.proxyServerName, h.hookRecordId, h.handedOffAt])) +
       detailTable("Intents with no outcome observed", ["record_id", "call_id"], unobserved.map(r => [r.id, r.call.callId]))),
-    section("cc8-1", "CC8.1 change management", () => text(["[V] Scope: controlled, authorized changes (AICPA TSC, printed p. 44). [H] Mapping: write/risky/unreviewed tool decisions; a shell call need not be a production change."]) + table(["written_at", "agent_session_id", "server/tool", "risk", "approval (decision, approver)", "outcome (status, errorClass)", "evidence_class"], tools.filter(r => r.policy.risk !== "read").map(r => [r.writtenAt, sessionLabel(r), `${r.call.server}/${r.call.tool}`, r.policy.risk, r.approval ? `${r.approval.decision}, ${r.approval.approver ?? "not recorded"}` : "not recorded", outcomes.get(r.call.callId)?.outcome ? json(outcomes.get(r.call.callId)!.outcome) : "no outcome observed", label(r)])) + text([denial])),
+    section("cc8-1", "CC8.1 change management", () => text(["[V] Scope: controlled, authorized changes (AICPA TSC, printed p. 44). [H] Mapping: write/risky/unreviewed tool decisions; a shell call need not be a production change."]) + table(["written_at", "agent_session_id", "server/tool", "risk", "approval (decision, approver)", "outcome (status, errorClass)", "evidence_class"], tools.filter(r => r.policy.risk !== "read").map(r => [r.writtenAt, sessionLabel(r), `${r.call.server}/${r.call.tool}`, r.policy.risk, r.approval ? `${r.approval.decision}, ${r.approval.approver ?? "not recorded"}` : "not recorded", outcomes.get(r.call.callId)?.outcome ? json(outcomes.get(r.call.callId)!.outcome) : "no outcome observed", label(r)]), "Change decisions", true, tools.filter(r => r.policy.risk !== "read")) + text([denial])),
     section("records", "Record evidence", () => {
       // Presentation derives from the unchanged CSV projection; retain every non-empty source field.
-      const compact = table(["Time", "Phase", "Tool", "Decision", "Evidence class", "Criteria"], records.map((r, i) => [r.writtenAt, r.phase, r.call.tool, isHeartbeat(r) ? "health record" : r.handoff ? "handoff" : r.policy.verdict, label(r), rows[i]![16]!]), "Record index; full fields follow in numbered details", false);
+      const compact = table(["Chain", "Time", "Phase", "Tool", "Decision", "Evidence class", "Criteria"], records.map((r, i) => [`${reference(i)}\nprev ${display(r.prevHash).slice(0, 12)}\nhash ${display(r.hash).slice(0, 12)}`, r.writtenAt, r.phase, r.call.tool, isHeartbeat(r) ? "health record" : r.handoff ? "handoff" : r.policy.verdict, label(r), rows[i]![16]!]), "Record index; full fields follow in numbered details", false, records);
       return compact + rows.map((row, i) => {
         const fields = [...columns.slice(0, 20).map((name, n) => [name, row[n]!] as const), ["agent_session_id", display(agentSession(records[i]!) ?? "")] as const, ["evidence_class", row[26]!] as const, ["received_at", row[20]!] as const].filter(([name, value]) => value !== "" && !(name === "arguments_labeled" && Object.keys(records[i]!.call.args).length === 0));
         const lines: string[] = [];
@@ -250,31 +272,37 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
           const line = `${name}: ${value}`;
           const previous = lines.at(-1);
           // Keep record boundaries explicit; combine short interior fields without dropping evidence.
-          if (previous && !previous.startsWith("record_id:") && name !== "received_at" && previous.length + line.length < 100) lines[lines.length - 1] = `${previous} | ${line}`;
+          if (previous && !isId(name) && !/^(?:record_id|call_id|agent_id|session_id|agent_session_id|parent_record_id|prev_hash|hash):/.test(previous) && name !== "received_at" && previous.length + line.length < 100) lines[lines.length - 1] = `${previous} | ${line}`;
           else lines.push(line);
         }
-        pdf.push({ kind: "record", lines });
-        return `<details id="record-${i + 1}"><summary>Record ${i + 1} · ${esc(records[i]!.phase)} · ${esc(display(records[i]!.call.tool))} · ${mono(records[i]!.id)}</summary><dl class="record-fields">${fields.map(([name, value]) => `<dt>${name}</dt><dd>${isId(name) ? mono(value, false) : esc(value)}</dd>`).join("")}</dl></details>`;
+        pdf.push({ kind: "record", lines: [reference(i), ...lines] });
+        return `<details open id="record-${i + 1}"><summary>${reference(i)} · ${esc(records[i]!.phase)} · ${esc(display(records[i]!.call.tool))} · ${mono(records[i]!.id)}</summary><dl class="record-fields">${fields.map(([name, value]) => `<dt>${name}</dt><dd>${isId(name) ? mono(value, false) : esc(value)}</dd>`).join("")}</dl></details>`;
       }).join("\n");
     }),
-    section("legend", "Vocabulary", () => text([...vocabulary, "UTC = Coordinated Universal Time; criterion tables retain full source timestamps, identifiers and hashes. The record index uses UTC times with dates in captions (multi-date rows retain the date). IDs and hashes may be shortened in the header and record summaries; full values are in titles and Record evidence. CC = Common Criteria; SOC = System and Organization Controls; TSC = Trust Services Criteria; [V] = verified scope; [H] = hypothesized mapping. OK = no finding in this check; FLAG = observations to review, not proof of a control failure.", denial, "heartbeat = the SessionStart hook ran and could reach the ledger; it does not prove every later call was hooked", "AICPA 2017 Trust Services Criteria (Revised Points of Focus 2022), printed pages 33, 39, 44; [V] scope / [H] evidence mapping. https://www.aicpa-cima.com/resources/download/2017-trust-services-criteria-with-revised-points-of-focus-2022"]))
+    section("legend", "Vocabulary", () => text([...vocabulary, "UTC = Coordinated Universal Time; criterion tables retain full source timestamps, identifiers and hashes. The record index uses UTC times with dates in captions (multi-date rows retain the date). Record summaries may shorten identifiers; full values are in Record evidence. R-0001 references are pack-local sequence numbers. Chain margins show prefixes only; the record index is filtered to this range, so adjacent rows need not be consecutive ledger records. CC = Common Criteria; SOC = System and Organization Controls; TSC = Trust Services Criteria; [V] = verified scope; [H] = hypothesized mapping. OK = no finding in this check; FLAG = observations to review, not proof of a control failure.", denial, "heartbeat = the SessionStart hook ran and could reach the ledger; it does not prove every later call was hooked", "AICPA 2017 Trust Services Criteria (Revised Points of Focus 2022), printed pages 33, 39, 44; [V] scope / [H] evidence mapping. https://www.aicpa-cima.com/resources/download/2017-trust-services-criteria-with-revised-points-of-focus-2022", "Fonts embedded in HTML: Source Serif 4 © Adobe; IBM Plex Sans Condensed © IBM Corp.; JetBrains Mono © The JetBrains Mono Project Authors. All licensed under SIL Open Font License 1.1. Full license notices are in the HTML pack and src/report/fonts."]) + `<details class="font-notices"><summary>Font license notices (SIL Open Font License 1.1)</summary>${fontLicenseNotices.map(notice => `<pre>${esc(notice)}</pre>`).join("\n")}</details>`)
   ];
   const html = `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Agent Ledger evidence pack</title>
 <style>
-:root{font-family:Charter,"Iowan Old Style",Cambria,Georgia,serif;color:#202b33;background:#fff;font-size:16px;line-height:1.55}
-body{max-width:1180px;margin:40px auto;padding:0 28px}h1,h2,h3,nav,dt,table,summary,.status-band,.downloads{font-family:system-ui,-apple-system,"Segoe UI",sans-serif}h1{font-size:2rem;line-height:1.2;margin-bottom:12px}h2{font-size:1.35rem}h3{font-size:1rem}p,section>ul{max-width:72ch}p{margin:12px 0}a{color:#174d75;text-underline-offset:3px}header{margin-bottom:28px}.subtitle{color:#4b5963}.downloads{display:flex;gap:20px;font-size:.9rem}nav{background:#f4f6f7;padding:16px 20px;margin:24px 0}nav ol{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 28px;padding-left:24px}nav span{display:block;color:#4b5963;font-size:.8rem}section{border-top:1px solid #b8c3cb;padding:20px 0;scroll-margin-top:16px}
-.status-band{display:grid;grid-template-columns:1fr 1.6fr .8fr;gap:12px;margin:20px 0}.status-band>div{padding:14px;border:1px solid #bdcbc5;border-top:4px solid #28634b;background:#f2f7f4}.status-band .flag{border-color:#956019;background:#fff8eb}.status-band strong,.status-band span{display:block}.status-band span{font-size:.8rem;margin-top:6px}.facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px 28px}.facts dt{color:#4b5963;font-size:.8rem}.facts dd{margin:4px 0 0;font-variant-numeric:tabular-nums}.trust-boundary{border-left:4px solid #526b7c;background:#f4f6f7;padding:16px 20px;margin:24px 0}.trust-boundary p{margin-bottom:0}
-table{border-collapse:collapse;width:100%;font-size:.78rem}caption{text-align:left;color:#4b5963;font-size:.75rem;padding:8px 0}th,td{text-align:left;vertical-align:top;border-bottom:1px solid #d5dce1;padding:9px 10px;overflow-wrap:break-word}th{background:#e9eef1;font-weight:600}tbody tr:nth-child(even){background:#f7f9fa}.time{white-space:nowrap}.time,.number{font-variant-numeric:tabular-nums}code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.85em;overflow-wrap:anywhere}td code{white-space:nowrap}.table-scroll{overflow-x:auto}.anomaly-checks{list-style:none;padding:0;max-width:72ch}.anomaly-checks li{display:flex;justify-content:space-between;gap:20px;padding:8px 12px;border-bottom:1px solid #d5dce1}.anomaly-checks strong{font:600 .8rem system-ui;color:#28634b}.anomaly-checks .flag strong{color:#80500d}details{border-bottom:1px solid #d5dce1;padding:12px 0}summary{cursor:pointer;font-size:.9rem}summary:focus-visible,a:focus-visible{outline:2px solid #174d75;outline-offset:4px}.record-fields{display:grid;grid-template-columns:170px minmax(0,1fr);gap:8px 20px;font-size:.9rem}.record-fields dt{font-size:.8rem;color:#4b5963}.record-fields dd{margin:0;white-space:pre-wrap;overflow-wrap:anywhere}
+body{counter-reset:section}section[id]>h2::before{counter-increment:section;content:counter(section) ". "}
+${embeddedFontCss}
+:root{--paper:#FFFFFF;--surround:#EEF0EE;--ink:#1B2733;--ink-muted:#4A5866;--rule:#C9D0CC;--rule-strong:#9AA69F;--seal:#8C6A1E;--human-approval:#7A1F2B;--exception-tint:#F6F1EA;--serif:"Source Serif 4",serif;--form:"IBM Plex Sans Condensed",sans-serif;--mono:"JetBrains Mono",monospace;--xs:4px;--sm:8px;--md:16px;--lg:24px;--xl:32px;--2xl:48px;--3xl:64px;color-scheme:light;background:var(--surround);color:var(--ink)}
+*{box-sizing:border-box;border-radius:0}body{margin:0;font:400 1.0625rem/1.55 var(--serif);font-optical-sizing:auto}.sheet{max-width:1080px;margin:48px auto;padding:64px;background:var(--paper);box-shadow:0 8px 24px #1B273310}h1,h2,h3{font-family:var(--serif);font-weight:600;margin:0}h1{font-size:2.75rem;letter-spacing:-.005em;line-height:1.08}h2{font-size:1.625rem;line-height:1.2;margin:64px 0 16px}h3{font-size:1.1875rem;margin:32px 0 8px}p{max-width:68ch;margin:0 0 16px}a{color:inherit;text-underline-offset:3px}.label,dt,caption,th{font:600 .78rem/1.3 var(--form);letter-spacing:.01em;color:var(--ink-muted)}.muted{color:var(--ink-muted)}.cover{display:grid;grid-template-columns:2fr 1fr;gap:48px;border-bottom:2px solid var(--ink);padding-bottom:32px}.entity{font-size:1.1875rem;margin-top:16px}.registration{margin:0;border:1px solid var(--rule-strong);min-width:0}.registration>div{display:grid;grid-template-columns:auto minmax(0,1fr);gap:16px;padding:8px 16px;border-bottom:1px solid var(--rule)}.registration>div:last-child{border-bottom:0}.registration dd{margin:0;text-align:right;font:400 .9rem/1.4 var(--form);overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
+.integrity-block{display:grid;grid-template-columns:auto minmax(0,1fr);gap:24px;margin-top:32px;padding:24px;border:1px solid var(--rule-strong)}.verification-seal{width:76px;height:76px;border:2px solid var(--seal);color:var(--seal);border-radius:9999px;display:grid;align-content:center;text-align:center;font:600 .78rem/1.2 var(--form)}.verdict{font-weight:600;font-size:1.25rem}.ledger-head,code{font:400 .84rem/1.55 var(--mono);font-variant-ligatures:none;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}.trust-boundary{border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);margin:24px 0;padding:16px 0}.trust-boundary strong{font:600 .78rem/1.3 var(--form)}.trust-boundary p{margin:8px 0 0}.downloads{display:flex;gap:24px;font-family:var(--form)}nav{border-block:1px solid var(--rule);padding:16px 0;font-family:var(--form)}nav ol{display:grid;grid-template-columns:1fr 1fr;gap:8px 32px;padding-left:24px}nav span{display:block;font-size:.9rem;color:var(--ink-muted)}section{scroll-margin-top:16px}.facts{margin:16px 0}.facts>div{display:grid;grid-template-columns:160px minmax(0,1fr);gap:24px;padding:8px 0;border-bottom:1px solid var(--rule)}.facts dd{margin:0;max-width:68ch}
+table{border-collapse:collapse;width:100%;font:400 .9rem/1.4 var(--form);font-variant-numeric:tabular-nums}caption{text-align:left;padding-bottom:8px}th,td{text-align:left;vertical-align:top;padding:8px;overflow-wrap:break-word}th{border-bottom:1.5px solid var(--ink)}td{border-bottom:1px solid var(--rule)}.time,.number{font-variant-numeric:tabular-nums}.time{white-space:nowrap}.table-scroll{overflow-x:auto;margin:16px 0}.chain-margin{font:400 12px/1.35 var(--mono);font-variant-ligatures:none;white-space:nowrap;color:var(--ink-muted);border-right:1px dashed var(--rule-strong)}.anomaly-checks{list-style:none;padding:0;max-width:68ch}.anomaly-checks li{display:flex;justify-content:space-between;gap:24px;padding:8px;border-bottom:1px solid var(--rule)}.anomaly-checks strong{font:600 .78rem/1.4 var(--form)}.anomaly-checks .flag{background:var(--exception-tint)}details{border-bottom:1px solid var(--rule);padding:16px 0}summary{cursor:pointer;font-family:var(--form)}summary:focus-visible,a:focus-visible{outline:2px solid var(--ink);outline-offset:4px}.record-fields{display:grid;grid-template-columns:160px minmax(0,1fr);gap:8px 24px}.record-fields dd{margin:0;white-space:pre-wrap;overflow-wrap:anywhere}.font-notices pre{font:400 .84rem/1.55 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}
+@media(max-width:760px){.sheet{margin:0;padding:24px}.cover,nav ol,.facts>div,.record-fields{grid-template-columns:1fr}.cover{gap:24px}.integrity-block{padding:16px;gap:16px}.record-fields dd{margin-bottom:16px}table{min-width:700px}}
+@media print{@page{size:landscape;margin:14mm}:root{background:var(--paper)}.sheet{max-width:none;margin:0;padding:0;box-shadow:none}.cover,nav,.integrity-block,.trust-boundary{break-inside:avoid}h2,h3,caption{break-after:avoid}tr{break-inside:avoid}thead{display:table-header-group}.table-scroll{overflow:visible}table{min-width:0}th,td{padding:4px}.downloads{display:none}details::details-content{content-visibility:visible}details>*{display:block}details>.record-fields{display:grid}.record-fields{break-inside:avoid}a{color:inherit}}
+
+${tableStyles.join("\n")}
 ${Array.from({ length: 7 }, (_, i) => {
   const n = i + 1;
-  return `.time-${n} td:nth-child(${n}){white-space:nowrap;font-variant-numeric:tabular-nums}.number-${n} td:nth-child(${n}){font-variant-numeric:tabular-nums}.id-${n} td:nth-child(${n}){font-family:ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}`;
+  return `.time-${n} td:nth-child(${n}){font-variant-numeric:tabular-nums}.number-${n} td:nth-child(${n}){font-variant-numeric:tabular-nums}.id-${n} td:nth-child(${n}){font-family:var(--mono);font-size:.84rem;overflow-wrap:anywhere;font-variant-ligatures:none}`;
 }).join("\n")}
-.ledger-head{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.85em;overflow-wrap:anywhere}
-@media(max-width:760px){body{margin:24px auto;padding:0 16px}.status-band,.facts,nav ol{grid-template-columns:1fr}.record-fields{grid-template-columns:1fr}.record-fields dd{margin-bottom:12px}table{min-width:700px}}
-@media print{@page{size:landscape;margin:14mm}body{max-width:none;margin:0;padding:0;font-size:10pt}header,nav,.status-band,.trust-boundary{break-inside:avoid}h2,h3,caption{break-after:avoid}tr{break-inside:avoid}thead{display:table-header-group}.table-scroll{overflow:visible}table{min-width:0;font-size:8pt}th,td{padding:5px}.downloads{display:none}.status-band>div,.status-band .flag{background:white;border-color:#555}.anomaly-checks strong,.anomaly-checks .flag strong{color:#222}details::details-content{content-visibility:visible}details>*{display:block}details>.record-fields{display:grid}details{break-inside:avoid}.record-fields{font-size:8pt}td code{white-space:normal}a{color:inherit}}
-</style>
-<header><h1>SOC 2 evidence pack</h1><p class="subtitle">Agent Ledger · Range: ${esc(range.from)} to ${esc(range.to)}<br>Generated: ${esc(generated)} · Head: ${mono(head)}</p><p class="downloads"><a href="report.pdf" download>Download PDF</a><a href="records.csv" download>Download CSV</a></p></header>
-<nav aria-label="Contents"><strong>Contents</strong><ol>${contents.map(([id, title, count]) => `<li><a href="#${id}">${title}</a><span>${count}</span></li>`).join("")}</ol></nav><main>${sections.join("\n")}</main></html>\n`;
+</style><body><main class="sheet">
+<header class="cover" aria-label="Exhibit cover"><div><h1>SOC 2 evidence pack</h1><p class="entity">Agent Ledger · Entity not supplied</p><p>${esc(scope)}</p><p class="muted">Generated: ${esc(generated)}</p></div><dl class="registration" aria-label="Registration">${registration.map(([key, value]) => `<div><dt>${key}</dt><dd>${key === "Pack" ? mono(value!, false) : esc(display(value!))}</dd></div>`).join("")}</dl></header>
+<div class="integrity-block" aria-label="Integrity statement"><div class="verification-seal">CHAIN<br>${verify.ok ? "VERIFIED" : "FAIL"}</div><div><p class="verdict">${esc(display(chain))}</p><p>${esc(display(anchor))}</p><div class="label">Ledger head (SHA-256)</div><div class="ledger-head">${esc(display(head))}</div></div></div>
+<aside class="trust-boundary" aria-label="Cover trust boundary"><strong>Trust boundary</strong><p>${esc(trust)}</p></aside>
+<p class="downloads"><a href="report.pdf" download>Download PDF</a><a href="records.csv" download>Download CSV</a></p>
+<nav aria-label="Contents"><strong>Contents</strong><ol>${contents.map(([id, title, count]) => `<li><a href="#${id}">${title}</a><span>${count}</span></li>`).join("")}</ol></nav>${sections.join("\n")}</main></body></html>\n`;
   const csv = [columns, ...rows].map(row => row.map(csvCell).join(",")).join("\r\n") + "\r\n";
   const dir = resolve(outDir); await mkdir(dir, { recursive: true, mode: 0o700 });
   for (const [name, content] of [["records.csv", csv], ["report.pdf", textPdf(pdf, verify.ok ? "PASS" : "FAIL")], ["report.html", html]] as const) await writeFile(join(dir, name), content, { flag: "wx", mode: 0o600 });

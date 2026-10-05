@@ -52,3 +52,29 @@ it("design: wraps at word boundaries and retains complete timestamps, UUIDs and 
   for (const token of tokens) expect(lines.slice(lines.indexOf('time'))).toContain(token);
   expect(pdf.toString('ascii')).toContain('/BaseFont /Helvetica');
 });
+
+it('filed instrument: text uses Times, table labels Helvetica and identifiers Courier', () => {
+  const pdf = textPdf([
+    { kind: 'heading', lines: ['1. Summary'] },
+    { kind: 'text', lines: ['Prose statement'] },
+    { kind: 'table', headers: ['record_id', 'decision'], rows: [['rec-1', 'denied']], caption: 'Table 1.1', exceptionRows: [true] },
+  ], 'FAIL');
+  assertStructure(pdf);
+  const raw = pdf.toString('ascii');
+  expect(raw).toMatch(/\/F3 [^\n]+\(1\. Summary\) Tj/);
+  expect(raw).toMatch(/\/F4 [^\n]+\(Prose statement\) Tj/);
+  expect(raw).toMatch(/\/F5 [^\n]+\(record_id\) Tj/);
+  expect(raw).toMatch(/\/F2 [^\n]+\(rec-1\) Tj/);
+  expect(raw).toMatch(/\/F1 [^\n]+\(denied\) Tj/);
+  expect(raw).not.toMatch(/\brg\b|\bRG\b/); // ordinary evidence uses only grayscale
+  expect(raw).toContain('0.95 g');
+  expect(raw).toContain('0.15 G 1.5 w');
+});
+
+it('filed instrument: a failed chain is written FAIL on the bronze seal, never VERIFIED', () => {
+  const pdf = textPdf([{ kind: 'cover', title: 'Evidence pack', entity: 'Entity not supplied', scope: 'Scope: governed paths', registration: [['Pack', 'AL-1']], chain: 'Chain verification: FAIL; checked 2 records (whole ledger); brokenAt: rec-2', anchor: 'Anchor: no anchor', head: 'a'.repeat(64), trust: 'Local mode: best-effort gating', findings: 1 }], 'FAIL');
+  assertStructure(pdf);
+  expect(printedLines(pdf.toString('ascii'))).toContain('FAIL');
+  expect(printedLines(pdf.toString('ascii'))).not.toContain('VERIFIED');
+  expect(pdf.toString('ascii')).toContain('0.5490 0.4157 0.1176 rg');
+});
