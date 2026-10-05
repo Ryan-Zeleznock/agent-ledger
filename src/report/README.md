@@ -77,12 +77,14 @@ PDF is a dependency-free, paginated PDF 1.4 document using standard Helvetica fo
 Helvetica Bold for headings and Courier only for identifier/hash fields. It starts with a cover
 (title, range, generation time, verdicts, scope and trust boundary), then a contents page with
 resolved page numbers. Table columns use measured content widths, repeated captions/headers,
-hairline rules and zebra rows. Times use UTC with dates in captions. Record details retain every
+hairline rules and zebra rows. Criterion tables retain full source timestamps and identifiers;
+the compact record index uses UTC times with dates in captions. Record details retain every
 non-empty field, including full identifiers; short interior fields share lines to reduce repetition.
 
 Wrapping happens at whitespace boundaries, never inside timestamps, hashes or Unicode escapes.
 Non-ASCII ledger characters remain reversible `\uXXXX` UTF-16 escapes; HTML/CSV retain Unicode.
-Table IDs are abbreviated with `...`, with complete values in record details. An unbroken token
+Criterion table IDs are never abbreviated. The cover abbreviates the head with `...`; the summary
+and record details retain the full value. An unbroken token
 wider than its available line is fitted by reducing its font size, preserving all evidence bytes;
 very long unbroken values can consequently be small and should be read in HTML/CSV. Fitting
 record blocks stay on one page; oversized blocks continue. Each footer includes the chain result.
@@ -163,15 +165,19 @@ is retained at `docs/reviews/2026-10-03-fable-slice-1c-pack-review.md`; fixes ne
 ## Auditor layout (2026-10-04 design audit)
 
 HTML leads with chain/anchor/findings status expressed in text as well as color, followed by
-a definition grid and the unchanged trust-boundary callout. Contents links retain all six pin-8
+a definition grid and the unchanged trust-boundary callout. The status band is additional:
+all pinned summary lines, including chain/anchor and the full observed head, remain contiguous
+escaped text runs below it. Contents links retain all six pin-8
 section IDs and include record/check counts. Monitoring lists every anomaly check even at zero,
 and emits detail tables only for populated checks. Heartbeat counts remain explicit.
 
 Charter/Iowan/Cambria/Georgia are offline prose fonts chosen for long-form reading; system sans
 labels and tables distinguish navigation from evidence. Prose is limited to 72ch inside a 1180px
-page. Only IDs/hashes use monospace; time/count columns use tabular numerals. Table timestamps
-are normalized to UTC with dates in captions and full source timestamps in titles. Multi-date
-tables retain each row's date. Full IDs/hashes remain in titles and record details. Grayscale
+page. Only IDs/hashes use monospace; time/count columns use tabular numerals. Criterion tables
+retain the exact pinned columns/order and plain escaped cell values, including full timestamps
+with their original offsets and full identifiers. Wrapper classes and CSS provide column styling
+without changing the cells consumed by the e2e checks. Only the compact record index normalizes
+times to UTC (dates in captions and multi-date rows); header/record summaries may shorten IDs. Grayscale
 print rules preserve text statuses, repeat table headers, and expose details in browsers supporting
 `::details-content`; browser print behavior requires coordinator visual verification. No remote assets.
 
@@ -186,3 +192,8 @@ CSV byte stability and PDF xref/stream/page references. A synthetic 24-record PD
 rasterized with local Poppler for visual inspection. HTML browser rendering, responsive behavior
 and browser print expansion were not visually verified in the sandbox. Full suite/e2e remains
 with the coordinator; this is a build handoff, not independent approval.
+
+Coordinator regression fix (uncommitted pending outside-sandbox confirmation): report tests now
+exercise the same `section`/`under`/`tableRows` parsing as Slice 1c steps 8–10 and Slice 2a step 10,
+check criterion values against CSV, and use the e2e PDF extractor for section order and the
+contiguous anchor/denial lines. The e2e tests themselves are unchanged.
