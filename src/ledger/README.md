@@ -330,6 +330,25 @@ Argument validation caps structure at 100,000 JSON nodes, includes keys in the 4
 character budget even for numeric/null values, and caps individual keys at 256 KiB like strings.
 The ID index remains proportional to ledger history; refreshes read bounded chunks rather than
 allocating the entire appended suffix. File replacement/shrink resets that index. Shared stored-line
-validation also applies the byte cap to Postgres rows. Older oversized evidence is rejected explicitly,
-never silently skipped; retain the original files for recovery. Tests: `test/core-security.test.ts`,
+validation also applies the byte cap to Postgres rows. Strict reads/verification reject oversized or malformed evidence explicitly; retain the original
+files for recovery. The append-only ID-recovery exception is documented below. Tests: `test/core-security.test.ts`,
 `test/ledger-jsonl.test.ts`, and the existing multi-process suite. Postgres needs coordinator validation.
+
+
+Verification R2, coordinator decision (2026-10-05): append availability depends on the **last physical
+line**, which must be complete, within 8 MiB, valid UTF-8, canonical, shape-valid and self-hash-valid.
+A damaged/torn final line refuses append without altering evidence. Earlier malformed JSON, invalid
+shape/UTF-8, joined/torn records or oversized lines do not block new logging when the tail is sound.
+The ID scan skips unreadable interior lines using bounded buffers, preserves recoverable bounded IDs
+and continues indexing subsequent lines; known duplicate IDs remain refused. No damaged bytes are
+removed or repaired. `verify()` still fails on that damage, and strict `read()` still refuses it.
+Tests: `R2: earlier %s damage preserves append availability and remains detectable` and
+`R2: final %s damage blocks append without changing evidence` (`test/core-security.test.ts`).
+
+Scale consideration R5 (documented, no further optimization in this round): each fresh hook process
+rebuilds its ID index by scanning the ledger and calling `parseStored` for each bounded historical line.
+This performs more validation/canonicalization than the original JSON.parse-only index scan. Cost is
+O(history) time per fresh process and O(recoverable IDs) index memory; a long-lived store incrementally
+indexes new bytes. Repeated short-lived hooks can therefore accumulate quadratic total scan work as
+history grows. A persistent collector/index needs a separate design and scale benchmark; streaming
+report correlation does not remove ledger verification or ID-index costs.

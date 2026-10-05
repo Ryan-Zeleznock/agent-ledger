@@ -92,8 +92,11 @@ record blocks stay on one page; oversized blocks continue. Each footer includes 
 No PDF/A, embedded fonts or signatures are claimed. Output files use exclusive
 creation with mode 0600; use a fresh output directory for each pack. HTML is written last. I/O errors
 can leave an incomplete pack; a failed invocation must not be distributed as a completed export.
-All history/outputs are held in memory. Session and outcome lookups use maps/sets; the unchanged
-handoff reconciliation can be quadratic. Large-ledger streaming remains future work (review residual #8).
+Selected records and rendered outputs are held in memory. History is scanned with only selected
+session IDs, call correlation keys and compact intent/outcome facts retained. Handoff matching indexes
+selected handoffs by call ID; matching proxies are streamed, including the grace interval. The report
+collector has no lifetime record-count or history-byte limit. Large selected windows still require a
+narrower range when their retained evidence exceeds the documented memory budget below.
 
 Tests: `test/report.test.ts`, plus the real-ledger/process export in `test/cli-process.test.ts`.
 
@@ -228,11 +231,27 @@ the member id outside its direction context. This also isolates controls in olde
 existing text representation. Tests cover RLO in historical names, ordinary RTL names, id-like name text and HTML escaping.
 
 
-Security round C5/C8 (2026-10-05): outcome lookup is scoped by identity and session and stored by
-intent record ID. A later reused callId cannot borrow a preceding call's outcome or another agent's
-execution. Full reuse of all identifiers remains correlation, not proof of provenance; changing the
-frozen record schema is outside this round. Reports and standalone handoff reconciliation stop before
-rendering when evidence exceeds 10,000 records or 32 MiB of serialized records. The report limit covers
-all history read for heartbeat/orphan evidence, not just the selected range. Oversized input fails
-explicitly and writes no pack; streaming larger histories remains future work. C5 agent/session/order
-and C8 record/byte-budget regressions are in `test/report-slice-1c.test.ts`.
+Security round C5/C8, corrected for verification R1 (2026-10-05): outcome lookup is scoped by identity
+and session and stored by intent record ID. A later reused callId cannot borrow a preceding call's
+outcome or another agent's execution. Full reuse of all identifiers remains correlation, not proof of
+provenance; changing the frozen record schema is outside this round.
+
+The collector reads the selected range first, then streams all history. Only selected session IDs and
+call keys are tracked: old intents supply compact classification facts; future heartbeats still cover
+selected sessions; outcomes/handoff proxies count only through the grace boundary. Historical argument
+payloads and unrelated identities never accumulate. Head checks bracket all passes; no transactional
+snapshot is claimed. Standalone handoff reconciliation similarly retains only selected handoff metadata
+and streams matching candidates, with head checks across both reads.
+
+Every individual evidence record is limited to 8 MiB. Retained selected records, correlation metadata,
+and handoff metadata each have a 32 MiB serialized-size budget, with a minimum 512-byte charge per
+entry for object/index overhead; replacing a correlation entry releases its previous charge. These
+are conservative input/state budgets, not exact JavaScript heap measurements or limits on lifetime
+history. Rendering output expands the selected evidence in memory; an oversized selected window fails
+before publishing with an instruction to choose a narrower range. Ledger verification and backend
+indexes retain their own existing costs. No 10,000-record cutoff remains.
+
+Tests: `test/report-history.test.ts` generates 50,000 unrelated historical/grace records and checks the
+pack's prior-intent, heartbeat and handoff results. Its supervised child checks retained heap during
+all scan passes stays below 32 MiB after GC. `test/report-slice-1c.test.ts` covers selected-window and
+individual-record bounds plus C5 identity/session/order regressions.

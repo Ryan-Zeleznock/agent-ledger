@@ -3,7 +3,7 @@ import { dirname } from "node:path";
 import { performance } from "node:perf_hooks";
 import type { DateRange, LedgerRecord, UnsealedRecord, VerifyResult } from "../types/index.js";
 import type { LedgerStore } from "./contract.js";
-import { MAX_LEDGER_LINE_BYTES, parseInstant } from "./validate.js";
+import { MAX_LEDGER_LINE_BYTES, MAX_SCALAR_CHARS, parseInstant } from "./validate.js";
 import { GENESIS_HASH, checkStoredLine, parseStored, sealRecord, sealedLine, verifyLines, type Tail } from "./chain.js";
 
 /**
@@ -133,29 +133,37 @@ function readLastLine(fd: number, size: number): string {
 class LineError extends Error {
   constructor(readonly line: number, message: string) { super(message); }
 }
-/** LF-only framing, fatal UTF-8, bounded pending bytes, and a fixed size from the same descriptor. */
-function* lines(fd: number, size: number, offset = 0): Generator<{ n: number; raw: string }> {
-  let n = 0, pending: Buffer = Buffer.alloc(0);
+/** Strict reads use LF framing and fatal UTF-8. Only ID recovery skips damaged interior lines. */
+function* lines(fd: number, size: number, offset = 0, skipDamaged = false): Generator<{ n: number; raw: string }> {
+  let n = 0, length = 0, discarding = false;
+  let pieces: Buffer[] = [];
   while (offset < size) {
     const buf = Buffer.alloc(Math.min(TAIL_CHUNK, size - offset));
     if (readSync(fd, buf, 0, buf.length, offset) !== buf.length) throw new LineError(n + 1, "ledger: file changed during read");
     offset += buf.length;
-    pending = Buffer.concat([pending, buf]);
     let start = 0;
-    for (;;) {
-      const nl = pending.indexOf(0x0a, start);
+    while (start < buf.length) {
+      const nl = buf.indexOf(0x0a, start), end = nl === -1 ? buf.length : nl;
+      if (!discarding) {
+        length += end - start;
+        if (length > MAX_LEDGER_LINE_BYTES) {
+          if (!skipDamaged) throw new LineError(n + 1, "ledger: line size limit exceeded");
+          // ID recovery must continue after an oversized interior line without buffering it.
+          pieces = []; length = 0; discarding = true;
+        } else pieces.push(buf.subarray(start, end));
+      }
       if (nl === -1) break;
-      if (nl - start > MAX_LEDGER_LINE_BYTES) throw new LineError(n + 1, "ledger: line size limit exceeded");
-      let raw: string;
-      try { raw = decode(pending.subarray(start, nl)); }
-      catch { throw new LineError(n + 1, "ledger: invalid UTF-8"); }
+      let raw = "";
+      if (!discarding) {
+        try { raw = decode(Buffer.concat(pieces, length)); }
+        catch { if (!skipDamaged) throw new LineError(n + 1, "ledger: invalid UTF-8"); }
+      }
       yield { n: ++n, raw };
+      pieces = []; length = 0; discarding = false;
       start = nl + 1;
     }
-    pending = pending.subarray(start);
-    if (pending.length > MAX_LEDGER_LINE_BYTES) throw new LineError(n + 1, "ledger: line size limit exceeded");
   }
-  if (pending.length) throw new LineError(n + 1, "ledger: incomplete line");
+  if (length || discarding) throw new LineError(n + 1, "ledger: incomplete line");
 }
 
 // ---------- the store ----------
@@ -185,16 +193,18 @@ export class JsonlLedger implements LedgerStore {
     return { id: rec.id, hash: rec.hash };
   }
 
-  /** Incremental id scan, bounded per line; an inode replacement or shrink rebuilds the index. */
+  /** Incremental ID recovery, bounded per line; earlier damage is skipped, never repaired or hidden from verify. */
   private refreshIds(fd: number, size: number): Set<string> {
     const st = fstatSync(fd), file = `${st.dev}:${st.ino}`;
     if (this.ids === null || size < this.idsOffset || file !== this.idsFile) {
       this.ids = new Set(); this.idsOffset = 0; this.idsFile = file;
     }
-    for (const { raw } of lines(fd, size, this.idsOffset)) {
+    for (const { raw } of lines(fd, size, this.idsOffset, true)) {
       const p = parseStored(raw);
-      if (p.err !== undefined) throw new Error("ledger: invalid stored record; run verify()");
-      this.ids.add(p.rec.id);
+      // Earlier damage remains visible to verify/read but does not stop collecting new evidence.
+      // Preserve any recoverable bounded ID, including a shape-invalid record's ID.
+      const id = p.err === undefined ? p.rec.id : p.id;
+      if (typeof id === "string" && id.length <= MAX_SCALAR_CHARS) this.ids.add(id);
     }
     this.idsOffset = size;
     return this.ids;

@@ -1,7 +1,8 @@
-import { evidenceBudget } from "./limits.js";
+import { handoffScan } from "./history.js";
+import { checkEvidenceRecord } from "./limits.js";
 import type { DateRange } from "../types/index.js";
 import type { LedgerStore } from "../ledger/contract.js";
-import { checkedRange, findHandoffs, renderReport, HANDOFF_RECONCILE_GRACE_MS } from "./render.js";
+import { checkedRange, renderReport, HANDOFF_RECONCILE_GRACE_MS } from "./render.js";
 export interface ReportFiles { pdfPath: string; csvPath: string; }
 export type AnchorStatus = "head" | "ancestor" | "missing" | "mismatch" | "untrusted";
 export interface ReportContext { anchor?: { status: AnchorStatus; latest: { hash: string; at: string } | null } }
@@ -19,8 +20,10 @@ export interface UnreconciledHandoff { callId: string; proxyServerName: string; 
 export { HANDOFF_RECONCILE_GRACE_MS } from "./render.js";
 export async function reconcileHandoffs(ledger: LedgerStore, range: DateRange, graceMs = HANDOFF_RECONCILE_GRACE_MS): Promise<UnreconciledHandoff[]> {
   const { extended } = checkedRange(range, graceMs);
-  const records = [];
-  const checkEvidence = evidenceBudget();
-  for await (const record of ledger.read({ from: range.from, to: extended })) { checkEvidence(record); records.push(record); }
-  return findHandoffs(records, range);
+  const before = await ledger.head();
+  const scan = handoffScan();
+  for await (const record of ledger.read(range)) { checkEvidenceRecord(record); scan.add(record); }
+  for await (const record of ledger.read({ from: range.from, to: extended })) { checkEvidenceRecord(record); scan.observe(record); }
+  if (await ledger.head() !== before) throw new Error("Ledger changed during reconciliation; retry with writers paused");
+  return scan.unmatched();
 }

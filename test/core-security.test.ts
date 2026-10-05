@@ -131,3 +131,35 @@ it("C8: config growth after fstat cannot bypass the read limit", () => {
   }) as typeof original);
   expect(() => readConfigFile(p)).toThrow(/size limit/);
 });
+
+it.each(["json", "shape", "utf8", "oversized", "joined"])("R2: earlier %s damage preserves append availability and remains detectable", async damage => {
+  const p = path(), ledger = createLedger("jsonl", p);
+  await ledger.append(unsealed(1)); const tail = await ledger.append(unsealed(2));
+  const original = fs.readFileSync(p), newline = original.indexOf(10);
+  const bad = damage === "json" ? Buffer.from("not-json\n") : damage === "shape" ? Buffer.from('{"id":"rec-1"}\n') :
+    damage === "utf8" ? Buffer.from([0xff, 10]) : damage === "oversized" ? Buffer.from("x".repeat(8 * 1024 * 1024 + 1) + "\n") : Buffer.from("torn-prefix" + original.subarray(0, newline + 1).toString());
+  fs.writeFileSync(p, Buffer.concat([bad, original.subarray(newline + 1)]));
+  const damaged = fs.readFileSync(p);
+  const restarted = createLedger("jsonl", p);
+  expect((await restarted.verify()).ok).toBe(false);
+  const appended = await restarted.append(unsealed(3));
+  expect(appended.prevHash).toBe(tail.hash); expect(appended.parentRecordId).toBe(tail.id);
+  await expect(restarted.append(unsealed(2))).rejects.toThrow(/duplicate id/);
+  expect(fs.readFileSync(p).subarray(0, damaged.length).equals(damaged)).toBe(true);
+  expect((await restarted.verify()).ok).toBe(false);
+});
+it.each(["json", "torn", "utf8", "oversized"])("R2: final %s damage blocks append without changing evidence", async damage => {
+  const p = path(), ledger = createLedger("jsonl", p); await ledger.append(unsealed(1));
+  const bad = damage === "json" ? Buffer.from("not-json\n") : damage === "torn" ? Buffer.from("torn") :
+    damage === "utf8" ? Buffer.from([0xff, 10]) : Buffer.from("x".repeat(8 * 1024 * 1024 + 1) + "\n");
+  fs.appendFileSync(p, bad); const before = fs.readFileSync(p);
+  await expect(createLedger("jsonl", p).append(unsealed(2))).rejects.toThrow();
+  expect(fs.readFileSync(p).equals(before)).toBe(true);
+  expect((await ledger.verify()).ok).toBe(false);
+});
+it("R4: package and lockfile require Node >=24", () => {
+  const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+  const lock = JSON.parse(fs.readFileSync("package-lock.json", "utf8"));
+  expect(pkg.engines.node).toBe(">=24");
+  expect(lock.packages[""].engines.node).toBe(">=24");
+});
