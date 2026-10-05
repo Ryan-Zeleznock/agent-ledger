@@ -20,7 +20,7 @@ spec:
           args:
             - --context=tar:///work/context.tar.gz
             - --dockerfile=Dockerfile
-            - --destination=ghcr.io/ryan-zeleznock/agent-ledger:slice-2a
+            - --destination=ghcr.io/ryan-zeleznock/agent-ledger:slice-2b
             - --digest-file=/dev/termination-log
             - --reproducible
             - --cache=false

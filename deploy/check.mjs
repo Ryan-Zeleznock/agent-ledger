@@ -41,7 +41,7 @@ for (const doc of workloads) {
     assert(c.resources.requests.cpu && c.resources.requests.memory && c.resources.limits.cpu && c.resources.limits.memory);
     assert(!(c.env??[]).some(e=>e.name==='NODE_OPTIONS'));
     assert(!c.envFrom?.length);
-    if(c.image.startsWith('ghcr.io/ryan-zeleznock/agent-ledger')) assert.match(c.image, doc.metadata.name==='everything' ? /^ghcr\.io\/ryan-zeleznock\/agent-ledger:everything-2026\.8\.31@sha256:[0-9a-f]{64}$/ : /^ghcr\.io\/ryan-zeleznock\/agent-ledger:slice-2a@sha256:[0-9a-f]{64}$/);
+    if(c.image.startsWith('ghcr.io/ryan-zeleznock/agent-ledger')) assert.match(c.image, doc.metadata.name==='everything' ? /^ghcr\.io\/ryan-zeleznock\/agent-ledger:everything-2026\.8\.31@sha256:[0-9a-f]{64}$/ : /^ghcr\.io\/ryan-zeleznock\/agent-ledger:slice-2b@sha256:[0-9a-f]{64}$/);
     // Slice 2b pin 9: every image in the namespace is digest-pinned, busybox and postgres included.
     assert.match(c.image, /@sha256:[0-9a-f]{64}$/, `${doc.metadata.name}/${c.name} image must be digest-pinned`);
     if(c.image.startsWith('docker.io/library/busybox:')) assert.equal(c.image, BUSYBOX);

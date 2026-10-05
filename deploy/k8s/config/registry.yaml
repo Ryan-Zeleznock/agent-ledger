@@ -13,21 +13,21 @@ servers:
       echo:
         class: read
         reviewedBy: ryan
-        reviewedAt: 2026-10-04
+        reviewedAt: 2026-10-05
         storeArgs: [message]
       now:
         class: read
         reviewedBy: ryan
-        reviewedAt: 2026-10-04
+        reviewedAt: 2026-10-05
       add:
         class: write
         reviewedBy: ryan
-        reviewedAt: 2026-10-04
+        reviewedAt: 2026-10-05
         storeArgs: [a, b]
       wipe:
         class: risky
         reviewedBy: ryan
-        reviewedAt: 2026-10-04
+        reviewedAt: 2026-10-05
         storeArgs: []
   everything:
     trusted: false
@@ -35,32 +35,32 @@ servers:
       echo:
         class: read
         reviewedBy: ryan
-        reviewedAt: 2026-10-04
+        reviewedAt: 2026-10-05
         storeArgs: [message]
       get-sum:
         class: read
         reviewedBy: ryan
-        reviewedAt: 2026-10-04
+        reviewedAt: 2026-10-05
         storeArgs: [a, b]
       get-tiny-image:
         class: read
         reviewedBy: ryan
-        reviewedAt: 2026-10-04
+        reviewedAt: 2026-10-05
       get-annotated-message:
         class: read
         reviewedBy: ryan
-        reviewedAt: 2026-10-04
+        reviewedAt: 2026-10-05
       get-structured-content:
         class: read
         reviewedBy: ryan
-        reviewedAt: 2026-10-04
+        reviewedAt: 2026-10-05
       get-env:
         class: risky
         reviewedBy: ryan
-        reviewedAt: 2026-10-04
+        reviewedAt: 2026-10-05
         storeArgs: []
       gzip-file-as-resource:
         class: risky
         reviewedBy: ryan
-        reviewedAt: 2026-10-04
+        reviewedAt: 2026-10-05
         storeArgs: []
