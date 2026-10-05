@@ -87,8 +87,9 @@ export class LegacyUpstream {
       return send(200, { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: negotiated, capabilities: { tools: { listChanged: false } }, serverInfo: { name: "legacy-fixture", version: "1.0.0" }, instructions: "hand-written 2025-11-25 fixture" } }, { "mcp-session-id": id });
     }
     const negotiated = this.sessions.get(session);
+    // Reference app has no Express body parser: its req.body?.id is omitted from the 400 JSON (Fable live probe).
     if (negotiated === undefined) return this.o.unknownSessionStatus === 400
-      ? err(400, -32000, "Bad Request: No valid session ID provided", msg.id ?? null)
+      ? send(400, { jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: No valid session ID provided" } })
       : err(404, -32001, "Session not found", msg.id ?? null);
     if (pv !== undefined ? pv !== negotiated : negotiated !== "2025-03-26") return err(400, -32000, "Bad Request: Unsupported protocol version", msg.id ?? null);
     if (msg.id === undefined) return send(202);                                          // a notification (notifications/initialized)

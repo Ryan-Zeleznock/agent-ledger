@@ -183,7 +183,7 @@ The six numbered sections retain their pin-8 IDs and titles, and tables are numb
 section. The record index adds the chain margin (pack-local R-0001 sequence, previous-hash
 prefix, own-hash prefix). Adjacent selected records need not be adjacent in the whole ledger;
 full hashes and all non-empty source fields remain in initially open record details. The
-criterion tables retain exact pinned columns, plain escaped cells, full timestamps with
+criterion tables retain exact pinned columns, escaped cells, full timestamps with
 original offsets and full identifiers. Because the integration parser requires literal
 `<tr>` / `<td>` tags, scoped positional CSS applies exception tint and approval stamps
 without changing those tags. Oxblood marks only approved write/risky/unreviewed calls with a
@@ -220,3 +220,8 @@ Test: `labels absent agent sessions conservatively in HTML/PDF/CSV without guess
 Coordinator owns the pin-8 wording amendment; no mode field or enforcement claim was added.
 
 ADR-015 amendment (2026-10-05): CC8.1 renders `approved, Ryan Zeleznock (U0C6UV8NMR7)` when a name is recorded, retaining the stable member id. Missing names keep the member-only rendering. HTML/PDF escape names through the existing renderer; CSV keeps its 28 columns and includes the additive name inside the existing `approval` JSON cell.
+
+
+Fable review P2-1 (2026-10-05): the HTML CC8.1 approval cell wraps only the escaped display name in `<bdi>`, leaving
+the member id outside its direction context. This also isolates controls in older stored names; PDF/CSV preserve their
+existing text representation. Tests cover RLO in historical names, ordinary RTL names, id-like name text and HTML escaping.

@@ -209,7 +209,12 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
       if (approvalRows[i]) tableStyles.push(`/* human-approval-mark */ .${tableId} tbody tr:nth-child(${i + 1}) td:nth-child(${approvalColumn + 1}){color:var(--human-approval);outline:1.5px solid var(--human-approval);outline-offset:-4px;padding:8px 16px}`);
     });
     pdf.push({ kind: "table", headers, rows: pdfRows, caption: dateCaption.replaceAll(" · ", " / "), exceptionRows, approvalRows, approvalColumn });
-    const cell = (value: string, name: string) => {
+    const cell = (value: string, name: string, source?: LedgerRecord) => {
+      const approval = source?.approval;
+      if (name === "approval (decision, approver)" && approval?.approver && approval.approverName?.trim()) {
+        // Isolate even historical names containing bidi controls; the stable member id stays outside.
+        return `<td>${esc(display(approval.decision))}, <bdi>${esc(display(approval.approverName))}</bdi> (${esc(display(approval.approver))})</td>`;
+      }
       if (name === "Chain") return `<td class="chain-margin">${esc(value).replaceAll("\n", "<br>")}</td>`;
       if (pinned) return `<td>${esc(display(value))}</td>`;
       if (isTime(name) && Number.isFinite(Date.parse(value))) {
@@ -219,9 +224,9 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
       if (isId(name) && value !== missingSessionLabel) return `<td>${mono(value)}</td>`;
       return `<td${/^\d+$/.test(value) ? ' class="number"' : ""}>${esc(display(value))}</td>`;
     };
-    // Pinned cells stay plain text. Wrapper classes style columns without changing their parsed values.
+    // Pinned cells retain their text; approval names alone get bidi isolation. Wrapper classes style columns.
     const columnClasses = pinned ? headers.map((name, i) => isTime(name) ? `time-${i + 1}` : isId(name) ? `id-${i + 1}` : name === "tool_records" ? `number-${i + 1}` : "").filter(Boolean).join(" ") : "";
-    return `<div class="table-scroll ${tableId}${columnClasses ? ` ${columnClasses}` : ""}"><table><caption>${esc(dateCaption)}</caption><thead><tr>${headers.map(h => `<th scope="col">${esc(h)}</th>`).join("")}</tr></thead><tbody>${values.length ? values.map(row => `<tr>${row.map((value, i) => cell(value, headers[i]!)).join("")}</tr>`).join("\n") : `<tr><td colspan="${headers.length}">None</td></tr>`}</tbody></table></div>`;
+    return `<div class="table-scroll ${tableId}${columnClasses ? ` ${columnClasses}` : ""}"><table><caption>${esc(dateCaption)}</caption><thead><tr>${headers.map(h => `<th scope="col">${esc(h)}</th>`).join("")}</tr></thead><tbody>${values.length ? values.map((row, rowIndex) => `<tr>${row.map((value, i) => cell(value, headers[i]!, sourceRecords[rowIndex])).join("")}</tr>`).join("\n") : `<tr><td colspan="${headers.length}">None</td></tr>`}</tbody></table></div>`;
   };
   const detailTable = (title: string, headers: string[], values: string[][]) => values.length ? heading(`${title} (${values.length})`) + table(headers, values, title) : "";
   const checks: [string, number][] = [["Record anomalies", recordAnomalies.size], ["Sessions without heartbeat", missing.length], ["Launch-environment warnings", warnings.length], ["Orphan outcomes", orphans.length], ["Unreconciled handoffs", handoffs.length], ["Intents with no outcome observed", unobserved.length]];

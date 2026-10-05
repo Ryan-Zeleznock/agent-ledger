@@ -250,3 +250,28 @@ it('discards late lookup completion after its deadline instead of mutating the r
   finish(Response.json({ ok: true, user: { id: 'U0123456789', real_name: 'Late Name' } })); await flush();
   expect(settled).not.toHaveProperty('approverName'); expect(settled.decision).toBe('approved');
 });
+
+
+describe('Fable fixes-2b review name controls', () => {
+  const controls = [0x00, 0x09, 0x1f, 0x7f, 0x80, 0x9f, 0xad, 0x061c, 0x200b, 0x200c, 0x200d, 0x200e, 0x200f,
+    0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069, 0xfeff];
+  it.each(controls)('omits names containing control/format character U+%s without revising the decision', async cp => {
+    fake.replies.set('users.info', [() => Response.json({ ok: true, user: { id: 'U0123456789',
+      profile: { real_name: `Ryan${String.fromCodePoint(cp)}`, display_name: 'Fallback Name' } } })]);
+    const p = a.requestApproval(call, policy, channel); await flush(); fake.click();
+    const decision = await p;
+    expect(decision).toMatchObject({ decision: 'approved', approver: 'U0123456789' });
+    expect(decision).not.toHaveProperty('approverName');
+  });
+  it.each(['real_name', 'display_name'])('checks fallback %s for Unicode controls too', async field => {
+    fake.replies.set('users.info', [() => Response.json({ ok: true, user: { id: 'U0123456789',
+      ...(field === 'real_name' ? { real_name: 'Ryan\u202e' } : { profile: { display_name: 'Ryan\u2067' } }) } })]);
+    const p = a.requestApproval(call, policy, channel); await flush(); fake.click();
+    expect(await p).not.toHaveProperty('approverName');
+  });
+  it('retains ordinary right-to-left names without control characters', async () => {
+    fake.replies.set('users.info', [() => Response.json({ ok: true, user: { id: 'U0123456789', real_name: 'ריאן' } })]);
+    const p = a.requestApproval(call, policy, channel); await flush(); fake.click();
+    expect(await p).toHaveProperty('approverName', 'ריאן');
+  });
+});

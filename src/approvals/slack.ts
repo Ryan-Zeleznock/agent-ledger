@@ -111,8 +111,11 @@ async function approverName(member: string, r: Router, nonce: string, budgetMs: 
     const profile = record(data.user.profile) ? data.user.profile : {};
     for (const value of [profile.real_name, data.user.real_name, profile.display_name]) {
       if (typeof value !== 'string') continue;
+      // Reject before trimming: Cc/Cf include C1, bidi overrides/isolates and zero-width format controls.
+      // Do not fall back to another profile field after a control-bearing name.
+      if (/[\p{Cc}\p{Cf}]/u.test(value)) return undefined;
       const name = value.trim();
-      if (name && name.length <= 256 && Buffer.from(name, 'utf8').toString('utf8') === name && !/[\x00-\x1f\x7f]/.test(name) &&
+      if (name && name.length <= 256 && Buffer.from(name, 'utf8').toString('utf8') === name &&
           ![r.bot, r.app, nonce].some(secret => secret && name.includes(secret))) return name;
     }
   } catch { /* Best effort, value-free: the already settled decision is never revised. */ }

@@ -47,8 +47,10 @@ reason and decision timestamp. Before returning the immutable result, one best-e
 the remaining approval wait; it never retries. Both fetch and body parsing race that deadline, even for injected
 transports that ignore abort. The response body is capped at 64 KiB. No failure can revise the decision or emit response
 values; failure/absent/invalid names simply omit the field. Only a matching returned user id is accepted; prefer profile
-real_name, then user real_name, then profile display_name. Names are trimmed, well-formed, control-free, ≤256 characters,
-and cannot contain the known tokens or nonce. No profile cache: names reflect each decision's lookup, not later edits.
+real_name, then user real_name, then profile display_name. Names are trimmed, well-formed, ≤256 characters,
+and cannot contain the known tokens or nonce. Before trimming, Unicode Cc/Cf characters are refused (including C1,
+bidi overrides/isolates and zero-width format controls); a control-bearing candidate omits approverName without
+falling back to another profile field. Ordinary right-to-left text remains valid. No profile cache: names reflect each decision's lookup, not later edits.
 Display names are presentation, never allowlist identity. HTML/PDF retain the member id; CSV uses existing approval JSON.
 
 Tests: `ADR-015 approver names` in `test/approvals.test.ts`; ledger projection, strict-read/hash round-trip, report

@@ -65,7 +65,7 @@ describe('dual-era upstream client', () => {
     expect(fake.seen.filter(r => r.body.method === 'tools/call' && r.headers.get('mcp-session-id') === 'session-2')).toHaveLength(2);
   });
   it('throws after a second session 404', async () => {
-    const up = await connect(); fake.script = r => r.body.method === 'tools/call' ? new Response(null, { status: 404 }) : undefined;
+    const up = await connect(); fake.script = r => r.body.method === 'tools/call' ? Response.json({ jsonrpc: '2.0', id: null, error: { code: -32001, message: 'Session not found' } }, { status: 404 }) : undefined;
     await expect(up.execute(call)).rejects.toThrow(); expect(fake.seen.filter(r => r.body.method === 'initialize')).toHaveLength(2);
   });
   it('refuses a server-to-client request on an SSE stream instead of waiting', async () => {
@@ -284,13 +284,44 @@ describe('live legacy restart regression', () => {
   });
 });
 
-it('bounds legacy 400 body inspection by the existing response cap and deadline', async () => {
+it.each([400, 404])('bounds legacy %s body inspection by the existing response cap and deadline', async status => {
   const up = await connect();
-  fake.script = r => r.body.method === 'tools/call' ? new Response('private-value', { status: 400, headers: { 'content-length': String(4 * 1024 * 1024 + 1) } }) : undefined;
+  fake.script = r => r.body.method === 'tools/call' ? new Response('private-value', { status, headers: { 'content-length': String(4 * 1024 * 1024 + 1) } }) : undefined;
   await expect(up.execute(call)).rejects.toThrow('response exceeds');
   vi.useFakeTimers();
-  fake.script = r => r.body.method === 'tools/call' ? new Response(new ReadableStream({ start() {}, cancel() {} }), { status: 400 }) : undefined;
+  fake.script = r => r.body.method === 'tools/call' ? new Response(new ReadableStream({ start() {}, cancel() {} }), { status }) : undefined;
   const p = expect(up.execute(call)).rejects.toMatchObject({ name: 'UpstreamTimeout' });
   await vi.advanceTimersByTimeAsync(30_000); await p;
   expect(fake.seen.filter(r => r.body.method === 'initialize')).toHaveLength(1);
+});
+
+
+describe('Fable fixes-2b review session envelopes', () => {
+  it.each([400, 404])('recovers from an exact session error with omitted, null or matching id (HTTP %s)', async status => {
+    const up = await connect();
+    for (const shape of ['omitted', 'null', 'matching']) {
+      let rejected = false;
+      fake.script = r => {
+        if (r.body.method !== 'tools/call' || rejected) return undefined;
+        rejected = true;
+        return Response.json({ jsonrpc: '2.0', ...(shape === 'omitted' ? {} : { id: shape === 'null' ? null : r.body.id }),
+          error: status === 400 ? { code: -32000, message: 'Bad Request: No valid session ID provided' }
+            : { code: -32001, message: 'Session not found' } }, { status });
+      };
+      expect((await up.execute(call)).isError).toBe(false);
+    }
+    expect(fake.seen.filter(r => r.body.method === 'initialize')).toHaveLength(4);
+    expect(fake.seen.filter(r => r.body.method === 'tools/call')).toHaveLength(6);
+  });
+  it.each(['html', 'wrong-code', 'wrong-message', 'mismatched-id', 'result', 'wrong-version'])('refuses unrelated or malformed 404: %s', async shape => {
+    const up = await connect();
+    fake.script = r => r.body.method !== 'tools/call' ? undefined : new Response(shape === 'html' ? '<html>private-value</html>' : JSON.stringify({
+      jsonrpc: shape === 'wrong-version' ? '1.0' : '2.0', id: shape === 'mismatched-id' ? 999 : null,
+      error: { code: shape === 'wrong-code' ? -32000 : -32001, message: shape === 'wrong-message' ? 'private-value' : 'Session not found' },
+      ...(shape === 'result' ? { result: {} } : {}),
+    }), { status: 404 });
+    await expect(up.execute(call)).rejects.toThrow(/^upstream demo: HTTP 404 on tools\/call$/);
+    expect(fake.seen.filter(r => r.body.method === 'initialize')).toHaveLength(1);
+    expect(fake.seen.filter(r => r.body.method === 'tools/call')).toHaveLength(1);
+  });
 });

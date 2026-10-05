@@ -12,3 +12,5 @@
 - [ ] Coordinator: real Slack Socket Mode and loopback e2e checks; review by Fable (not self-approved)
 
 - [x] ADR-015 2026-10-05: bounded users.info enrichment after atomic settlement, no name on failure, member identity unchanged, scope + reinstall docs; in-process races/failures and coordinator loopback assertions.
+
+- [x] Fable fixes-2b P2-1: reject Unicode Cc/Cf before trimming or fallback; decision unchanged; ordinary RTL names retained.

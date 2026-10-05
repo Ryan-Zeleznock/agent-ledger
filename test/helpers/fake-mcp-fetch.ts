@@ -24,7 +24,7 @@ export class FakeMcpFetch {
         if (id) this.sessions.add(id);
         return this.ok(r, { protocolVersion: this.version, capabilities: { tools: {} }, serverInfo: { name: 'fake', version: '1' } }, id ? { 'mcp-session-id': id } : {});
       }
-      if (session && !this.sessions.has(session)) return Response.json({ jsonrpc: '2.0', id: r.body.id ?? null, error: { code: -32000, message: 'expired' } }, { status: 404 });
+      if (session && !this.sessions.has(session)) return Response.json({ jsonrpc: '2.0', id: null, error: { code: -32001, message: 'Session not found' } }, { status: 404 });
       if (!session && this.sessionHeader !== null) return Response.json({ jsonrpc: '2.0', id: r.body.id ?? null, error: { code: -32000, message: 'no session' } }, { status: 400 });
       if (r.body.method === 'notifications/initialized') return new Response(null, { status: 202 });
     }

@@ -448,7 +448,7 @@ it("labels absent agent sessions conservatively in HTML/PDF/CSV without guessing
 it('renders the approver name with the stable member id and keeps it in the existing CSV approval JSON', async () => {
   const r = rec(1); approve(r, 'approved'); Object.assign(r.approval!, { approver: 'U0C6UV8NMR7', approverName: 'Ryan Zeleznock' });
   const p = await pack([r]);
-  expect(section(p.html, 'cc8-1')).toContain('approved, Ryan Zeleznock (U0C6UV8NMR7)');
+  expect(section(p.html, 'cc8-1')).toContain('approved, <bdi>Ryan Zeleznock</bdi> (U0C6UV8NMR7)');
   expect(p.pdfText.replace(/\s+/g, ' ')).toContain('approved, Ryan Zeleznock (U0C6UV8NMR7)');
   expect(p.csv).toContain('""approverName"":""Ryan Zeleznock""');
   expect(p.csv.split('\n')[0]!.split(',')).toHaveLength(28);
@@ -457,7 +457,14 @@ it('escapes display names and preserves member-only reports when lookup is absen
   const named = rec(1); approve(named, 'denied'); Object.assign(named.approval!, { approverName: '<script>(é) & "name"</script>' });
   const old = rec(2); approve(old, 'approved');
   const p = await pack([named, old]); const cc8 = section(p.html, 'cc8-1');
-  expect(cc8).toContain('denied, &lt;script&gt;(é) &amp; &quot;name&quot;&lt;/script&gt; (reviewer)');
+  expect(cc8).toContain('denied, <bdi>&lt;script&gt;(é) &amp; &quot;name&quot;&lt;/script&gt;</bdi> (reviewer)');
   expect(cc8).not.toContain('<script>'); expect(cc8).toContain('approved, reviewer');
   expect(p.pdfText.replace(/\s+/g, ' ')).toContain('denied, <script>(é) & "name"</script> (reviewer)');
+});
+
+it.each(['Alice\u202e', 'ריאן', 'Alice (U0AAAAAAAA)'])('isolates a stored display name from the member id in HTML: %s', async name => {
+  const r = rec(1); approve(r, 'approved'); Object.assign(r.approval!, { approver: 'U0C6UV8NMR7', approverName: name });
+  const p = await pack([r]);
+  expect(section(p.html, 'cc8-1')).toContain(`<td>approved, <bdi>${name}</bdi> (U0C6UV8NMR7)</td>`);
+  expect(p.csv).not.toContain('<bdi>'); expect(p.pdfText).not.toContain('<bdi>');
 });

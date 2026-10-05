@@ -434,7 +434,7 @@ describe.sequential("Slice 2b end to end: Slack approvals + the legacy-era bridg
     expect(cls(callIds["unavailable"]!)).toEqual(["denied: Slack unavailable"]);
     const html = readFileSync(out.htmlPath, "utf8");
     const cc81 = html.split('<section id="cc8-1">')[1]!.split("</section>")[0]!;
-    expect(cc81).toContain(`approved, Ryan Zeleznock (${APPROVER})`); expect(cc81).toContain("executed after ask");
+    expect(cc81).toContain(`approved, <bdi>Ryan Zeleznock</bdi> (${APPROVER})`); expect(cc81).toContain("executed after ask");
     // leak sweep
     const nonces = slack.posted.flatMap((m) => JSON.stringify(m.body).match(/:[0-9a-f]{32}"/g) ?? []).map((s) => s.slice(1, -1));
     expect(nonces.length).toBeGreaterThan(0);
