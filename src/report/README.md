@@ -73,10 +73,22 @@ HTML escapes all record text and has no scripts or remote assets. CSV uses quote
 quotes, and prefixes formula-leading cells with an apostrophe; that presentation prefix is not part
 of the original value. Exported text is evidence presentation, not a byte-for-byte rehashable ledger.
 
-PDF is a dependency-free, paginated PDF 1.4 text document using Courier. Non-ASCII characters are
-shown as reversible `\uXXXX` UTF-16 escapes, each kept whole when wrapping; HTML/CSV retain Unicode. It wraps long text without
-truncating records, uses larger section headings and landscape aligned tables with repeated headers,
-and keeps each record block together when it fits on a page. Each page footer includes the chain result. No PDF/A, embedded fonts or signatures are claimed. Output files use exclusive
+PDF is a dependency-free, paginated PDF 1.4 document using standard Helvetica for prose,
+Helvetica Bold for headings and Courier only for identifier/hash fields. It starts with a cover
+(title, range, generation time, verdicts, scope and trust boundary), then a contents page with
+resolved page numbers. Table columns use measured content widths, repeated captions/headers,
+hairline rules and zebra rows. Criterion tables retain full source timestamps and identifiers;
+the compact record index uses UTC times with dates in captions. Record details retain every
+non-empty field, including full identifiers; short interior fields share lines to reduce repetition.
+
+Wrapping happens at whitespace boundaries, never inside timestamps, hashes or Unicode escapes.
+Non-ASCII ledger characters remain reversible `\uXXXX` UTF-16 escapes; HTML/CSV retain Unicode.
+Criterion table IDs are never abbreviated. The cover abbreviates the head with `...`; the summary
+and record details retain the full value. An unbroken token
+wider than its available line is fitted by reducing its font size, preserving all evidence bytes;
+very long unbroken values can consequently be small and should be read in HTML/CSV. Fitting
+record blocks stay on one page; oversized blocks continue. Each footer includes the chain result.
+No PDF/A, embedded fonts or signatures are claimed. Output files use exclusive
 creation with mode 0600; use a fresh output directory for each pack. HTML is written last. I/O errors
 can leave an incomplete pack; a failed invocation must not be distributed as a completed export.
 All history/outputs are held in memory. Session and outcome lookups use maps/sets; the unchanged
@@ -88,8 +100,7 @@ Tests: `test/report.test.ts`, plus the real-ledger/process export in `test/cli-p
 
 The six ordered sections are Executive summary, CC6.1 logical access, CC7.2 monitoring,
 CC8.1 change management, Record evidence and Vocabulary. Tables are semantic HTML with column
-headers and grayscale print styles; PDF has the same titles/order. Existing record blocks retain
-all their fields. CSV retains its original 25 columns, then appends `agent_session_id`,
+headers and grayscale print styles; PDF has the same titles/order. Expandable record details retain all non-empty fields; the compact index lists every record. CSV retains its original 25 columns, then appends `agent_session_id`,
 `evidence_class`, `anchor_status` in that order. Missing session ids display as
 "pre-1c, no agent session id"; missing anchor context displays "not supplied" in CSV.
 
@@ -150,3 +161,39 @@ CLI and merged e2e seams require coordinator integration and independent review.
 
 Regression tests: `test/report-slice-1c.test.ts`, `test/report-pdf.test.ts`. Fable's full review
 is retained at `docs/reviews/2026-10-03-fable-slice-1c-pack-review.md`; fixes need his scoped verification.
+
+## Auditor layout (2026-10-04 design audit)
+
+HTML leads with chain/anchor/findings status expressed in text as well as color, followed by
+a definition grid and the unchanged trust-boundary callout. The status band is additional:
+all pinned summary lines, including chain/anchor and the full observed head, remain contiguous
+escaped text runs below it. Contents links retain all six pin-8
+section IDs and include record/check counts. Monitoring lists every anomaly check even at zero,
+and emits detail tables only for populated checks. Heartbeat counts remain explicit.
+
+Charter/Iowan/Cambria/Georgia are offline prose fonts chosen for long-form reading; system sans
+labels and tables distinguish navigation from evidence. Prose is limited to 72ch inside a 1180px
+page. Only IDs/hashes use monospace; time/count columns use tabular numerals. Criterion tables
+retain the exact pinned columns/order and plain escaped cell values, including full timestamps
+with their original offsets and full identifiers. Wrapper classes and CSS provide column styling
+without changing the cells consumed by the e2e checks. Only the compact record index normalizes
+times to UTC (dates in captions and multi-date rows); header/record summaries may shorten IDs. Grayscale
+print rules preserve text statuses, repeat table headers, and expose details in browsers supporting
+`::details-content`; browser print behavior requires coordinator visual verification. No remote assets.
+
+The redesign request explicitly supersedes pin 8's original Courier-only PDF and raw-block presentation; fields,
+verbatim caveats, classifications, CSV bytes and section order are preserved. The CSV regression
+fingerprint was captured before changing the renderer, including hostile strings and HMAC data.
+
+Validation for the redesign: report tests cover cover/contents page boundaries and resolved page
+numbers, complete word/token wrapping, non-empty details (including false/zero), status/contents
+HTML structure, conditional anomaly tables, multi-date captions, Unicode/hostile input escaping,
+CSV byte stability and PDF xref/stream/page references. A synthetic 24-record PDF was parsed and
+rasterized with local Poppler for visual inspection. HTML browser rendering, responsive behavior
+and browser print expansion were not visually verified in the sandbox. Full suite/e2e remains
+with the coordinator; this is a build handoff, not independent approval.
+
+Coordinator regression fix (uncommitted pending outside-sandbox confirmation): report tests now
+exercise the same `section`/`under`/`tableRows` parsing as Slice 1c steps 8–10 and Slice 2a step 10,
+check criterion values against CSV, and use the e2e PDF extractor for section order and the
+contiguous anchor/denial lines. The e2e tests themselves are unchanged.

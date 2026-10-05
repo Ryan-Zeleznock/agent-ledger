@@ -35,11 +35,11 @@ function approve(r: LedgerRecord, decision: ApprovalResult["decision"], channel:
 function pdfText(raw: string): string {
   return [...raw.matchAll(/\(((?:\\.|[^\\)])*)\) Tj/g)].map(m => m[1]!.replace(/\\267/g, "·").replace(/\\([\\()])/g, "$1").replace(/\\u([0-9a-f]{4})/g, (_, n: string) => String.fromCharCode(parseInt(n, 16)))).join("\n");
 }
-async function pack(records: LedgerRecord[], context?: ReportContext) {
+async function pack(records: LedgerRecord[], context?: ReportContext, selectedRange = range) {
   const dir = await mkdtemp(join(tmpdir(), "pack-1c-")); dirs.push(dir);
   const ledger: LedgerStore = { append: vi.fn(), head: async () => records.at(-1)?.hash ?? "0", verify: async () => ({ ok: true, checked: records.length }),
     async *read(r) { for (const x of records) if (Date.parse(x.writtenAt) >= Date.parse(r.from) && Date.parse(x.writtenAt) <= Date.parse(r.to)) yield x; } };
-  await generateReport(ledger, range, dir, context);
+  await generateReport(ledger, selectedRange, dir, context);
   const html = await readFile(join(dir, "report.html"), "utf8");
   const pdf = await readFile(join(dir, "report.pdf"), "ascii");
   return { html, pdf, pdfText: pdfText(pdf), csv: await readFile(join(dir, "records.csv"), "utf8") };
@@ -115,7 +115,7 @@ it("escapes new table cells and appended CSV columns, labels digests and preserv
 it("paginates aligned tables with repeated headers, larger titles, footers and unsplit fitting record blocks", async () => {
   const p = await pack(Array.from({ length: 45 }, (_, i) => rec(i, `session-${i}`)));
   const pages = [...p.pdf.matchAll(/stream\n([\s\S]*?)endstream/g)].map(m => pdfText(m[1]!));
-  expect(p.pdf).toMatch(/\/F1 1[2-8] Tf/);
+  expect(p.pdf).toMatch(/\/F[13] 1[2-8] Tf/);
   expect(p.pdf).toContain("Agent Ledger evidence pack \\267 page");
   pages.forEach((page, i) => expect(page).toContain(`Agent Ledger evidence pack · page ${i + 1} / ${pages.length} · chain PASS`));
   expect(pages.filter(page => page.includes("rule_id")).length).toBeGreaterThan(1);
@@ -180,4 +180,184 @@ it.each(["tool", "server", "rule"] as const)("review #7: heartbeat %s mismatch s
   expect(section(p.html, "summary")).toContain(`heartbeat discriminator mismatch: ${h.id};`);
   expect(section(p.html, "cc7-2")).toContain("heartbeat discriminator mismatch");
   expect(p.csv.split("\r\n")[1]).toContain("heartbeat discriminator mismatch");
+});
+
+it("design: status comes before definition facts, with contents, labeled downloads and an offline print layout", async () => {
+  const p = await pack([rec(1)]);
+  const summary = section(p.html, "summary");
+  expect(summary).toContain('class="status-band"');
+  expect(summary.indexOf('class="status-band"')).toBeLessThan(summary.indexOf('<dl class="facts">'));
+  expect(summary).toContain('class="trust-boundary"');
+  expect(summary).toContain(`title="${rec(1).hash}"`);
+  expect(p.html).toContain('aria-label="Contents"');
+  for (const id of ["summary", "cc6-1", "cc7-2", "cc8-1", "records", "legend"]) expect(p.html).toContain(`href="#${id}"`);
+  expect(p.html).toContain('href="report.pdf" download>Download PDF');
+  expect(p.html).toContain('href="records.csv" download>Download CSV');
+  expect(p.html).toContain("font-variant-numeric:tabular-nums");
+  expect(p.html).toContain("@media print");
+  expect(p.html).not.toMatch(/<(script|link)\b/);
+});
+it("design: compact record table and non-empty details retain full evidence and escape attribute values", async () => {
+  const r = rec(1); r.call.args = {}; r.call.declaredPlan = ''; r.call.onBehalfOf = '\"><script>hostile</script>';
+  const p = await pack([r]); const s = section(p.html, "records");
+  expect(s.match(/<table>/g)).toHaveLength(1);
+  for (const title of ["Time", "Phase", "Tool", "Decision", "Evidence class", "Criteria"]) expect(s).toContain(`>${title}</th>`);
+  expect(s.match(/<details\b/g)).toHaveLength(1);
+  const details = s.split('<details')[1]!;
+  for (const absent of ["approval", "outcome", "handoff", "parent_record_id", "declared_plan", "arguments_labeled"]) expect(details).not.toContain(`<dt>${absent}</dt>`);
+  for (const present of ["record_id", "hash", "received_at", "on_behalf_of"]) expect(details).toContain(`<dt>${present}</dt>`);
+  expect(details).toContain(r.hash);
+  expect(s).toContain('&quot;&gt;&lt;script&gt;hostile&lt;/script&gt;');
+  expect(s).not.toContain('<script>');
+  expect(s).toMatch(/<caption>[^<]*2026-09-30/);
+  expect(s).toContain('class="time"');
+});
+it("design: monitoring check list reports zero checks without empty detail tables", async () => {
+  const p = await pack([]); const s = section(p.html, "cc7-2");
+  expect(s).toContain('class="anomaly-checks"');
+  expect(s).toContain("Sessions without heartbeat (0)");
+  expect(s).toContain("OK");
+  expect(s).not.toContain('<table>');
+  const flagged = section((await pack([rec(1, "missing")])).html, "cc7-2");
+  expect(flagged).toContain("FLAG");
+  expect(flagged).toContain('<table>');
+});
+it("design: CSV bytes remain frozen across presentation changes", async () => {
+  const { createHash } = await import('node:crypto');
+  const r = rec(2, '=hostile<script>'); approve(r, 'delegated', 'hook-ask');
+  r.call.args = { digest: `hmac-sha256:${'a'.repeat(64)}`, clear: '"x",é\n=SUM(A1)' };
+  const p = await pack([heartbeat(1, 'healthy'), r, result(r, 'ok')], { anchor: { status: 'head', latest: { hash: r.hash, at: range.from } } });
+  expect(createHash('sha256').update(p.csv).digest('hex')).toBe('14a75575c75df78c86ff72a6945ee767381172dfc008d344bbd97300ad47c206');
+});
+it("design: PDF starts with dedicated cover and contents pages", async () => {
+  const p = await pack([rec(1)]);
+  const pages = [...p.pdf.matchAll(/stream\n([\s\S]*?)endstream/g)].map(m => pdfText(m[1]!));
+  expect(p.pdf).toContain('/BaseFont /Helvetica');
+  expect(pages[0]).toContain('SOC 2 evidence pack');
+  for (const text of ['Range', 'Chain verification: PASS', 'Anchor:', 'Findings:', 'Scope:', 'best-effort gating']) expect(pages[0]).toContain(text);
+  expect(pages[1]).toContain('Contents');
+  for (const title of ['Executive summary', 'CC6.1 logical access', 'CC7.2 monitoring', 'CC8.1 change management', 'Record evidence', 'Vocabulary']) expect(pages[1]).toContain(title);
+  expect(pages[2]).toContain('Executive summary');
+});
+it("design: contents page numbers resolve to real section headings and record details preserve false/zero", async () => {
+  const r = rec(1, 'a-session-id-that-is-long-enough-to-shorten'); r.call.args = { enabled: false, count: 0 };
+  const p = await pack([r]);
+  expect(section(p.html, 'records')).toContain('&quot;enabled&quot;:false,&quot;count&quot;:0');
+  expect(section(p.html, 'records')).toContain('<dt>agent_session_id</dt>');
+  expect(p.pdfText).toContain('a-session-id-that-is-long-enough-to-shorten');
+  expect(p.pdfText).toContain('"enabled":false,"count":0');
+  const pages = [...p.pdf.matchAll(/stream\n([\s\S]*?)endstream/g)].map(m => pdfText(m[1]!));
+  for (const title of ['Executive summary', 'CC6.1 logical access', 'CC7.2 monitoring', 'CC8.1 change management', 'Record evidence', 'Vocabulary']) {
+    const contentsLines = pages[1]!.split('\n');
+    const number = Number(contentsLines[contentsLines.indexOf(title) + 1]);
+    expect(number).toBeGreaterThanOrEqual(3);
+    expect(pages[number - 1]!.split('\n')).toContain(title);
+  }
+});
+it("design: multi-date tables retain row dates and original timestamp offsets", async () => {
+  const r = rec(1); r.writtenAt = '2026-09-30T23:30:00-10:00';
+  const p = await pack([rec(2), r], undefined, { from: range.from, to: '2026-10-01T13:00:00Z' });
+  const records = section(p.html, 'records');
+  expect(records).toContain('Dates (UTC): 2026-09-30, 2026-10-01');
+  expect(records).toContain('datetime="2026-09-30T23:30:00-10:00"');
+  expect(records).toContain('>2026-10-01 09:30:00.000Z</time>');
+  expect(records).toContain('>2026-09-30 12:00:01.000Z</time>');
+});
+it.each(['{}', '[]', 'null'])("design: non-empty literal %s remains evidence in record details", async value => {
+  const r = rec(1); r.call.declaredPlan = value;
+  const p = await pack([r]);
+  expect(section(p.html, 'records')).toContain(`<dt>declared_plan</dt><dd>${value}</dd>`);
+  expect(p.pdfText).toContain(`declared_plan: ${value}`);
+});
+it("design: appended record-detail identifiers still label HMAC values", async () => {
+  const r = rec(1, `hmac-sha256:${'d'.repeat(64)}`);
+  const p = await pack([r]);
+  for (const output of [p.html, p.pdfText, p.csv]) {
+    expect(output).not.toContain('hmac-sha256:');
+    expect(output).toContain('HMAC-SHA256 digest (argument withheld)');
+    expect(output).toContain('d'.repeat(64));
+  }
+});
+
+// Mirror the coordinator's e2e parsers; criterion cells are literal escaped text, not nested markup.
+const seamUnesc = (s: string) => s.replace(/&(amp|lt|gt|quot|#39);/g, (_, e: string) => ({ amp: "&", lt: "<", gt: ">", quot: '"', "#39": "'" })[e]!);
+const seamRows = (html: string): string[][] => {
+  const tbody = html.split("<tbody>")[1]?.split("</tbody>")[0] ?? "";
+  return [...tbody.matchAll(/<tr>(.*?)<\/tr>/gs)].map(m => [...m[1]!.matchAll(/<td(?: colspan="\d+")?>(.*?)<\/td>/gs)].map(c => c[1]!)).filter(row => !(row.length === 1 && row[0] === "None"));
+};
+const seamUnder = (html: string, heading: string) => {
+  const body = html.split(`<h3>${heading}</h3>`)[1]?.split("<h3>")[0];
+  expect(body).toBeDefined(); return body!;
+};
+it("pin 8 coordinator regression: summary lines remain contiguous below the additional status band", async () => {
+  const r = rec(1, 'session-with-a-full-identifier');
+  const p = await pack([r], { anchor: { status: 'ancestor', latest: { hash: r.hash, at: range.from } } });
+  const summary = seamUnesc(section(p.html, 'summary'));
+  const afterBand = summary.slice(summary.indexOf('<dl class="facts">'));
+  for (const line of [
+    '1 records', `Range (writtenAt, inclusive): ${range.from} to ${range.to}`,
+    `Observed ledger head: ${r.hash}`, 'Chain verification: PASS; checked 1 records (whole ledger); brokenAt: none',
+    `Anchor: ancestor anchored at ${range.from}: records after it are unprotected; local file anchor, editable by this machine's owner`,
+    'Agent sessions seen: 1; heartbeats: 0', 'Tool intents by risk: read: 0; write: 0; risky: 1; unreviewed: 0',
+    'Asks: 0; recorded approvals: 0', 'Recorded denials by cause: none', 'Outcomes ok: 0; error: 0; no outcome observed: 1',
+  ]) expect(afterBand).toContain(`>${line}<`);
+  expect(afterBand).toMatch(/>Generated: [^<]+</);
+  expect(afterBand).toMatch(/>Local mode: visibility, tamper-evident logging and best-effort gating, not enforcement\.[^<]+</);
+});
+it("pin 8 coordinator regression: exact criterion columns and full cells agree with CSV and e2e parsers", async () => {
+  const { parseCsv } = await import('./helpers/e2e-demo.js');
+  const session = 'd247c305-c18e-4a4b-893c-049e87ed62c6';
+  const h = heartbeat(1, session); h.call.args.nodeOptionsSet = true;
+  const r = rec(2, session); r.writtenAt = '2026-09-30T08:00:02.123-04:00'; approve(r, 'delegated', 'hook-ask');
+  const m = rec(3, 'missing-session-with-a-long-identifier'); m.writtenAt = '2026-09-30T12:00:03.000Z';
+  const o = result(m, 'blocked', 'permission-denied:auto-mode'); o.writtenAt = '2026-09-30T12:00:04.000Z';
+  const p = await pack([h, r, m, o]);
+  const access = seamUnesc(section(p.html, 'cc6-1')), monitoring = seamUnesc(section(p.html, 'cc7-2')), change = seamUnesc(section(p.html, 'cc8-1'));
+  const headers = (html: string) => [...html.split('</thead>')[0]!.matchAll(/<th scope="col">(.*?)<\/th>/g)].map(m => m[1]);
+  expect(headers(access)).toEqual(['written_at', 'agent_session_id', 'agent_id', 'server/tool', 'risk', 'verdict', 'rule_id']);
+  expect(headers(change)).toEqual(['written_at', 'agent_session_id', 'server/tool', 'risk', 'approval (decision, approver)', 'outcome (status, errorClass)', 'evidence_class']);
+  expect(seamRows(access)).toEqual([r, m].map(x => [x.writtenAt, x.call.agentSessionId, x.call.agentId, `${x.call.server}/${x.call.tool}`, x.policy.risk, x.policy.verdict, x.policy.ruleId]));
+  const heartbeatTable = seamUnder(monitoring, 'Heartbeats (1)');
+  expect(headers(heartbeatTable)).toEqual(['written_at', 'agent_session_id', 'source', 'permission_mode', 'watchdog_check', 'node_options_set', 'interpreter']);
+  expect(seamRows(heartbeatTable)).toEqual([[h.writtenAt, session, 'startup', 'default', 'ok', 'true', '/usr/local/bin/node']]);
+  expect(seamRows(seamUnder(monitoring, 'Sessions without heartbeat (1)'))).toEqual([[m.call.agentSessionId, m.id, '1']]);
+  expect(seamRows(seamUnder(monitoring, 'Launch-environment warnings (1)'))).toEqual([[h.id, session, 'nodeOptionsSet: true', 'informational']]);
+  expect(seamRows(seamUnder(monitoring, 'Intents with no outcome observed (1)'))).toEqual([[r.id, r.call.callId]]);
+  expect(seamRows(change)).toEqual([
+    [r.writtenAt, session, `${r.call.server}/${r.call.tool}`, 'risky', 'delegated, reviewer', 'no outcome observed', 'asked, no outcome observed'],
+    [m.writtenAt, m.call.agentSessionId, `${m.call.server}/${m.call.tool}`, 'risky', 'not recorded', JSON.stringify(o.outcome), 'denied: auto mode'],
+  ]);
+  const [header, ...csv] = parseCsv(p.csv); const col = (name: string) => header!.indexOf(name);
+  for (const row of seamRows(change)) {
+    const csvRow = csv.find(c => c[col('written_at')] === row[0] && c[col('phase')] === 'intent');
+    expect(csvRow).toBeDefined();
+    expect([csvRow![col('agent_session_id')], csvRow![col('evidence_class')]]).toEqual([row[1], row[6]]);
+  }
+});
+it("pin 8 coordinator regression: PDF keeps section order, full criterion values and contiguous extracted anchor text", async () => {
+  const { pdfText: extract } = await import('./helpers/e2e-demo.js');
+  const r = rec(1, 'd247c305-c18e-4a4b-893c-049e87ed62c6'); r.writtenAt = '2026-09-30T08:00:02.123-04:00';
+  const p = await pack([r], { anchor: { status: 'ancestor', latest: { hash: r.hash, at: range.from } } });
+  const pdf = extract(Buffer.from(p.pdf, 'ascii'));
+  const titles = ['Executive summary', 'CC6.1 logical access', 'CC7.2 monitoring', 'CC8.1 change management', 'Record evidence', 'Vocabulary'];
+  let previous = -1;
+  for (const title of titles) { expect(pdf.indexOf(title)).toBeGreaterThan(previous); previous = pdf.indexOf(title); }
+  expect(pdf).toContain(`Anchor: ancestor anchored at ${range.from}: records after it are unprotected; local file anchor, editable by this machine's owner`);
+  expect(pdf).toContain(denial);
+  // Check the actual access section, past the cover and contents references.
+  const body = p.pdfText.slice(p.pdfText.lastIndexOf('CC6.1 logical access\n')).split('CC7.2 monitoring\n')[0]!;
+  expect(body).toContain(r.writtenAt);
+  expect(body).toContain(r.call.agentSessionId);
+});
+it("pin 8 coordinator regression: Slice 2a CC8.1 server/tool, risk and evidence-class positions remain fixed", async () => {
+  const write = rec(1); write.call.server = 'demo'; write.call.tool = 'add'; write.policy.risk = 'write';
+  const risky = rec(2); risky.call.server = 'demo'; risky.call.tool = 'wipe'; approve(risky, 'no-channel', 'hook-ask'); delete risky.approval!.approver;
+  const unreviewed = rec(3); unreviewed.call.server = 'demo'; unreviewed.call.tool = 'whoami'; unreviewed.policy.risk = 'unreviewed'; approve(unreviewed, 'no-channel', 'hook-ask'); delete unreviewed.approval!.approver;
+  const p = await pack([write, result(write, 'ok'), risky, unreviewed]);
+  const rows = seamRows(seamUnesc(section(p.html, 'cc8-1')));
+  expect(rows.map(r => [r[2], r[3], r[6]])).toEqual([
+    ['demo/add', 'write', 'executed (allowed)'], ['demo/wipe', 'risky', 'denied: no channel'], ['demo/whoami', 'unreviewed', 'denied: no channel'],
+  ]);
+  expect(rows[1]![4]).toBe('no-channel, not recorded');
+  expect(rows.every(r => r.length === 7)).toBe(true);
 });
