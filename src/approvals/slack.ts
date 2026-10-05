@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { constants, openSync, fstatSync, readSync, closeSync } from 'node:fs';
 import type { ApprovalResult, PolicyDecision, SecretRef, ToolCall } from '../types/index.js';
+import { buildArgsPreview, previewSummary } from './preview.js';
 import { SLACK_ACTION_IDS, SLACK_BLOCK_ID_PREFIX, SLACK_BUTTON_VALUE_RE, SLACK_NONCE_BYTES, type PendingApproval, type SlackApprovalRouter, type SlackChannel } from './contract.js';
 
 export const SLACK_API_BASE_URL = 'https://slack.com/api/' as const;
@@ -12,6 +13,11 @@ const NAME_LOOKUP_TIMEOUT_MS = 1_000;
 const NAME_RESPONSE_MAX_BYTES = 64 * 1024;
 const SETTLED_FEEDBACK_MS = 30_000;
 const MAX_SETTLED_FEEDBACK = 1024;
+/** ADR-018 §2: pending Slack approvals one agent may hold at once; the next request is denied without posting. */
+export const SLACK_MAX_PENDING_PER_AGENT = 4;
+/** ADR-018 §2: agentId → pending count, and the identity keys (agent, server, tool, args digest) currently pending. */
+const pendingByAgent = new Map<string, number>();
+const pendingKeys = new Map<string, string>(); // key → callId of the request that holds it
 export interface WebSocketLike {
   readyState: number; send(data: string): void; close(code?: number): void;
   addEventListener(type: 'open' | 'message' | 'close' | 'error', fn: (ev: { data?: unknown }) => void): void;
@@ -281,19 +287,37 @@ export async function requestApprovalImpl(call: ToolCall, policy: PolicyDecision
   if (!Number.isFinite(wait) || shutdown) return unavailable(callId, shutdown ? 'proxy shutting down' : 'secret');
   let r: Router;
   try { r = getRouter(channel); } catch { return unavailable(callId, 'secret'); }
+  // ADR-018 §3: the reviewed preview is built from the (already redacted) args BEFORE anything is posted; if it cannot be
+  // shown within Slack's limits the call is denied (recorded by the pipeline), never approved blind.
+  const preview = buildArgsPreview(call?.args);
+  if (!preview.ok) return result(callId, 'denied', `agent-ledger: ${preview.reason}; denied without asking (arguments digest ${preview.digest})`);
+  // ADR-018 §2: per-agent pending cap; an identical pending request (same agent, tool and stored arguments) is not posted twice.
+  const agent = String(call?.agentId ?? '');
+  const key = `${agent}\u0000${call?.server}\u0000${call?.tool}\u0000${preview.digest}`;
+  const holder = pendingKeys.get(key);
+  if (holder !== undefined) return result(callId, 'denied', `agent-ledger: an identical approval request (${holder}) is already pending; denied without posting a duplicate`);
+  if ((pendingByAgent.get(agent) ?? 0) >= SLACK_MAX_PENDING_PER_AGENT) return result(callId, 'denied', `agent-ledger: ${SLACK_MAX_PENDING_PER_AGENT} approvals already pending for this agent; denied without asking`);
+  pendingKeys.set(key, callId); pendingByAgent.set(agent, (pendingByAgent.get(agent) ?? 0) + 1);
+  let held = true;
+  const releaseHold = () => {
+    if (!held) return; held = false;
+    if (pendingKeys.get(key) === callId) pendingKeys.delete(key);
+    const n = (pendingByAgent.get(agent) ?? 1) - 1; if (n <= 0) pendingByAgent.delete(agent); else pendingByAgent.set(agent, n);
+  };
   return new Promise<ApprovalResult>(resolve => {
     let nonce: string;
     try { nonce = (config.randomBytes ?? randomBytes)(SLACK_NONCE_BYTES).toString('hex'); if (!SLACK_BUTTON_VALUE_RE.test(`${callId}:${nonce}`) || (SLACK_BLOCK_ID_PREFIX + callId).length > 255) throw Error(); }
-    catch { resolve(unavailable(callId, 'secret')); return; }
+    catch { releaseHold(); resolve(unavailable(callId, 'secret')); return; }
     const expires = now() + wait; let settled: ApprovalResult | undefined, updated = false; let blocks: unknown[] = [];
     const update = () => {
       if (!settled || !entry.messageTs || updated) return; updated = true; r.remember(entry, settled);
       const text = settled.decision === 'approved' ? `Approved by <@${settled.approver}> at ${settled.decidedAt}` : settled.decision === 'denied' ? `Denied by <@${settled.approver}> at ${settled.decidedAt}` : settled.decision === 'timeout' ? `Expired after ${wait} ms` : 'Not decided: Slack unavailable';
-      void api('chat.update', r.bot, { channel: entry.channelId, ts: entry.messageTs, text, blocks: [...blocks.slice(0, 2), { type: 'context', elements: [{ type: 'mrkdwn', text }] }] }).catch(() => undefined);
+      // keep what was reviewed (header, arguments, digest); only the buttons are replaced by the outcome
+      void api('chat.update', r.bot, { channel: entry.channelId, ts: entry.messageTs, text, blocks: [...blocks.filter(b => (b as { type?: string }).type !== 'actions'), { type: 'context', elements: [{ type: 'mrkdwn', text }] }] }).catch(() => undefined);
     };
     const entry: PendingApproval = { callId, nonce, messageTs: '', channelId: channel.channelId, state: 'pending', settle(outcome) {
       if (entry.state !== 'pending') return false;
-      entry.state = 'settled'; settled = outcome; clearTimeout(timer); r.remove(entry); update();
+      entry.state = 'settled'; settled = outcome; clearTimeout(timer); releaseHold(); r.remove(entry); update();
       // Lock/remove first: competing clicks, shutdown and the approval timer cannot change this decision.
       // Enrichment fits inside the remaining wait (at most 1 s), and only the returned copy gets the name.
       if (outcome.approver && (outcome.decision === 'approved' || outcome.decision === 'denied')) {
@@ -308,10 +332,17 @@ export async function requestApprovalImpl(call: ToolCall, policy: PolicyDecision
       const clean = (s: string) => escape(s.replaceAll(r.bot, '[secret]').replaceAll(r.app, '[secret]').replaceAll(nonce, '[nonce]'));
       const name = clean(`${call.server}/${call.tool}`);
       const text = `Agent Ledger: approval needed for ${name} (${policy.risk})`;
-      const preview = JSON.stringify(call.args);
+      const reason = clean(policy.reason);
+      const shownReason = reason.length > 1500 ? `${reason.slice(0, 1500)} … [truncated: 1500 of ${reason.length} characters shown]` : reason;
+      // The argument sections are plain_text (nothing in an argument can format, link or mention); the bot/app tokens and
+      // the nonce can never be in them (the stored projection never holds our own secrets), but are checked anyway.
+      const argBlocks = preview.blocks.filter(b => { const t = JSON.stringify(b); return ![r.bot, r.app, nonce].some(x => x && t.includes(x)); });
+      if (argBlocks.length !== preview.blocks.length) throw new SlackFailure('secret');
       blocks = [
-        { type: 'section', text: { type: 'mrkdwn', text: `${clean(call.agentId)} — ${name}\nRisk: ${policy.risk}; rule: ${clean(policy.ruleId)}\n${clean(policy.reason)}\n${clean(preview).slice(0, 1500)}` } },
+        { type: 'section', text: { type: 'mrkdwn', text: `${clean(call.agentId)} — ${name}\nRisk: ${policy.risk}; rule: ${clean(policy.ruleId)}\n${shownReason}` } },
         { type: 'context', elements: [{ type: 'mrkdwn', text: `${clean(callId)}; expiresAt ${new Date(expires).toISOString()}` }] },
+        ...argBlocks,
+        { type: 'context', elements: [{ type: 'plain_text', text: previewSummary(preview), emoji: false }] },
         { type: 'actions', block_id: SLACK_BLOCK_ID_PREFIX + callId, elements: [
           { type: 'button', action_id: SLACK_ACTION_IDS.approve, text: { type: 'plain_text', text: 'Approve' }, style: 'primary', value: `${callId}:${nonce}`, confirm: { title: { type: 'plain_text', text: 'Approve action?' }, text: { type: 'plain_text', text: `Approve ${name}?` }, confirm: { type: 'plain_text', text: 'Approve' }, deny: { type: 'plain_text', text: 'Cancel' } } },
           { type: 'button', action_id: SLACK_ACTION_IDS.deny, text: { type: 'plain_text', text: 'Deny' }, style: 'danger', value: `${callId}:${nonce}` },
