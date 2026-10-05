@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+const requireFont = (name: string) => readFileSync(new URL(`../src/report/fonts/${name}`, import.meta.url));
+
 import { afterEach, expect, it, vi } from "vitest";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -182,11 +185,11 @@ it.each(["tool", "server", "rule"] as const)("review #7: heartbeat %s mismatch s
   expect(p.csv.split("\r\n")[1]).toContain("heartbeat discriminator mismatch");
 });
 
-it("design: status comes before definition facts, with contents, labeled downloads and an offline print layout", async () => {
+it("design: integrity precedes summary facts, with contents, labeled downloads and an offline print layout", async () => {
   const p = await pack([rec(1)]);
   const summary = section(p.html, "summary");
-  expect(summary).toContain('class="status-band"');
-  expect(summary.indexOf('class="status-band"')).toBeLessThan(summary.indexOf('<dl class="facts">'));
+  expect(p.html.indexOf('class="integrity-block"')).toBeLessThan(p.html.indexOf('<dl class="facts">'));
+  expect(summary).toContain('class="findings-status"');
   expect(summary).toContain('class="trust-boundary"');
   expect(summary).toContain(`title="${rec(1).hash}"`);
   expect(p.html).toContain('aria-label="Contents"');
@@ -234,7 +237,7 @@ it("design: PDF starts with dedicated cover and contents pages", async () => {
   const pages = [...p.pdf.matchAll(/stream\n([\s\S]*?)endstream/g)].map(m => pdfText(m[1]!));
   expect(p.pdf).toContain('/BaseFont /Helvetica');
   expect(pages[0]).toContain('SOC 2 evidence pack');
-  for (const text of ['Range', 'Chain verification: PASS', 'Anchor:', 'Findings:', 'Scope:', 'best-effort gating']) expect(pages[0]).toContain(text);
+  for (const text of ['Period', 'Chain verification: PASS', 'Anchor:', 'Findings:', 'Scope:', 'best-effort gating']) expect(pages[0]).toContain(text);
   expect(pages[1]).toContain('Contents');
   for (const title of ['Executive summary', 'CC6.1 logical access', 'CC7.2 monitoring', 'CC8.1 change management', 'Record evidence', 'Vocabulary']) expect(pages[1]).toContain(title);
   expect(pages[2]).toContain('Executive summary');
@@ -249,9 +252,10 @@ it("design: contents page numbers resolve to real section headings and record de
   const pages = [...p.pdf.matchAll(/stream\n([\s\S]*?)endstream/g)].map(m => pdfText(m[1]!));
   for (const title of ['Executive summary', 'CC6.1 logical access', 'CC7.2 monitoring', 'CC8.1 change management', 'Record evidence', 'Vocabulary']) {
     const contentsLines = pages[1]!.split('\n');
-    const number = Number(contentsLines[contentsLines.indexOf(title) + 1]);
+    const numberedTitle = contentsLines.find(line => line.endsWith(`. ${title}`))!;
+    const number = Number(contentsLines[contentsLines.indexOf(numberedTitle) + 1]);
     expect(number).toBeGreaterThanOrEqual(3);
-    expect(pages[number - 1]!.split('\n')).toContain(title);
+    expect(pages[number - 1]!.split('\n')).toContain(numberedTitle);
   }
 });
 it("design: multi-date tables retain row dates and original timestamp offsets", async () => {
@@ -289,7 +293,7 @@ const seamUnder = (html: string, heading: string) => {
   const body = html.split(`<h3>${heading}</h3>`)[1]?.split("<h3>")[0];
   expect(body).toBeDefined(); return body!;
 };
-it("pin 8 coordinator regression: summary lines remain contiguous below the additional status band", async () => {
+it("pin 8 coordinator regression: summary lines remain contiguous in definition facts", async () => {
   const r = rec(1, 'session-with-a-full-identifier');
   const p = await pack([r], { anchor: { status: 'ancestor', latest: { hash: r.hash, at: range.from } } });
   const summary = seamUnesc(section(p.html, 'summary'));
@@ -360,4 +364,65 @@ it("pin 8 coordinator regression: Slice 2a CC8.1 server/tool, risk and evidence-
   ]);
   expect(rows[1]![4]).toBe('no-channel, not recorded');
   expect(rows.every(r => r.length === 7)).toBe(true);
+});
+
+it('filed instrument: embeds all four vendored fonts and the three OFL notices offline', async () => {
+  const p = await pack([]);
+  const fonts = [...p.html.matchAll(/url\(data:font\/woff2;base64,([A-Za-z0-9+/=]+)\)/g)].map(m => Buffer.from(m[1]!, 'base64'));
+  const names = ['SourceSerif4-variable-latin.woff2', 'IBMPlexSansCondensed-400-latin.woff2', 'IBMPlexSansCondensed-600-latin.woff2', 'JetBrainsMono-400-latin.woff2'];
+  expect(fonts).toHaveLength(names.length);
+  for (const name of names) expect(fonts.some(f => f.equals(requireFont(name)))).toBe(true);
+  for (const name of ['Source Serif 4', 'IBM Plex Sans Condensed', 'JetBrains Mono', 'SIL Open Font License 1.1']) expect(section(p.html, 'legend')).toContain(name);
+  expect(Buffer.byteLength(p.html)).toBeLessThan(200_000);
+  expect(p.html).not.toMatch(/(?:src|href)=["']https?:|url\(["']?https?:|@import/);
+});
+
+it('filed instrument: cover registration, full head, numbered sections and ruled tables', async () => {
+  const p = await pack([rec(1)]);
+  expect(p.html).toContain('<header class="cover" aria-label="Exhibit cover"><div><h1>');
+  expect(p.html).toContain('aria-label="Registration"');
+  expect(p.html).toContain('class="verification-seal"');
+  expect(p.html).toContain('class="integrity-block"');
+  expect(p.html).toContain('1. Executive summary');
+  expect(p.html).toContain('6. Vocabulary');
+  expect(section(p.html, 'records')).toContain('Table 5.1');
+  expect(p.html).toContain('border-bottom:1.5px solid var(--ink)');
+  expect(p.html).not.toMatch(/border-left:|status-band|repeat\(3,/);
+  for (const font of ['Times-Roman', 'Times-Bold', 'Helvetica', 'Courier']) expect(p.pdf).toContain(`/BaseFont /${font}`);
+  const cover = [...p.pdf.matchAll(/stream\n([\s\S]*?)endstream/g)][0]![1]!;
+  expect(pdfText(cover)).toContain(rec(1).hash);
+  expect(cover).toMatch(/1 0 0 1 5\d\d\.00 /); // registration at right
+});
+
+it('filed instrument: chain margin interlocks and never replaces pinned columns', async () => {
+  const a = rec(1), b = rec(2); b.prevHash = a.hash;
+  const p = await pack([a, b]);
+  const index = section(p.html, 'records');
+  expect(index).toContain('>Chain</th>');
+  for (const [i, r] of [a, b].entries()) {
+    expect(index).toContain(`R-${String(i + 1).padStart(4, '0')}`);
+    expect(index).toContain(`prev ${r.prevHash.slice(0, 12)}`);
+    expect(index).toContain(`hash ${r.hash.slice(0, 12)}`);
+  }
+  expect(section(p.html, 'cc6-1')).not.toContain('>Chain</th>');
+});
+
+it('filed instrument: only approved named humans receive a stamp; exceptions retain words', async () => {
+  const named = rec(1), unnamed = rec(2), delegated = rec(3), timeout = rec(4), blank = rec(5);
+  approve(named, 'approved'); named.approval!.approver = '<Human & reviewer>';
+  approve(unnamed, 'approved'); delete unnamed.approval!.approver;
+  approve(delegated, 'delegated', 'hook-ask'); approve(timeout, 'timeout');
+  approve(blank, 'approved'); blank.approval!.approver = '  ';
+  const p = await pack([named, unnamed, delegated, timeout, blank]);
+  const change = section(p.html, 'cc8-1');
+  expect(p.html.match(/\/\* human-approval-mark \*\//g)).toHaveLength(1);
+  expect(p.html).toContain('.table-4-1 tbody tr:nth-child(1) td:nth-child(5){color:var(--human-approval)');
+  expect(change).toContain('approved, &lt;Human &amp; reviewer&gt;');
+  expect(p.html).toContain('.table-4-1 tbody tr:nth-child(4) td{background:var(--exception-tint)}');
+  expect(change).toContain('<td>timeout, reviewer</td>');
+  expect(change).toContain('denied: Slack timeout');
+  expect(p.pdf).toContain('0.4784 0.1216 0.1686 rg');
+  const anonymous = await pack([unnamed, delegated, timeout, blank]);
+  expect(anonymous.html).not.toContain('/* human-approval-mark */');
+  expect(anonymous.pdf).not.toContain('0.4784 0.1216 0.1686 rg');
 });
