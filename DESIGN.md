@@ -118,7 +118,7 @@ Rectangles and rules. The only circle is the verification seal. Approval marks a
 
 ## Components
 integrity-block, verification-seal, human-approval-mark, table-header (1.5px ink rule), exception-row (tint + word),
-registration block (label/value rows), chain margin (dashed rule-strong divider, mono 11.5px).
+registration block (label/value rows), chain margin (dashed rule-strong divider, mono 12px; never below 12px).
 
 ## Do's and Don'ts
 Do: keep every pinned sentence and table column verbatim (docs/slices/slice-1c-pins.md pin 8); show exceptions with the
