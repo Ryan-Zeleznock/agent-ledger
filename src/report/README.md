@@ -102,7 +102,7 @@ The six ordered sections are Executive summary, CC6.1 logical access, CC7.2 moni
 CC8.1 change management, Record evidence and Vocabulary. Tables are semantic HTML with column
 headers and grayscale print styles; PDF has the same titles/order. Expandable record details retain all non-empty fields; the compact index lists every record. CSV retains its original 25 columns, then appends `agent_session_id`,
 `evidence_class`, `anchor_status` in that order. Missing session ids display as
-"pre-1c, no agent session id"; missing anchor context displays "not supplied" in CSV.
+"not recorded (server mode or pre-1c)"; missing anchor context displays "not supplied" in CSV.
 
 Pin-7 fixtures are the integration boundary: heartbeat discrimination requires
 `policy.ruleId === "heartbeat:session-start"`, `call.tool === "SessionStart"` and a `builtin:`
@@ -209,3 +209,12 @@ and chain index. Chromium failed sandbox Mach-port registration, so HTML renderi
 layout and browser printing need coordinator visual verification. Print CSS removes the sheet
 shadow, repeats table headers and expands evidence details; evidence details also start open.
 The coordinator runs the full suite and e2e outside the sandbox. This build is not independent approval.
+
+
+Live-lab label correction (2026-10-05): `LedgerRecord`/`ToolCall` have no writer or mode discriminator.
+Both pipeline paths project the same fields and use `identity.startSession`; `agentSessionId` is absent in proxy
+mode AND old hook records. MCP server names, Slack decisions and handoff correlation do not prove provenance.
+Therefore HTML/PDF and the existing CSV `agent_session_id` label use the conservative wording above, with a
+Vocabulary explanation, instead of asserting `not applicable (server mode)`. CSV remains 28 columns.
+Test: `labels absent agent sessions conservatively in HTML/PDF/CSV without guessing from MCP names`.
+Coordinator owns the pin-8 wording amendment; no mode field or enforcement claim was added.

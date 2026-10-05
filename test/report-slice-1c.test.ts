@@ -71,7 +71,7 @@ it("finds exactly the session without a heartbeat, never a pre-1c record; heartb
   const monitoring = section(p.html, "cc7-2");
   expect(monitoring).toContain("Sessions without heartbeat (1)");
   expect(monitoring).toMatch(/missing-session<\/td><td>rec-3<\/td><td>2/);
-  expect(p.html).toContain("pre-1c, no agent session id");
+  expect(p.html).toContain("not recorded (server mode or pre-1c)");
   expect(section(p.html, "cc6-1")).not.toContain("SessionStart");
   expect(section(p.html, "cc8-1")).not.toContain("SessionStart");
   expect(p.html).toContain("Intents with no outcome observed (4)");
@@ -427,4 +427,20 @@ it('filed instrument: only approved named humans receive a stamp; exceptions ret
   const anonymous = await pack([unnamed, delegated, timeout, blank]);
   expect(anonymous.html).not.toContain('/* human-approval-mark */');
   expect(anonymous.pdf).not.toContain('0.4784 0.1216 0.1686 rg');
+});
+
+
+it("labels absent agent sessions conservatively in HTML/PDF/CSV without guessing from MCP names", async () => {
+  const proxy = rec(1); proxy.call.server = "everything"; proxy.call.tool = "echo";
+  const oldHook = rec(2); oldHook.call.server = "builtin:claude-code";
+  const hook = rec(3, "recorded-agent-session");
+  const p = await pack([proxy, oldHook, hook]);
+  for (const output of [p.html, p.pdfText.replace(/\s+/g, " "), p.csv]) {
+    expect(output).toContain("not recorded (server mode or pre-1c)");
+    expect(output).not.toContain("pre-1c, no agent session id");
+    expect(output).toContain("recorded-agent-session");
+  }
+  expect(section(p.html, "legend")).toContain("Records have no deployment-mode discriminator");
+  expect(p.csv.split("\n")[0]!.split(",")).toHaveLength(28);
+  expect(section(p.html, "cc6-1")).not.toContain("not applicable (server mode)");
 });

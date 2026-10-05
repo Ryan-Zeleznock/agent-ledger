@@ -43,6 +43,7 @@ const vocabulary = [
   "CC8.1 change management: writes and risky/unknown actions, approval requests, approvals and denials. A shell call is not necessarily a production change.",
   "delegated = asked in the terminal; not a recorded human approval. An intent with no outcome means execution was not observed; denial, cancellation or lost telemetry cannot be distinguished.",
   "An empty evidence_class identifies a heartbeat/handoff, an orphan without a classifiable cause, or a blocked outcome whose cause is not recorded; consult the raw outcome. It does not mean allowed or successful execution.",
+  "Agent session id: not recorded (server mode or pre-1c) means the record has no agent runtime session id. Records have no deployment-mode discriminator, so a missing id cannot identify a proxy writer or establish record age.",
   "Codex hook outcome ok means the tool ran and returned; it does not prove success.",
   "HMAC-SHA256 digest = argument withheld, not the clear argument. Keyed comparison requires the separately held per-ledger key; the pack never includes that key.",
   `Handoff matching uses callId and a non-handoff MCP intent; collector provenance is absent from the schema, so this is correlation, not proof of proxy identity. Grace: ${HANDOFF_RECONCILE_GRACE_MS} ms after range end.`,
@@ -61,7 +62,9 @@ const isHeartbeat = (r: LedgerRecord) => hasHeartbeatRule(r) && hasHeartbeatCall
 const isToolIntent = (r: LedgerRecord) => r.phase === "intent" && !r.handoff && !isHeartbeat(r);
 const agentSession = (r: LedgerRecord): string | undefined =>
   "agentSessionId" in r.call && typeof r.call.agentSessionId === "string" ? r.call.agentSessionId : undefined;
-const sessionLabel = (r: LedgerRecord) => agentSession(r) ?? "pre-1c, no agent session id";
+// No deployment-mode/provenance field exists; MCP names and missing hook ids cannot identify the writer.
+const missingSessionLabel = "not recorded (server mode or pre-1c)";
+const sessionLabel = (r: LedgerRecord) => agentSession(r) ?? missingSessionLabel;
 const denial = "A manual denial at the Claude Code permission prompt fires no hook event (Claude Code hooks reference, read 2026-10-01), so 'asked, no outcome observed' cannot distinguish a user's denial from a cancelled call, an interrupted session or lost telemetry. Only auto-mode denials are recorded (`permission-denied:auto-mode`).";
 
 function anchorLine(context?: ReportContext): string {
@@ -190,7 +193,7 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
         const utc = new Date(value).toISOString();
         return dates.length === 1 ? utc.slice(11) : utc.replace("T", " ");
       }
-      return isId(headers[i]!) && value !== "pre-1c, no agent session id" ? short(display(value)).replace("…", "...") : display(value);
+      return isId(headers[i]!) && value !== missingSessionLabel ? short(display(value)).replace("…", "...") : display(value);
     }));
     const exceptionRows = values.map((_, i) => sourceRecords[i] ? (headers.includes("verdict") ? sourceRecords[i]!.policy.verdict === "deny" : exception(sourceRecords[i]!)) : /Record anomalies|Sessions without heartbeat|Launch-environment warnings|Orphan outcomes|Unreconciled handoffs|Intents with no outcome/.test(caption));
     const approvalColumn = headers.indexOf("approval (decision, approver)");
@@ -208,7 +211,7 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
         const utc = new Date(value).toISOString();
         return `<td class="time"><time datetime="${esc(value)}" title="${esc(value)}">${dates.length === 1 ? utc.slice(11) : utc.replace("T", " ")}</time></td>`;
       }
-      if (isId(name) && value !== "pre-1c, no agent session id") return `<td>${mono(value)}</td>`;
+      if (isId(name) && value !== missingSessionLabel) return `<td>${mono(value)}</td>`;
       return `<td${/^\d+$/.test(value) ? ' class="number"' : ""}>${esc(display(value))}</td>`;
     };
     // Pinned cells stay plain text. Wrapper classes style columns without changing their parsed values.
