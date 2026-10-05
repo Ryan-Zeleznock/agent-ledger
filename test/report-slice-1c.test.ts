@@ -383,8 +383,10 @@ it('filed instrument: cover registration, full head, numbered sections and ruled
   expect(p.html).toContain('aria-label="Registration"');
   expect(p.html).toContain('class="verification-seal"');
   expect(p.html).toContain('class="integrity-block"');
-  expect(p.html).toContain('1. Executive summary');
-  expect(p.html).toContain('6. Vocabulary');
+  // Section numbers are a CSS counter so the pinned h2 text stays verbatim (pin 8).
+  expect(p.html).toContain('<section id="summary"><h2>Executive summary</h2>');
+  expect(p.html).toContain('content:counter(section) ". "');
+  expect(p.html).toContain('<section id="legend"><h2>Vocabulary</h2>');
   expect(section(p.html, 'records')).toContain('Table 5.1');
   expect(p.html).toContain('border-bottom:1.5px solid var(--ink)');
   expect(p.html).not.toMatch(/border-left:|status-band|repeat\(3,/);

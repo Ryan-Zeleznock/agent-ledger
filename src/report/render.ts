@@ -236,7 +236,7 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
     sectionNumber++; tableNumber = 0;
     const numbered = `${sectionNumber}. ${title}`;
     pdf.push({ kind: "heading", id, lines: [numbered] });
-    return `<section id="${id}"><h2>${numbered}</h2>${body()}</section>`;
+    return `<section id="${id}"><h2>${title}</h2>${body()}</section>`;
   };
   const sections = [
     section("summary", "Executive summary", () => {
@@ -283,6 +283,7 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
   ];
   const html = `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Agent Ledger evidence pack</title>
 <style>
+body{counter-reset:section}section[id]>h2::before{counter-increment:section;content:counter(section) ". "}
 ${embeddedFontCss}
 :root{--paper:#FFFFFF;--surround:#EEF0EE;--ink:#1B2733;--ink-muted:#4A5866;--rule:#C9D0CC;--rule-strong:#9AA69F;--seal:#8C6A1E;--human-approval:#7A1F2B;--exception-tint:#F6F1EA;--serif:"Source Serif 4",serif;--form:"IBM Plex Sans Condensed",sans-serif;--mono:"JetBrains Mono",monospace;--xs:4px;--sm:8px;--md:16px;--lg:24px;--xl:32px;--2xl:48px;--3xl:64px;color-scheme:light;background:var(--surround);color:var(--ink)}
 *{box-sizing:border-box;border-radius:0}body{margin:0;font:400 1.0625rem/1.55 var(--serif);font-optical-sizing:auto}.sheet{max-width:1080px;margin:48px auto;padding:64px;background:var(--paper);box-shadow:0 8px 24px #1B273310}h1,h2,h3{font-family:var(--serif);font-weight:600;margin:0}h1{font-size:2.75rem;letter-spacing:-.005em;line-height:1.08}h2{font-size:1.625rem;line-height:1.2;margin:64px 0 16px}h3{font-size:1.1875rem;margin:32px 0 8px}p{max-width:68ch;margin:0 0 16px}a{color:inherit;text-underline-offset:3px}.label,dt,caption,th{font:600 .78rem/1.3 var(--form);letter-spacing:.01em;color:var(--ink-muted)}.muted{color:var(--ink-muted)}.cover{display:grid;grid-template-columns:2fr 1fr;gap:48px;border-bottom:2px solid var(--ink);padding-bottom:32px}.entity{font-size:1.1875rem;margin-top:16px}.registration{margin:0;border:1px solid var(--rule-strong);min-width:0}.registration>div{display:grid;grid-template-columns:auto minmax(0,1fr);gap:16px;padding:8px 16px;border-bottom:1px solid var(--rule)}.registration>div:last-child{border-bottom:0}.registration dd{margin:0;text-align:right;font:400 .9rem/1.4 var(--form);overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
