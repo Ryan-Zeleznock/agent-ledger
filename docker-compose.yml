@@ -1,6 +1,7 @@
 # Optional local server-mode lab. Kubernetes in docs/HOMELAB.md is the reference deployment.
 # Build only after A+B integration. CONFIG_DIR is absolute and files belong to LOCAL_UID (nonzero).
-# upstreams.yaml for Compose must use http://demo-upstream:3001/mcp.
+# upstreams.yaml for Compose must use http://demo-upstream:3001/mcp with `insecure: true` (ADR-018: a bearer over
+# plaintext to a non-loopback host is refused otherwise; the Compose network is the boundary).
 services:
   proxy:
     build: .

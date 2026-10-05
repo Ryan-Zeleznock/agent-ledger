@@ -3,6 +3,10 @@ upstreams:
   - name: demo
     transport: http
     url: http://demo-upstream.agent-ledger.svc.cluster.local:3001/mcp
+    # ADR-018 §6: the proxy refuses to send an upstream bearer over plaintext http:// to a non-loopback host unless the
+    # entry says so. The demo upstream is in-cluster plain HTTP; the bearer crosses only the pod network, and
+    # NetworkPolicy 23-demo-upstream-ingress admits only the proxy and the integration Job. A real upstream uses https://.
+    insecure: true
   # Slice 2b pin 9: no bearer (server-everything has no auth; NetworkPolicy 25-everything is its boundary).
   - name: everything
     transport: http

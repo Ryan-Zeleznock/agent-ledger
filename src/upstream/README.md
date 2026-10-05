@@ -142,3 +142,12 @@ fixture echoed it, masking the real restart failure. `LegacyUpstream` now omits 
 `FakeMcpFetch` uses SDK 404/-32001/`Session not found` with null id. Regressions cover absent/null/matching ids,
 present mismatches, exact 404 recovery, unrelated/malformed 404 refusal, and bounded 400/404 body inspection.
 Coordinator reruns `/private/tmp/claude-501/fx2b/probe.mjs` against the rebuilt `dist/`; the builder cannot run loopback.
+
+## ADR-018 §6 (2026-10-05): no plaintext bearer to a remote host
+
+`connectUpstreams` refuses an upstream whose `secrets` entry carries a `bearerToken` when its URL is `http://` and the
+host is not loopback (`127.0.0.0/8`, `::1`, `localhost`), unless the entry sets `insecure: true` (additive
+`UpstreamConfig.insecure`; `upstreams.yaml` accepts `insecure: true|false`). The refusal happens before any request,
+names the upstream and never the token. No bearer, `https://` or loopback pass unchanged. The in-cluster demo upstream
+sets `insecure: true` with the reason next to it. Residual: the server root retries this refusal like any connect
+failure until the start budget ends (then refuses with the same reason). Tests: `test/upstream-plaintext.test.ts`.

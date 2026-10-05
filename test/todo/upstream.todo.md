@@ -18,3 +18,4 @@ Converted on 2026-10-03 (Fable, Slice 2a pin 4) in `test/upstream.test.ts`, agai
 - [x] Live 2026-10-05 restart: exact reference-app 400/-32000 session rejection and 404 recover single-flight once; other/malformed 400s refuse; value-free and bounded body inspection.
 
 - [x] Fable fixes-2b P1-1/P3-1: real id-less 400 fixture; absent/null/matching ids recover; mismatches and unrelated 404s refuse; exact SDK 404 and bounded body tests.
+- [x] ADR-018 §6 (server audit P2-4): bearer over plaintext http:// to a non-loopback host refused unless `insecure: true`.

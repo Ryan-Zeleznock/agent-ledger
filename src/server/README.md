@@ -22,7 +22,7 @@ fix round F10: concurrent `tools/call` invocations admitted, integer 1-100000, d
 the api_key SHA-256 only); `hmac.key` exactly 32 raw bytes; `ledger.password`; both private files are read with
 `readPrivateFile` (`files.ts`: `O_NOFOLLOW`, regular, owned by this uid, mode 0600/0400, size cap; errors name the file);
 `secrets/` through `secrets.createSecretsProvider("file")`; `upstreams.yaml` (`version: 1`, `upstreams: [{ name,
-transport: http, url }]`, unknown fields refused) through the shared `readConfigFile`/`parseConfigDocument`. A Kubernetes
+transport: http, url, insecure? }]`, unknown fields refused; ADR-018: `insecure: true` is required to send a bearer over plaintext http:// to a non-loopback host) through the shared `readConfigFile`/`parseConfigDocument`. A Kubernetes
 Secret volume mounted directly is root-owned symlinks and is refused loudly: pin 8's `stage-config` initContainer copies
 everything into a `Memory` emptyDir as uid 65532 with mode 0600 first; a start-up refusal prints WHICH file failed and why,
 never its contents (HOMELAB step 9's verify line).
