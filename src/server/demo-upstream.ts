@@ -29,6 +29,8 @@ export const DEMO_TOOLS: ToolInfo[] = [
   { server: DEMO_SERVER_NAME, name: "whoami", description: "Says who answered. Deliberately absent from the registry (unreviewed).", inputSchema: { type: "object", additionalProperties: false }, annotations: { readOnlyHint: true, openWorldHint: false } },
 ];
 
+/** ADR-018: the one client the demo upstream knows (the proxy); the front refuses every other bearer with 401 before any method. */
+export const DEMO_CLIENT_ID = "agent-ledger-proxy" as const;
 const text = (t: string, isError = false): ToolResult => ({ content: [{ type: "text", text: t }], isError });
 /** Constant-time equality over equal-length buffers; different lengths compare against self and answer false. */
 export function tokenMatches(presented: string, expected: Buffer): boolean {
@@ -98,7 +100,7 @@ export interface DemoUpstreamOptions { port: number; bindHost: string; token: Bu
 /** In-process start (tests and the entrypoint below share it). */
 export async function startDemoUpstream(o: DemoUpstreamOptions): Promise<RunningFront> {
   if (!(o.token instanceof Buffer) || o.token.length === 0) throw new Error("demo-upstream: token must be a non-empty Buffer");
-  return startFront(createDemoHandler(o.token, o.log), { mode: "http", port: o.port, bindHost: o.bindHost, allowedOrigins: [], naming: "tool", tools: async () => DEMO_TOOLS });
+  return startFront(createDemoHandler(o.token, o.log), { mode: "http", port: o.port, bindHost: o.bindHost, allowedOrigins: [], naming: "tool", tools: async () => DEMO_TOOLS, authenticate: (bearer) => (tokenMatches(bearer, o.token) ? DEMO_CLIENT_ID : undefined) });
 }
 
 /** Entry point: env → token file → listen; one JSON line per event on stderr; SIGTERM/SIGINT → stop → exit 0. */

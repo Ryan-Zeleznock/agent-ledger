@@ -1,9 +1,9 @@
-import { closeSync, constants, createReadStream, fstatSync, fsyncSync, mkdirSync, openSync, readSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, constants, fstatSync, fsyncSync, mkdirSync, openSync, readSync, unlinkSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 import { performance } from "node:perf_hooks";
 import type { DateRange, LedgerRecord, UnsealedRecord, VerifyResult } from "../types/index.js";
 import type { LedgerStore } from "./contract.js";
-import { parseInstant } from "./validate.js";
+import { MAX_LEDGER_LINE_BYTES, MAX_SCALAR_CHARS, parseInstant } from "./validate.js";
 import { GENESIS_HASH, checkStoredLine, parseStored, sealRecord, sealedLine, verifyLines, type Tail } from "./chain.js";
 
 /**
@@ -86,52 +86,85 @@ async function acquireLock(lockPath: string, timeoutMs: number): Promise<() => v
 
 // ---------- file primitives ----------
 
-/** One O_APPEND write of the whole line, then fsync. A short write is continued; a zero-progress write is an error. */
-function appendLine(path: string, line: string): void {
+/** Every operation checks and uses one descriptor. O_NONBLOCK prevents FIFO-open hangs. */
+function openData(path: string, write = false, create = false): number | null {
+  let fd: number;
+  try { fd = openSync(path, (write ? constants.O_RDWR | constants.O_APPEND | (create ? constants.O_CREAT | constants.O_EXCL : 0) : constants.O_RDONLY) | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600); }
+  catch (e) { if (!create && isErrno(e, "ENOENT")) return null; throw e; }
+  try {
+    if (!fstatSync(fd).isFile()) throw new Error("ledger: data must be a regular file");
+    return fd;
+  } catch (e) { closeSync(fd); throw e; }
+}
+
+function appendLine(fd: number, line: string): void {
   const buf = Buffer.from(line, "utf8");
-  const fd = openSync(path, "a");
-  try {
-    let off = 0;
-    while (off < buf.length) {
-      const n = writeSync(fd, buf, off, buf.length - off);
-      if (n <= 0) throw new Error(`ledger: write to ${path} made no progress after ${off} of ${buf.length} bytes`);
-      off += n;
-    }
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
+  let off = 0;
+  while (off < buf.length) {
+    const n = writeSync(fd, buf, off, buf.length - off);
+    if (n <= 0) throw new Error("ledger: write made no progress");
+    off += n;
   }
+  fsyncSync(fd);
 }
 
-/** Reads the last line of `path` backwards in chunks. `complete` is false when the file does not end with "\n". */
-function readLastLine(path: string, size: number): { line: string; complete: boolean } {
-  const fd = openSync(path, "r");
-  try {
-    const last = Buffer.alloc(1);
-    readSync(fd, last, 0, 1, size - 1);
-    if (last[0] !== 0x0a) return { line: "", complete: false };
-    const chunks: Buffer[] = [];
-    let cursor = size - 1; // exclusive end of the line's content
-    while (cursor > 0) {
-      const len = Math.min(TAIL_CHUNK, cursor);
-      const b = Buffer.alloc(len);
-      readSync(fd, b, 0, len, cursor - len);
-      const nl = b.lastIndexOf(0x0a);
-      if (nl !== -1) { chunks.unshift(b.subarray(nl + 1)); break; }
-      chunks.unshift(b);
-      cursor -= len;
-    }
-    return { line: Buffer.concat(chunks).toString("utf8"), complete: true };
-  } finally {
-    closeSync(fd);
+const decode = (bytes: Buffer) => new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+function endsWithNewline(fd: number, size: number): boolean {
+  if (size === 0) return true;
+  const last = Buffer.alloc(1);
+  return readSync(fd, last, 0, 1, size - 1) === 1 && last[0] === 0x0a;
+}
+function readLastLine(fd: number, size: number): string {
+  if (!endsWithNewline(fd, size)) throw new Error("ledger: incomplete line; recover manually, never auto-truncate");
+  const chunks: Buffer[] = [];
+  let cursor = size - 1, total = 0;
+  while (cursor > 0) {
+    const len = Math.min(TAIL_CHUNK, cursor), b = Buffer.alloc(len);
+    if (readSync(fd, b, 0, len, cursor - len) !== len) throw new Error("ledger: file changed during read");
+    const nl = b.lastIndexOf(0x0a), part = nl === -1 ? b : b.subarray(nl + 1);
+    total += part.length;
+    if (total > MAX_LEDGER_LINE_BYTES) throw new Error("ledger: line size limit exceeded");
+    chunks.unshift(part);
+    if (nl !== -1) break;
+    cursor -= len;
   }
+  return decode(Buffer.concat(chunks));
 }
-
-function fileSize(path: string): number {
-  try { return statSync(path).size; } catch (e) { if (isErrno(e, "ENOENT")) return 0; throw e; }
+class LineError extends Error {
+  constructor(readonly line: number, message: string) { super(message); }
 }
-
-const endsWithNewline = (path: string, size: number) => size === 0 || readLastLine(path, size).complete;
+/** Strict reads use LF framing and fatal UTF-8. Only ID recovery skips damaged interior lines. */
+function* lines(fd: number, size: number, offset = 0, skipDamaged = false): Generator<{ n: number; raw: string }> {
+  let n = 0, length = 0, discarding = false;
+  let pieces: Buffer[] = [];
+  while (offset < size) {
+    const buf = Buffer.alloc(Math.min(TAIL_CHUNK, size - offset));
+    if (readSync(fd, buf, 0, buf.length, offset) !== buf.length) throw new LineError(n + 1, "ledger: file changed during read");
+    offset += buf.length;
+    let start = 0;
+    while (start < buf.length) {
+      const nl = buf.indexOf(0x0a, start), end = nl === -1 ? buf.length : nl;
+      if (!discarding) {
+        length += end - start;
+        if (length > MAX_LEDGER_LINE_BYTES) {
+          if (!skipDamaged) throw new LineError(n + 1, "ledger: line size limit exceeded");
+          // ID recovery must continue after an oversized interior line without buffering it.
+          pieces = []; length = 0; discarding = true;
+        } else pieces.push(buf.subarray(start, end));
+      }
+      if (nl === -1) break;
+      let raw = "";
+      if (!discarding) {
+        try { raw = decode(Buffer.concat(pieces, length)); }
+        catch { if (!skipDamaged) throw new LineError(n + 1, "ledger: invalid UTF-8"); }
+      }
+      yield { n: ++n, raw };
+      pieces = []; length = 0; discarding = false;
+      start = nl + 1;
+    }
+  }
+  if (length || discarding) throw new LineError(n + 1, "ledger: incomplete line");
+}
 
 // ---------- the store ----------
 
@@ -140,6 +173,7 @@ export class JsonlLedger implements LedgerStore {
   /** Ids seen in the file up to `idsOffset` bytes (re-review P2 "append permits duplicate IDs"); refreshed under the lock. */
   private ids: Set<string> | null = null;
   private idsOffset = 0;
+  private idsFile = "";
 
   constructor(private readonly path: string) {
     if (typeof path !== "string" || path.length === 0) throw new Error("ledger: jsonl target must be a file path");
@@ -153,35 +187,26 @@ export class JsonlLedger implements LedgerStore {
   }
 
   /** The chain tail as the FILE has it right now: last line read, framed, validated and self-hash-checked. */
-  private readTail(): Tail {
-    const size = fileSize(this.path);
+  private readTail(fd: number, size: number): Tail {
     if (size === 0) return { id: null, hash: GENESIS_HASH };
-    const { line, complete } = readLastLine(this.path, size);
-    if (!complete) throw new Error(`ledger: ${this.path} ends with an incomplete line (interrupted write or tampering); refusing to append. Run verify() and recover manually; never auto-truncate.`);
-    const rec = checkStoredLine(line);
+    const rec = checkStoredLine(readLastLine(fd, size));
     return { id: rec.id, hash: rec.hash };
   }
 
-  /**
-   * Brings the id index up to `size` by reading only the bytes appended since the last refresh (amortised linear over
-   * the ledger's life). Called under the lock, after `readTail()` proved the file ends with "\n", so `size` is a line
-   * boundary. A shrunken file (rewritten) triggers a full rescan. Malformed lines are skipped here; verify() reports them.
-   */
-  private refreshIds(size: number): Set<string> {
-    if (this.ids === null || size < this.idsOffset) { this.ids = new Set(); this.idsOffset = 0; }
-    if (size > this.idsOffset) {
-      const fd = openSync(this.path, "r");
-      const buf = Buffer.alloc(size - this.idsOffset);
-      try { readSync(fd, buf, 0, buf.length, this.idsOffset); } finally { closeSync(fd); }
-      for (const line of buf.toString("utf8").split("\n")) {
-        if (line.length === 0) continue;
-        try {
-          const p: unknown = JSON.parse(line);
-          if (typeof p === "object" && p !== null && typeof (p as { id?: unknown }).id === "string") this.ids.add((p as { id: string }).id);
-        } catch { /* verify() reports it */ }
-      }
-      this.idsOffset = size;
+  /** Incremental ID recovery, bounded per line; earlier damage is skipped, never repaired or hidden from verify. */
+  private refreshIds(fd: number, size: number): Set<string> {
+    const st = fstatSync(fd), file = `${st.dev}:${st.ino}`;
+    if (this.ids === null || size < this.idsOffset || file !== this.idsFile) {
+      this.ids = new Set(); this.idsOffset = 0; this.idsFile = file;
     }
+    for (const { raw } of lines(fd, size, this.idsOffset, true)) {
+      const p = parseStored(raw);
+      // Earlier damage remains visible to verify/read but does not stop collecting new evidence.
+      // Preserve any recoverable bounded ID, including a shape-invalid record's ID.
+      const id = p.err === undefined ? p.rec.id : p.id;
+      if (typeof id === "string" && id.length <= MAX_SCALAR_CHARS) this.ids.add(id);
+    }
+    this.idsOffset = size;
     return this.ids;
   }
 
@@ -190,79 +215,66 @@ export class JsonlLedger implements LedgerStore {
       const timeoutMs = lockTimeoutMs();
       mkdirSync(dirname(this.path), { recursive: true }); // the lock file lives next to the ledger
       const release = await acquireLock(`${this.path}.lock`, timeoutMs);
+      let fd: number | null = null;
       try {
-        const tail = this.readTail();
-        const ids = this.refreshIds(fileSize(this.path));
+        fd = openData(this.path, true);
+        const size = fd === null ? 0 : fstatSync(fd).size;
+        const tail = fd === null ? { id: null, hash: GENESIS_HASH } : this.readTail(fd, size);
+        const ids = fd === null ? new Set<string>() : this.refreshIds(fd, size);
         const sealed = sealRecord(record, tail);
         if (ids.has(sealed.id)) throw new Error(`ledger.append: duplicate id ${JSON.stringify(sealed.id)}; ids must be unique per ledger (replay or caller bug); nothing was written`);
         const line = sealedLine(sealed);
-        appendLine(this.path, `${line}\n`);
+        if (fd === null) {
+          fd = openData(this.path, true, true)!;
+          const st = fstatSync(fd);
+          this.ids = ids; this.idsFile = `${st.dev}:${st.ino}`;
+        }
+        appendLine(fd, `${line}\n`);
         ids.add(sealed.id);
-        this.idsOffset = fileSize(this.path);
+        this.idsOffset = fstatSync(fd).size;
         return sealed;
       } finally {
+        if (fd !== null) closeSync(fd);
         release();
       }
     });
   }
 
   head(): Promise<string> {
-    return this.serialize(() => this.readTail().hash);
+    return this.serialize(() => {
+      const fd = openData(this.path);
+      if (fd === null) return GENESIS_HASH;
+      try { return this.readTail(fd, fstatSync(fd).size).hash; } finally { closeSync(fd); }
+    });
   }
 
-  /**
-   * Every physical line with its 1-based number, split on the LF byte ONLY and with nothing normalised away
-   * (Astra round 3b: `readline` stripped `\r\n`, so a CRLF record passed verify()/read() while head()/append()
-   * refused it). A `\r` stays in the line and `parseStored` reports it. Blank lines are yielded too (damage).
-   */
-  private async *lines(): AsyncGenerator<{ n: number; raw: string }> {
-    if (fileSize(this.path) === 0) return;
-    let n = 0;
-    let pending: Buffer = Buffer.alloc(0);
-    for await (const chunk of createReadStream(this.path)) {
-      const buf = chunk as Buffer;
-      pending = pending.length === 0 ? buf : Buffer.concat([pending, buf]);
-      let start = 0;
-      for (;;) {
-        const nl = pending.indexOf(0x0a, start);
-        if (nl === -1) break;
-        yield { n: ++n, raw: pending.subarray(start, nl).toString("utf8") };
-        start = nl + 1;
-      }
-      pending = pending.subarray(start);
-    }
-    if (pending.length > 0) yield { n: ++n, raw: pending.toString("utf8") }; // unterminated tail: framing checks report it
-  }
-
-  /**
-   * Walks the chain and stops at the first record that fails: not JSON, invalid shape, duplicate id, parent pointer or
-   * prevHash mismatch, recomputed hash mismatch, or (last) a file that does not end with "\n". Internal consistency
-   * only: a full re-chain by whoever can write the file passes this check (README "What verify() cannot see").
-   */
   async verify(): Promise<VerifyResult> {
-    const size = fileSize(this.path);
-    const lines = this.lines();
-    async function* rawLines() { for await (const { raw } of lines) yield raw; }
-    const result = await verifyLines(rawLines());
-    if (result.ok && !endsWithNewline(this.path, size)) return { ok: false, checked: result.checked, brokenAt: `line:${result.checked}` };
-    return result;
+    const fd = openData(this.path);
+    if (fd === null) return { ok: true, checked: 0 };
+    try {
+      const size = fstatSync(fd).size;
+      async function* rawLines() { for (const { raw } of lines(fd!, size)) yield raw; }
+      return await verifyLines(rawLines());
+    } catch (e) {
+      if (e instanceof LineError) return { ok: false, checked: e.line, brokenAt: `line:${e.line}` };
+      throw e;
+    } finally { closeSync(fd); }
   }
 
-  /**
-   * Records whose `writtenAt` (the ledger's clock) lies in [from, to], both inclusive, compared as instants. Throws on
-   * a range without explicit offsets, an unframed file, or any invalid line: a report must fail, not silently skip.
-   */
   async *read(range: DateRange): AsyncIterable<LedgerRecord> {
-    const from = parseInstant(range.from, "range.from"); const to = parseInstant(range.to, "range.to");
-    if (from > to) throw new Error(`ledger.read: invalid range, from is after to: ${JSON.stringify(range)}`);
-    const size = fileSize(this.path);
-    if (size === 0) return;
-    if (!endsWithNewline(this.path, size)) throw new Error(`ledger.read: ${this.path} ends with an incomplete line; run verify()`);
-    for await (const { n, raw } of this.lines()) {
-      const p = parseStored(raw);
-      if (p.err !== undefined) throw new Error(`ledger.read: invalid record at line ${n} of ${this.path} (${p.err}); run verify()`);
-      const t = parseInstant(p.rec.writtenAt, "writtenAt");
-      if (t >= from && t <= to) yield p.rec;
-    }
+    const from = parseInstant(range.from, "range.from"), to = parseInstant(range.to, "range.to");
+    if (from > to) throw new Error("ledger.read: from is after to");
+    const fd = openData(this.path);
+    if (fd === null) return;
+    try {
+      const size = fstatSync(fd).size;
+      if (!endsWithNewline(fd, size)) throw new Error("ledger.read: incomplete line; run verify()");
+      for (const { n, raw } of lines(fd, size)) {
+        const p = parseStored(raw);
+        if (p.err !== undefined) throw new Error(`ledger.read: invalid record at line ${n} (${p.err}); run verify()`);
+        const t = parseInstant(p.rec.writtenAt, "writtenAt");
+        if (t >= from && t <= to) yield p.rec;
+      }
+    } finally { closeSync(fd); }
   }
 }

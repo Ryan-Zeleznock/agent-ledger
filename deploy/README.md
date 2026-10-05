@@ -38,7 +38,7 @@ documents this behavior (checked 2026-10-03); the runtime regressions pass again
 - **Kyverno:** digest requirement extended to Postgres and BusyBox; projected ServiceAccount token volumes forbidden
   (negative Pod `k8s/test/bad-pod-projected-token.yaml`); reports-controller RBAC for `pods/ephemeralcontainers` in
   `k8s/cluster/` (cluster-scoped, applied by HOMELAB step 7b, not part of `-k deploy/k8s`).
-- **Slack app:** `slack/app-manifest.yaml` (bot scope `chat:write` only, Socket Mode, interactivity without Request URL).
+- **Slack app:** `slack/app-manifest.yaml` (bot scopes `chat:write` and `users:read` (ADR-015 amendment), Socket Mode, interactivity without Request URL).
 
 ### Digest pins (resolved 2026-10-04 from the registries' manifest APIs; multi-arch index digests)
 
@@ -48,8 +48,17 @@ documents this behavior (checked 2026-10-03); the runtime regressions pass again
 | `docker.io/library/postgres:17.11-alpine3.24` | `sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24` | same |
 | `docker.io/library/node:24-alpine3.24` (everything build stage) | `sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1` | same |
 | `gcr.io/distroless/nodejs24-debian12:nonroot` (everything runtime) | `sha256:14d42e2511532589a7c7e01a753667a74fcc96266e137e8125006b87b0c32d0a` | gcr.io `Docker-Content-Digest` |
+| `gcr.io/kaniko-project/executor:v1.23.2` (both Kaniko Jobs) | `sha256:9e69fd4330ec887829c780f5126dd80edc663df6def362cd22e79bcdf00ac53f` | gcr.io `Docker-Content-Digest` (OCI index), 2026-10-05 |
 
-The proxy's own `Dockerfile` still uses version tags for its bases (unchanged this slice).
+ADR-018 (2026-10-05): the proxy's own `Dockerfile` now uses the same node and distroless digests (re-resolved
+2026-10-05, unchanged; the distroless entrypoint `/nodejs/bin/node` read from the pinned image config). `check.mjs`
+walks the repo and refuses any unpinned `FROM` in any Dockerfile and any unpinned image in `kaniko/*.yaml`.
+
+Server audit P3s in this directory (2026-10-05): proxy egress also excepts 100.64.0.0/10 and 169.254.0.0/16;
+Kyverno binds the `app` labels to their ServiceAccounts and `app: proxy` to the proxy itself (negative proofs
+`k8s/test/bad-pod-label.yaml`, `k8s/test/bad-ephemeral-container.json`); Falco exempts only the entrypoint node
+binary and counts `busybox sh`; `001_init.sh` rejects superuser TCP logins; the agent key is its own Secret
+`agent-key`; the demo upstream entry is `insecure: true`. All asserted by `check.mjs`.
 
 ## Residuals carried to 2c
 
@@ -57,6 +66,6 @@ The proxy's own `Dockerfile` still uses version tags for its bases (unchanged th
 - [ ] **Database secrets in files:** `POSTGRES_PASSWORD_FILE`, mounted app/reader password files, file-based integration
   credential flow.
 - [ ] **Local DB authentication:** evaluate `--auth-local=scram-sha-256` (exec on postgres-0 is a superuser path today).
-- [ ] **Separate integration key** Secret.
+- [x] **Separate integration key** Secret (`agent-key`, ADR-018 round).
 - [ ] FQDN-scoped Slack egress (CiliumNetworkPolicy); cert-manager/public CA; replacing archived Kaniko; versioned
-  migrations; pinning the proxy Dockerfile's base images by digest.
+  migrations. [x] Pinning the proxy Dockerfile's base images by digest (ADR-018 round).

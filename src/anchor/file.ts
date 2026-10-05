@@ -1,4 +1,4 @@
-import { closeSync, constants, fstatSync, fsyncSync, mkdirSync, openSync, readFileSync, readSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, constants, fstatSync, fsyncSync, mkdirSync, openSync, readSync, unlinkSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 import { performance } from "node:perf_hooks";
 import canonicalize from "canonicalize";
@@ -96,34 +96,41 @@ async function acquireLock(lockPath: string, timeoutMs: number): Promise<() => v
   }
 }
 
-function appendLine(path: string, line: string): void {
-  const buf = Buffer.from(line, "utf8");
-  const fd = openSync(path, "a");
+function openData(path: string, write = false): number | null {
+  let fd: number;
+  try { fd = openSync(path, (write ? constants.O_RDWR | constants.O_APPEND | constants.O_CREAT : constants.O_RDONLY) | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600); }
+  catch (e) { if (!write && isErrno(e, "ENOENT")) return null; throw e; }
   try {
-    let off = 0;
-    while (off < buf.length) {
-      const n = writeSync(fd, buf, off, buf.length - off);
-      if (n <= 0) throw new Error(`anchor: write to ${path} made no progress after ${off} of ${buf.length} bytes`);
-      off += n;
-    }
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
+    if (!fstatSync(fd).isFile()) throw new Error("anchor: data must be a regular file");
+    return fd;
+  } catch (e) { closeSync(fd); throw e; }
+}
+function appendLine(fd: number, line: string): void {
+  const buf = Buffer.from(line, "utf8");
+  let off = 0;
+  while (off < buf.length) {
+    const n = writeSync(fd, buf, off, buf.length - off);
+    if (n <= 0) throw new Error("anchor: write made no progress");
+    off += n;
   }
+  fsyncSync(fd);
 }
 
-/** The file's last complete entry, or null when absent/empty. Throws on a torn tail or an invalid last line. */
-function readLatest(path: string): AnchorEntry | null {
-  let text: string;
-  try { text = readFileSync(path, "utf8"); } catch (e) { if (isErrno(e, "ENOENT")) return null; throw e; }
-  if (text.length === 0) return null;
-  if (!text.endsWith("\n")) throw new Error(`anchor: ${path} ends with an incomplete line (interrupted write or tampering); recover manually, never truncate`);
-  const last = text.slice(0, -1).split("\n").at(-1)!;
-  // Physical LF-only framing (Astra round 3b): a stored entry never contains a raw CR, so `\r\n` or a stray `\r` is damage, not whitespace.
-  if (last.includes("\r")) throw new Error(`anchor: last line of ${path} contains a carriage return; entries are LF-framed canonical JSON only`);
+/** Only the last entry is needed; never allocate/read the full anchor history. */
+const MAX_ANCHOR_LINE_BYTES = 4096;
+function readLatest(fd: number): AnchorEntry | null {
+  const size = fstatSync(fd).size;
+  if (size === 0) return null;
+  const length = Math.min(size, MAX_ANCHOR_LINE_BYTES + 2), buf = Buffer.alloc(length);
+  if (readSync(fd, buf, 0, length, size - length) !== length) throw new Error("anchor: file changed during read");
+  if (buf[length - 1] !== 0x0a) throw new Error("anchor: incomplete line; recover manually, never truncate");
+  const start = buf.lastIndexOf(0x0a, length - 2) + 1;
+  if ((start === 0 && size > length) || length - 1 - start > MAX_ANCHOR_LINE_BYTES) throw new Error("anchor: line size limit exceeded");
+  const last = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(buf.subarray(start, length - 1));
+  if (last.includes("\r")) throw new Error("anchor: last line contains a carriage return");
   let parsed: unknown;
-  try { parsed = JSON.parse(last); } catch { throw new Error(`anchor: last line of ${path} is not JSON`); }
-  try { return validate(parsed); } catch (e) { throw new Error(`anchor: last line of ${path} is not a valid entry: ${message(e)}`); }
+  try { parsed = JSON.parse(last); } catch { throw new Error("anchor: last line is not JSON"); }
+  try { return validate(parsed); } catch { throw new Error("anchor: last line is not a valid entry"); }
 }
 
 export class FileAnchor implements Anchor {
@@ -145,21 +152,30 @@ export class FileAnchor implements Anchor {
       const timeoutMs = lockTimeoutMs();
       mkdirSync(dirname(this.path), { recursive: true });
       const release = await acquireLock(`${this.path}.lock`, timeoutMs);
+      let fd: number | null = null;
       try {
-        readLatest(this.path); // framing + last entry must be sound before anything is appended (Astra #11)
-        appendLine(this.path, `${canonicalize(valid)!}\n`);
+        fd = openData(this.path, true)!;
+        readLatest(fd); // framing + last entry must be sound before anything is appended (Astra #11)
+        appendLine(fd, `${canonicalize(valid)!}\n`);
       } finally {
+        if (fd !== null) closeSync(fd);
         release();
       }
     });
   }
 
   latest(): Promise<AnchorEntry | null> {
-    return this.serialize(() => readLatest(this.path));
+    return this.serialize(() => {
+      const fd = openData(this.path);
+      if (fd === null) return null;
+      try { return readLatest(fd); } finally { closeSync(fd); }
+    });
   }
 }
 
 /** For tests: byte size of the anchor file (0 when absent). Not part of the contract. */
 export function anchorFileSize(path: string): number {
-  try { return statSync(path).size; } catch (e) { if (isErrno(e, "ENOENT")) return 0; throw e; }
+  const fd = openData(path);
+  if (fd === null) return 0;
+  try { return fstatSync(fd).size; } finally { closeSync(fd); }
 }

@@ -48,3 +48,12 @@ ledger never compares against the anchor**; the caller must check that an anchor
 chain (ledger README "What verify() cannot see"; test in `test/ledger-jsonl.test.ts`). Records after the last anchor
 are unprotected until the next one. Server mode replaces the file with S3 Object Lock (WORM), where audit-grade claims start.
 [H] A daily anchor copied to a second location is enough for the SOC 2 CC7.2 evidence story: to be tested in the Gate 1/2 calls.
+
+
+Security round C7/C8 (2026-10-05): data opens use `O_NOFOLLOW | O_NONBLOCK`, reject non-regular
+files on the opened descriptor, and use that same descriptor for validation and append. New files
+use mode 0600. `latest` reads at most 4098 tail bytes, accepts at most a 4096-byte line and decodes
+UTF-8 fatally; it no longer loads the complete anchor history. Oversized or damaged tails fail closed.
+The CLI owns ADR-018 chain membership checks because the anchor API receives no ledger. Tests:
+`C7: anchor refuses symlink reads and writes without touching the target`, the descriptor-replacement
+case, and `C8: ledger line and anchor tail reads are bounded` (`test/core-security.test.ts`).

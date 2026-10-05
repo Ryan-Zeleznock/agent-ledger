@@ -57,6 +57,29 @@ TLS with the coordinator's TEST-ONLY fixture, admission, shutdown and the upstre
 `test/front.test.ts` retains the original loopback suite with ADR-016's two changed expectations. The coordinator runs
 that suite, server/e2e integration and the reference SDK outside Astra's sandbox. Fable must review; no self-approval.
 
+## ADR-018 security round (2026-10-05): authenticate first
+
+`authenticate(bearer) → agentId | undefined` is **required** for HTTP. The composition root wires IdentityService's
+hash lookup; the demo upstream wires its constant-time token compare. Order per request: path → method → stopping →
+Origin → bearer grammar → **authenticate** → per-agent cap → Content-Length/Content-Type → body → JSON-RPC. Unknown, a
+throw, a non-string or an empty id → 401 `unauthorized` (generic text, nothing echoed), `Connection: close`; the
+remaining body is discarded, never buffered, and the socket is cut after REFUSED_LINGER_MS (1 s). This covers
+tools/list, server/discover, legacy initialize, ping, tools/call and DELETE. The pipeline still re-resolves identity.
+- `maxConnections` (default 256) sets node's `server.maxConnections`; extra connections are dropped unanswered.
+- `headersTimeout` 10 s (checked every 1 s via `connectionsCheckingInterval`); an authenticated body must arrive
+  within `bodyTimeoutMs` (default 10 s) or the answer is 408 and the connection is cut.
+- `maxInFlightPerAgent` (default 16) counts one agent's requests from authentication to response (body reads and
+  tools/call alike); over it → 503 -30503 with Retry-After: 1. The global `maxInFlight` still bounds tools/call.
+- Legacy sessions record the agent id. The 32-session cap is per agent (an agent evicts only its own LRU session); at
+  the global 1024 the next initialize is 503, never an eviction of another agent's session (supersedes P2-5 LRU).
+- tools/list is not filtered per agent: filtering needs the registry, which the front does not import. It is never
+  answered before authentication. Residual: one authenticated agent sees every exposed tool name and schema.
+- Residual: no per-source-IP connection cap (NodePort SNAT would make every client one address). A LAN host can hold
+  up to `maxConnections` header-phase sockets for 10 s each; it cannot buffer bodies or reach any method.
+
+Tests: `test/front-auth.test.ts` (401 on every method, before the body, fail-closed authenticate, 150 held 1 MiB
+bodies, 408 body deadline, connection cap, per-agent cap) and the ADR-018 rows in `test/front-dual-era.test.ts`.
+
 2c: stdio, SSE/progress responses, per-key rate limits, tool-list refresh and pipeline cancellation on disconnect.
 Certificate rotation and real-client CA trust are coordinator/runbook checks. A disconnected handler can continue
 until its existing deadline and occupies admission capacity throughout. Session eviction permits recovery but cannot

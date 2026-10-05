@@ -14,3 +14,4 @@
 - [x] ADR-015 2026-10-05: bounded users.info enrichment after atomic settlement, no name on failure, member identity unchanged, scope + reinstall docs; in-process races/failures and coordinator loopback assertions.
 
 - [x] Fable fixes-2b P2-1: reject Unicode Cc/Cf before trimming or fallback; decision unchanged; ordinary RTL names retained.
+- [x] ADR-018 (server audit P2-2/P2-3): reviewed preview of the redacted args (clear fields, withheld markers, JCS digest, stated truncation, deny when it cannot fit); per-agent pending cap; identical pending requests refused without a second post.

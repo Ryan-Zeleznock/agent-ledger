@@ -468,3 +468,33 @@ it.each(['Alice\u202e', 'ריאן', 'Alice (U0AAAAAAAA)'])('isolates a stored di
   expect(section(p.html, 'cc8-1')).toContain(`<td>approved, <bdi>${name}</bdi> (U0C6UV8NMR7)</td>`);
   expect(p.csv).not.toContain('<bdi>'); expect(p.pdfText).not.toContain('<bdi>');
 });
+
+it.each(["agent", "session", "agentSession", "ordering"])("C5: reused callId cannot borrow execution across %s", async boundary => {
+  const first = rec(901, "session-a"); approve(first, "delegated", "hook-ask");
+  const later = structuredClone(first); later.id = "later-intent";
+  if (boundary === "agent") later.call.agentId = "other-agent";
+  if (boundary === "session") later.call.sessionId = "other-session";
+  if (boundary === "agentSession") later.call.agentSessionId = "other-agent-session";
+  const outcome = result(first, "ok");
+  const records = boundary === "ordering" ? [first, outcome, later] : [first, later, outcome];
+  const p = await pack(records);
+  const rows = section(p.html, "cc8-1").match(/<tr>.*?<\/tr>/gs)!;
+  expect(rows[1]).toContain("executed after ask");
+  expect(rows[2]).toContain("asked, no outcome observed");
+  expect(rows[2]).not.toContain("executed after ask");
+});
+
+it("C8: an oversized individual evidence record is refused before rendering", async () => {
+  const r = rec(1); r.call.args = { text: "x".repeat(8 * 1024 * 1024) };
+  await expect(pack([r])).rejects.toThrow(/record byte limit/i);
+});
+
+it("C8: byte budget bounds selected evidence but unrelated payloads do not limit reconciliation", async () => {
+  const { reconcileHandoffs } = await import("../src/report/contract.js");
+  const dir = await mkdtemp(join(tmpdir(), "pack-byte-limit-")); dirs.push(dir);
+  const r = rec(1); r.call.args = { text: "x".repeat(256 * 1024) };
+  const ledger: LedgerStore = { append: vi.fn(), head: async () => "0", verify: async () => ({ ok: true, checked: 140 }),
+    async *read() { for (let i = 0; i < 140; i++) yield r; } };
+  await expect(generateReport(ledger, range, dir)).rejects.toThrow(/byte limit/i);
+  await expect(reconcileHandoffs(ledger, range)).resolves.toEqual([]);
+});

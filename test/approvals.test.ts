@@ -25,7 +25,7 @@ describe('Slack approvals in process', () => {
     expect(a.getSlackApprovalRouter(channel).pendingCount).toBe(0); expect(fake.sockets[0]!.readyState).toBe(3);
   });
   it('uses one connection for concurrent requests; unrelated, forged and duplicate clicks cannot settle another wait', async () => {
-    const ps = [1,2,3].map(n => a.requestApproval({ ...call, callId: `call-${n}` }, policy, channel)); await flush();
+    const ps = [1,2,3].map(n => a.requestApproval({ ...call, callId: `call-${n}`, args: { ...call.args, n } }, policy, channel)); await flush();
     expect(fake.sockets).toHaveLength(1); expect(a.getSlackApprovalRouter(channel)).toBe(a.getSlackApprovalRouter(channel));
     for (const patch of [{ api_app_id: 'wrong' }, { user: { id: 'U0123456789', team_id: 'other' } }, { actions: [] }, { container: { channel_id: 'wrong', message_ts: '2.001' } }]) fake.click(1, patch);
     expect(a.getSlackApprovalRouter(channel).pendingCount).toBe(3);
@@ -137,7 +137,7 @@ describe('Fable review recovery and feedback regressions', () => {
   it('P2-1 retries auth.test after a transient failure and shares the successful retry', async () => {
     fake.replies.set('auth.test', [() => new Response(null, { status: 503 })]);
     expect((await a.requestApproval(call, policy, channel)).decision).toBe('unavailable');
-    const pending = [2, 3].map(n => a.requestApproval({ ...call, callId: `retry-${n}` }, policy, channel)); await flush();
+    const pending = [2, 3].map(n => a.requestApproval({ ...call, callId: `retry-${n}`, args: { ...call.args, n } }, policy, channel)); await flush();
     expect(fake.calls.filter(c => c.method === 'auth.test')).toHaveLength(2);
     expect(fake.sockets).toHaveLength(1); fake.click(0); fake.click(1);
     expect((await Promise.all(pending)).map(r => r.decision)).toEqual(['approved', 'approved']);
@@ -162,7 +162,7 @@ describe('Fable review recovery and feedback regressions', () => {
   it('P3-1 bounds retained feedback to the latest 1024 settlements', async () => {
     const keeper = a.requestApproval({ ...call, callId: 'keeper' }, policy, channel); await flush();
     for (let n = 1; n <= 1025; n++) {
-      const pending = a.requestApproval({ ...call, callId: `settled-${n}` }, policy, channel); await flush();
+      const pending = a.requestApproval({ ...call, callId: `settled-${n}`, args: { ...call.args, n } }, policy, channel); await flush();
       fake.click(n); expect((await pending).decision).toBe('approved');
     }
     fake.click(1); await flush(); expect(fake.calls.filter(c => c.method === 'chat.postEphemeral')).toHaveLength(0);

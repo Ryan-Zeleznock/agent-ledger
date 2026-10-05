@@ -51,7 +51,8 @@ CC7.2: their placeholder allow/unreviewed policy is not a second access/approval
   they are findings to investigate, not automatic proof of bypass.
 - Orphan detection reads prior available history (supported timestamps from year 0100) and requires
   a preceding intent for the outcome's callId. A standalone blocked outcome can be a valid denial.
-  Intent/outcome joins use callId, **not** `parentRecordId`, which links neighboring chain records.
+  Intent/outcome joins use callId, agentId, sessionId and optional agentSessionId in ledger order;
+  `parentRecordId` links neighboring chain records.
 - An intent with no observed outcome through the grace boundary is listed separately. `delegated`
   means a terminal ask, **not** a recorded approval; no outcome cannot distinguish denial,
   cancellation and lost telemetry. Codex `ok` means ran-and-returned, not necessarily success.
@@ -91,8 +92,11 @@ record blocks stay on one page; oversized blocks continue. Each footer includes 
 No PDF/A, embedded fonts or signatures are claimed. Output files use exclusive
 creation with mode 0600; use a fresh output directory for each pack. HTML is written last. I/O errors
 can leave an incomplete pack; a failed invocation must not be distributed as a completed export.
-All history/outputs are held in memory. Session and outcome lookups use maps/sets; the unchanged
-handoff reconciliation can be quadratic. Large-ledger streaming remains future work (review residual #8).
+Selected records and rendered outputs are held in memory. History is scanned with only selected
+session IDs, call correlation keys and compact intent/outcome facts retained. Handoff matching indexes
+selected handoffs by call ID; matching proxies are streamed, including the grace interval. The report
+collector has no lifetime record-count or history-byte limit. Large selected windows still require a
+narrower range when their retained evidence exceeds the documented memory budget below.
 
 Tests: `test/report.test.ts`, plus the real-ledger/process export in `test/cli-process.test.ts`.
 
@@ -118,8 +122,8 @@ grace window. Pre-1c records are never counted as sessions without heartbeat.
 Outcome joins still stop at range end plus 60 seconds; future outcomes beyond grace do not
 turn an unobserved action into observed execution. Orphans require a preceding tool intent;
 an orphan in a heartbeated session is labelled "intent gap". No collector provenance or
-transactional snapshot is implied. The report uses the latest observed outcome for an intent;
-a reused callId remains ambiguous. Handoff placeholders are excluded from tool decision counts.
+transactional snapshot is implied. The report attaches each outcome to the latest preceding intent with matching callId, agentId,
+sessionId and optional agentSessionId, then keeps the latest outcome for that intent record. Handoff placeholders are excluded from tool decision counts.
 
 `delegated` and `require_approval` indicate an ask, not a named terminal approval. Recorded
 approvals count only `approved`; denial counts group policy, no-channel, Slack decisions and
@@ -225,3 +229,29 @@ ADR-015 amendment (2026-10-05): CC8.1 renders `approved, Ryan Zeleznock (U0C6UV8
 Fable review P2-1 (2026-10-05): the HTML CC8.1 approval cell wraps only the escaped display name in `<bdi>`, leaving
 the member id outside its direction context. This also isolates controls in older stored names; PDF/CSV preserve their
 existing text representation. Tests cover RLO in historical names, ordinary RTL names, id-like name text and HTML escaping.
+
+
+Security round C5/C8, corrected for verification R1 (2026-10-05): outcome lookup is scoped by identity
+and session and stored by intent record ID. A later reused callId cannot borrow a preceding call's
+outcome or another agent's execution. Full reuse of all identifiers remains correlation, not proof of
+provenance; changing the frozen record schema is outside this round.
+
+The collector reads the selected range first, then streams all history. Only selected session IDs and
+call keys are tracked: old intents supply compact classification facts; future heartbeats still cover
+selected sessions; outcomes/handoff proxies count only through the grace boundary. Historical argument
+payloads and unrelated identities never accumulate. Head checks bracket all passes; no transactional
+snapshot is claimed. Standalone handoff reconciliation similarly retains only selected handoff metadata
+and streams matching candidates, with head checks across both reads.
+
+Every individual evidence record is limited to 8 MiB. Retained selected records, correlation metadata,
+and handoff metadata each have a 32 MiB serialized-size budget, with a minimum 512-byte charge per
+entry for object/index overhead; replacing a correlation entry releases its previous charge. These
+are conservative input/state budgets, not exact JavaScript heap measurements or limits on lifetime
+history. Rendering output expands the selected evidence in memory; an oversized selected window fails
+before publishing with an instruction to choose a narrower range. Ledger verification and backend
+indexes retain their own existing costs. No 10,000-record cutoff remains.
+
+Tests: `test/report-history.test.ts` generates 50,000 unrelated historical/grace records and checks the
+pack's prior-intent, heartbeat and handoff results. Its supervised child checks retained heap during
+all scan passes stays below 32 MiB after GC. `test/report-slice-1c.test.ts` covers selected-window and
+individual-record bounds plus C5 identity/session/order regressions.

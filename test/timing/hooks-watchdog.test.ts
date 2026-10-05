@@ -481,10 +481,16 @@ describe("watchdog + real handler (what Astra's `hook` command does), spec §7 t
   }, 15_000);
 });
 
-afterAll(() => {
+afterAll(({}, suite) => {
   // the exit-code matrix over every watchdog process this file spawned
-  expect(codes.length).toBeGreaterThan(50);
-  expect(new Set(codes)).toEqual(new Set([0, 2]));
+  // Filtered runs may exercise only one branch or spawn no watchdog at all.
+  for (const code of codes) expect([0, 2]).toContain(code);
+  const allSelected = (task: import("vitest").RunnerTask): boolean =>
+    task.mode !== "skip" && task.mode !== "todo" && (task.type !== "suite" || task.tasks.every(allSelected));
+  if (suite.tasks.every(allSelected)) {
+    expect(codes.length).toBeGreaterThan(50);
+    expect(new Set(codes)).toEqual(new Set([0, 2]));
+  }
 });
 
 

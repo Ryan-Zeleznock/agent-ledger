@@ -2,7 +2,7 @@ import canonicalize from "canonicalize";
 import type { LedgerRecord, UnsealedRecord, VerifyResult } from "../types/index.js";
 import { sha256Jcs } from "./hash.js";
 import { redactArgs } from "./redact.js";
-import { assertJsonData, projectStored, projectUnsealed } from "./validate.js";
+import { MAX_LEDGER_LINE_BYTES, assertJsonData, projectStored, projectUnsealed } from "./validate.js";
 
 export const GENESIS_HASH = "0";
 export interface Tail { id: string | null; hash: string }
@@ -23,6 +23,7 @@ function idOf(raw: string): { id?: string } {
   } catch { return {}; }
 }
 export function parseStored(raw: string): { rec: LedgerRecord; err?: undefined } | { rec?: undefined; err: string; id?: string } {
+  if (Buffer.byteLength(raw, "utf8") > MAX_LEDGER_LINE_BYTES) return { err: "ledger line size limit exceeded" };
   if (raw.length === 0) return { err: "blank line" };
   // Physical framing first, before any parsing (JSON.parse would tolerate a trailing `\r` as whitespace):
   // records are LF-framed canonical JSON, which never contains a raw CR, so `\r\n` or a stray `\r` is damage.

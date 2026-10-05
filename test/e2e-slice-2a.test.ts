@@ -202,14 +202,16 @@ describe.sequential("Slice 2a demo path: proxy → policy → ledger → demo up
     expect(intent!.approval).toMatchObject({ decision: "no-channel", channel: "none" });
     expect(outcome!.outcome).toEqual({ status: "blocked" });
   });
-  it("7. protocol and auth rejections write no record: no bearer 401; wrong key denied by identity; missing Mcp-Name 400 -32020; 2025-11-25 400 -32022; evil Origin 403; GET 405; legacy initialize 400 -32020 naming 2026-07-28 (modern-framed: 404 -32601); notification 202; 2 MiB 413", async () => {
+  it("7. protocol and auth rejections write no record: no bearer 401; wrong key 401 at the front (ADR-018); missing Mcp-Name 400 -32020; 2025-11-25 400 -32022; evil Origin 403; GET 405; legacy initialize 400 -32020 naming 2026-07-28 (modern-framed: 404 -32601); notification 202; 2 MiB 413", async () => {
     const before = (await records()).length;
     const noBearer = await post({ method: "server/discover" });
     expect(noBearer.status).toBe(401); expect(noBearer.headers.get("www-authenticate")).toBe('Bearer realm="agent-ledger"');
-    // the front does not authenticate (identity does, in the pipeline): a well-formed wrong key is an isError deny with no record; pin 8/step 7 says 401, flagged
-    const wrong = await call("demo__echo", { message: "x" }, "e2e-wrong-key");
-    expect(wrong["isError"]).toBe(true); expect(toolText(wrong)).toMatch(/unknown agent/);
-    expect(lastCallLine()).toMatchObject({ tool: "echo", status: "denied" }); expect(lastCallLine()["agentId"]).toBeUndefined();
+    // ADR-018 §1: the front authenticates first; a well-formed wrong key is 401 before any method (pin 8/step 7 now holds)
+    const callsBefore = callLines().length;
+    const wrong = await post({ token: "e2e-wrong-key", method: "tools/call", params: { name: "demo__echo", arguments: { message: "x" } } });
+    expect(wrong.status).toBe(401); expect(wrong.text).not.toContain("e2e-wrong-key");
+    expect((await post({ token: "e2e-wrong-key", method: "tools/list" })).status).toBe(401);
+    expect(callLines().length).toBe(callsBefore);
     const noName = await post({ token: K, method: "tools/call", params: { name: "demo__echo", arguments: { message: "x" } }, headers: { "mcp-name": null } });
     expect(noName.status).toBe(400); expect(rpcErr(noName)!.code).toBe(-32020);
     const old = await post({ token: K, method: "server/discover", protocolVersion: "2025-11-25" });
@@ -229,18 +231,18 @@ describe.sequential("Slice 2a demo path: proxy → policy → ledger → demo up
     expect((await records()).length).toBe(before);
     expect(demoCalls()).toEqual([["echo", "ok"], ["add", "ok"]]);
   });
-  it("8. the agent's key is not the upstream's credential: a direct tools/call to the demo upstream with K is unauthorized (isError), with no bearer 401; the upstream token never appears in any proxy response", async () => {
-    const direct = await mcpCall(demoUrl, K, "tools/call", { name: "echo", arguments: { message: "x" } });
-    expect(direct["isError"]).toBe(true); expect(toolText(direct)).toBe("unauthorized");
+  it("8. the agent's key is not the upstream's credential: a direct tools/call to the demo upstream with K is 401 (ADR-018), with no bearer 401; the upstream token never appears in any proxy response", async () => {
+    const direct = await mcpPost({ url: demoUrl, token: K, method: "tools/call", params: { name: "echo", arguments: { message: "x" } } });
+    expect(direct.status).toBe(401); // ADR-018: the demo upstream's front authenticates first too
     expect((await mcpPost({ url: demoUrl, method: "server/discover" })).status).toBe(401);
     expect(toolText(await mcpCall(demoUrl, T, "tools/call", { name: "echo", arguments: { message: "direct" } }))).toBe("direct"); // the real credential works, so the refusal above was about the key
     expect(responses.join("\n")).not.toContain(T);
-    expect(demoCalls()).toEqual([["echo", "ok"], ["add", "ok"], ["echo", "unauthorized"], ["echo", "ok"]]);
+    expect(demoCalls()).toEqual([["echo", "ok"], ["add", "ok"], ["echo", "ok"]]);
   });
   it("9. smoke.js against the same sandbox: SMOKE PASS exit 0 (fails exactly at demo__wipe until B's validator line lands); a wrong key file → SMOKE FAIL exit 1; the key is never printed", async () => {
     const ok = await run(process.execPath, [smokeJs, "--url", proxyUrl, "--key-file", keyFile, "--expect-upstream-401", demoUrl], { cwd: sandbox, env: cliEnv, timeoutMs: 60_000 });
     const lines = ok.stdout.trim().split("\n");
-    if (noneOk) { expect(ok.code, ok.stdout + ok.stderr).toBe(0); expect(lines.at(-1)).toBe("SMOKE PASS"); expect(lines.filter((l) => l.startsWith("ok ")).length).toBe(13); }
+    if (noneOk) { expect(ok.code, ok.stdout + ok.stderr).toBe(0); expect(lines.at(-1)).toBe("SMOKE PASS"); expect(lines.filter((l) => l.startsWith("ok ")).length).toBe(15); }
     else { expect(ok.code).toBe(1); expect(lines.at(-1)).toBe("SMOKE FAIL demo__wipe denied: no channel"); expect(lines.slice(0, 5).every((l) => l.startsWith("ok "))).toBe(true); }
     const bad = await run(process.execPath, [smokeJs, "--url", proxyUrl, "--key-file", wrongKeyFile], { cwd: sandbox, env: cliEnv, timeoutMs: 60_000 });
     expect(bad.code).toBe(1); expect(bad.stdout.trim().split("\n").at(-1)).toMatch(/^SMOKE FAIL /);

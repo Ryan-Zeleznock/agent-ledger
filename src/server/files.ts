@@ -49,7 +49,7 @@ export function readUpstreamsConfig(path: string): UpstreamConfig[] {
   const seen = new Set<string>();
   return list.map((entry, i) => {
     const at = `${name}: upstreams[${i}]`;
-    const m = mapping(entry, at, ["name", "transport", "url"]);
+    const m = mapping(entry, at, ["name", "transport", "url", "insecure"]);
     const n = m.get("name"), transport = m.get("transport"), url = m.get("url");
     if (typeof n !== "string" || !MCP_SERVER_NAME_RE.test(n)) throw new Error(`${at}: name must match ${MCP_SERVER_NAME_RE.source}`);
     if (n === RESERVED_APPROVALS_NAME) throw new Error(`${at}: name ${RESERVED_APPROVALS_NAME} is reserved (the Slack tokens live under secrets/${RESERVED_APPROVALS_NAME}.*; Slice 2b pin 5)`);
@@ -57,7 +57,9 @@ export function readUpstreamsConfig(path: string): UpstreamConfig[] {
     seen.add(n);
     if (transport !== "http") throw new Error(`${at}: transport must be http (stdio is 2c)`);
     if (typeof url !== "string" || url.length === 0) throw new Error(`${at}: url must be a non-empty string`);
-    return { name: n, transport, url };
+    const insecure = m.get("insecure");
+    if (insecure !== undefined && typeof insecure !== "boolean") throw new Error(`${at}: insecure must be true or false`);
+    return insecure === undefined ? { name: n, transport, url } : { name: n, transport, url, insecure };
   });
 }
 /** Slice 2b pin 5: no upstream may be called `approvals`, so `secrets.get(name)` can never hand it the Slack tokens. */
