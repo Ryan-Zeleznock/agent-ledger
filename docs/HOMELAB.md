@@ -245,7 +245,7 @@ Undo: `kubectl -n build delete job kaniko-agent-ledger-everything`, then `kubect
 
 ## 5. Generate and provision secrets
 
-Changes: local private files and Secrets `proxy-config`, `demo-upstream`, `postgres-credentials`.
+Changes: local private files and Secrets `proxy-config`, `agent-key`, `demo-upstream`, `postgres-credentials`.
 Never put these files, raw passwords or tokens in the repo/vault/logs. API key bytes have no trailing newline;
 `agents.yaml` contains only its SHA-256 digest. `hmac.key` is exactly 32 raw bytes, not 64 hex characters.
 
@@ -263,13 +263,17 @@ const dir = process.argv[2];
 const sha256 = createHash('sha256').update(fs.readFileSync(`${dir}/api-key`)).digest('hex');
 fs.writeFileSync(`${dir}/agents.yaml`, JSON.stringify({version:1,agents:[{id:'ryan-lab',credential:{kind:'api_key',sha256}}]})+'\n', {mode:0o600});
 JS
-kubectl -n agent-ledger create secret generic proxy-config --from-file=agents.yaml="$LAB_WORK/agents.yaml" --from-file=hmac.key="$LAB_WORK/hmac.key" --from-file=ledger.password="$LAB_WORK/LEDGER_APP_PASSWORD" --from-file=demo.bearerToken="$LAB_WORK/demo-token" --from-file=api-key="$LAB_WORK/api-key"
+kubectl -n agent-ledger create secret generic proxy-config --from-file=agents.yaml="$LAB_WORK/agents.yaml" --from-file=hmac.key="$LAB_WORK/hmac.key" --from-file=ledger.password="$LAB_WORK/LEDGER_APP_PASSWORD" --from-file=demo.bearerToken="$LAB_WORK/demo-token"
+kubectl -n agent-ledger create secret generic agent-key --from-file=api-key="$LAB_WORK/api-key"
 kubectl -n agent-ledger create secret generic demo-upstream --from-file=token="$LAB_WORK/demo-token"
 kubectl -n agent-ledger create secret generic postgres-credentials --from-file=POSTGRES_PASSWORD="$LAB_WORK/POSTGRES_PASSWORD" --from-file=LEDGER_APP_PASSWORD="$LAB_WORK/LEDGER_APP_PASSWORD" --from-file=LEDGER_READER_PASSWORD="$LAB_WORK/LEDGER_READER_PASSWORD"
 ```
 
 `demo.bearerToken` is the legal Secret key; the staging initContainer creates `secrets/demo.bearerToken` on disk.
-The extra `api-key` entry is required by pin 12. It is mounted only in the integration Job, never the proxy Pod.
+The agent's `api-key` (pin 12) lives in its OWN Secret `agent-key` (server audit P3, 2026-10-05), mounted only by the
+integration Job; nothing that mounts `proxy-config` can read it. **Existing lab (migration, Ryan):** create `agent-key`
+as above, re-apply `deploy/k8s/40-integration.yaml`, then remove the old entry with
+`kubectl -n agent-ledger patch secret proxy-config --type=json -p '[{"op":"remove","path":"/data/api-key"}]'`.
 Keep the existing HMAC key when restarting: changing it breaks correlation of hashed arguments across that boundary.
 Verify: `kubectl -n agent-ledger get secrets` shows the four Secrets (including ghcr-pull) without their contents.
 Undo: delete these three Secrets individually after stopping dependent workloads; deleting a Secret does not rotate
@@ -375,6 +379,8 @@ kubectl apply --dry-run=server -f deploy/k8s/test/bad-pod-token.yaml
 kubectl apply --dry-run=server -f deploy/k8s/test/bad-pod-writable.yaml
 kubectl apply --dry-run=server -f deploy/k8s/test/bad-pod-init.yaml
 kubectl apply --dry-run=server -f deploy/k8s/test/bad-pod-projected-token.yaml
+kubectl apply --dry-run=server -f deploy/k8s/test/bad-pod-label.yaml
+kubectl -n agent-ledger patch pod postgres-0 --subresource=ephemeralcontainers --type=strategic --dry-run=server -p "$(cat deploy/k8s/test/bad-ephemeral-container.json)"
 kubectl apply --dry-run=client -k deploy/k8s
 kubectl apply --dry-run=server -k deploy/k8s
 ```
@@ -395,6 +401,13 @@ Those positive Pod proofs must pass. No proof Pod is created. Offline, `node dep
 containers, pins Agent Ledger, Postgres and BusyBox digests (2b), forbids projected ServiceAccount token volumes (2b: the
 negative Pod sets automount false and requests the token explicitly; expect "Projected ServiceAccount token volumes are
 forbidden."), refuses NODE_OPTIONS (including bulk envFrom imports), and requires explicit token/rootfs settings.
+Server audit P3 (2026-10-05): NetworkPolicies grant reach by the `app` label, so a Pod carrying `app: proxy|postgres|
+demo-upstream|integration|everything` must run as the ServiceAccount of that name, and `app: proxy` only as the proxy
+itself (agent-ledger image, args `dist/server/main.js`, no command, BusyBox init only, no ephemeral containers). Expect
+"A Pod with an Agent Ledger app label must run as the ServiceAccount of the same name." for `bad-pod-label.yaml`, and
+"Only approved Agent Ledger, Postgres 17 and BusyBox 1 images are allowed." for the ephemeral-container patch (run the
+patch only once postgres-0 exists; it is a dry run). Residual: anyone allowed to create Pods here may name those
+ServiceAccounts; Pod-create in this namespace is the real boundary.
 Undo: `kubectl delete validatingpolicy agent-ledger-hardening`. Negative tests are not resources to delete.
 
 ## 7b. Kyverno reports RBAC for `pods/ephemeralcontainers` (Slice 2b pin 9)
@@ -425,7 +438,7 @@ Undo: `kubectl delete clusterrole agent-ledger:kyverno-reports-ephemeralcontaine
 
 Changes: all eight NetworkPolicies, Postgres Service and StatefulSet with a 2Gi local-path PVC.
 **2b:** `20-proxy-egress` adds `everything:3001` and **TCP 443 to any public IPv4** (`0.0.0.0/0` except 10/8, 172.16/12,
-192.168/16) for the Slack Web API and Socket Mode: standard NetworkPolicy cannot name `slack.com` (FQDN egress via
+192.168/16, and since the server audit P3 also 100.64/10 carrier-grade NAT and 169.254/16 link-local) for the Slack Web API and Socket Mode: standard NetworkPolicy cannot name `slack.com` (FQDN egress via
 CiliumNetworkPolicy is 2c). `25-everything` allows ingress only from the proxy on 3001 and NO egress (not even DNS).
 Postgres/demo have no outbound allowance; DNS is allowed only for proxy/integration. Replies to allowed inbound
 connections remain allowed. Pod selectors are namespace-local; attacker labels in another namespace grant no access.
@@ -456,6 +469,10 @@ kubectl -n agent-ledger exec postgres-0 -- psql -U ledger_app -d ledger -c 'DELE
 ```
 
 Expected: uid/gid 70, accepting connections, ledger_app/ledger_reader roles, permission denied on DELETE.
+Server audit P3 (2026-10-05): `001_init.sh` prepends `host all postgres all reject` to `pg_hba.conf` at initdb, so the
+superuser cannot log in over TCP at all (the app and reader roles are unaffected). It runs only on a fresh data
+directory. **Existing PVC (Ryan, once):** `kubectl -n agent-ledger exec postgres-0 -- sh -c "sed -i '1i host all postgres all reject' \"\$PGDATA/pg_hba.conf\" && psql -U postgres -c 'SELECT pg_reload_conf()'"`;
+verify with `kubectl -n agent-ledger exec postgres-0 -- psql -U postgres -c "SELECT line_number, type, user_name, auth_method FROM pg_hba_file_rules LIMIT 3"` (line 1 is the reject).
 The official image's local trust authentication makes exec on postgres-0 a **password-less database-superuser path**:
 anyone permitted to exec can run `psql -U postgres`. This is the cluster-admin boundary, not a ledger protection.
 SELECT+INSERT app grants and SELECT-only reader grants are backed by UPDATE/DELETE/TRUNCATE refusal triggers.
@@ -812,6 +829,36 @@ do not delete the namespace. The Mac anchor and pack survive teardown. Remove th
 only if this slice was its sole user. Verify namespace/Job/PVC absence with read-only `kubectl get` commands.
 Undo: repeat installation with retained secrets and surviving storage; a deleted PVC needs a real backup to recover
 records. Anchors prove history but are **not** database backups. Rebuilding empty storage is a new ledger.
+
+## Security round (ADR-018, 2026-10-05): what changed for the operator
+
+- **The front authenticates first.** Every request is resolved through the agent registry's hash lookup before the body
+  is read and before any method answers (tools/list, discover, legacy initialize, tools/call, DELETE); an unknown key is
+  `401` with nothing echoed. Caps: 256 connections, 10 s for headers and for an authenticated body (`408`), 16 requests
+  in flight per agent, 64 tool calls overall. Legacy sessions are capped per agent; at global capacity a new
+  initialize is `503`, never an eviction. `tools/list` is not filtered per agent (residual; never before auth).
+- **Spec §9 note (the frozen spec is not edited):** `docs/spec.md` §9 line "incoming `Mcp-Session-Id` ignored (§3)"
+  predates ADR-016. Since Slice 2b a headerless legacy `initialize` opens a bearer-bound session (`Mcp-Session-Id`);
+  modern requests still ignore and never echo it. ADR-018 adds: sessions only for authenticated agents.
+- **Slack approvals:** the card lists every argument field: clear (reviewed `storeArgs`) values in full or with a
+  stated truncation, withheld (hashed or redacted) fields marked, plus `sha256` of the stored arguments (JCS) to tie it
+  to the ledger record. A preview that cannot fit Slack's limits is denied and recorded, never posted. At most 4
+  pending approvals per agent; an identical pending request is refused, not posted twice.
+- **Upstreams:** a bearer is never sent over plaintext `http://` to a non-loopback host unless the upstream entry sets
+  `insecure: true` (the in-cluster `demo` entry does, with the reason beside it).
+- **Start-up:** `AGENT_LEDGER_TLS=off` with a non-loopback bind is refused; `off-non-loopback` is the explicit override
+  (Compose, published on 127.0.0.1 only). The `listening` log line carries `configSha256` of registry, agents,
+  upstreams (and approvals) files, so an edited ConfigMap shows up in the pod log.
+- **Images:** the root Dockerfile bases and the Kaniko executor are digest-pinned; `node deploy/check.mjs` refuses any
+  unpinned `FROM` in any Dockerfile and any unpinned image in a Kaniko Job.
+- **Falco:** the proxy rule exempts only `/nodejs/bin/node` as the entrypoint (node spawned by node alerts, except in the
+  integration Job, which runs smoke.js as a child); the shell rule counts `busybox` itself (`busybox sh`) and exempts
+  BusyBox only in the `stage-config` init container. Re-apply with step 10's Helm upgrade to take effect.
+- **Residual: a crash or SIGKILL while an approval is pending leaves no ledger record and live Slack buttons** (a
+  graceful stop settles them `unavailable` and records the deny). A click after a restart settles nothing: the new
+  process holds no pending entry, so the button is dead and the call never ran. Recording an "approval requested"
+  marker before asking belongs to the pipeline (Astra's module; 2c candidate). Smoke's `--expect-upstream-401` now
+  checks exactly three things: no bearer, the agent's key on tools/call, and the agent's key on tools/list.
 
 ## Residuals and evidence limits
 

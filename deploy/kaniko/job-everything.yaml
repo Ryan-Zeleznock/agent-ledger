@@ -17,7 +17,8 @@ spec:
       automountServiceAccountToken: false
       containers:
         - name: kaniko
-          image: gcr.io/kaniko-project/executor:v1.23.2
+          # ADR-018 §6: OCI index digest of v1.23.2, resolved from gcr.io 2026-10-05; deploy/check.mjs enforces the pin.
+          image: gcr.io/kaniko-project/executor:v1.23.2@sha256:9e69fd4330ec887829c780f5126dd80edc663df6def362cd22e79bcdf00ac53f
           args:
             - --context=tar:///work/context.tar.gz
             - --dockerfile=Dockerfile

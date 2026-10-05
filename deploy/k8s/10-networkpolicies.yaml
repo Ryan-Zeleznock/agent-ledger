@@ -84,6 +84,10 @@ spec:
               - 10.0.0.0/8
               - 172.16.0.0/12
               - 192.168.0.0/16
+              # server audit P3 (2026-10-05): carrier-grade NAT (RFC 6598; Tailscale's range) and link-local (cloud
+              # metadata endpoints) are not the public internet either.
+              - 100.64.0.0/10
+              - 169.254.0.0/16
       ports:
         - protocol: TCP
           port: 443

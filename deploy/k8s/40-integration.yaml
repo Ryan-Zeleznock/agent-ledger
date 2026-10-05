@@ -73,9 +73,10 @@ spec:
       volumes:
         - name: work
           emptyDir: {}
+        # server audit P3: the agent's api-key lives in its OWN Secret, so nothing that mounts proxy-config can read it.
         - name: key
           secret:
-            secretName: proxy-config
+            secretName: agent-key
             defaultMode: 288
             items:
               - key: api-key

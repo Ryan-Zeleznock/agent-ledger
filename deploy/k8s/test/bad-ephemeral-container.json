@@ -1,0 +1,1 @@
+{"spec":{"ephemeralContainers":[{"name":"audit-probe","image":"docker.io/library/alpine:3.22","command":["sh"],"stdin":true,"tty":true,"securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}}}]}}
