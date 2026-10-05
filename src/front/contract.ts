@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
+import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
+import { createHash, timingSafeEqual, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import type { CallHandler, IncomingCall, ToolInfo, ToolResult } from "../types/index.js";
 import { notImplemented } from "../types/not-implemented.js";
@@ -10,11 +11,13 @@ export const MCP_PROTOCOL_VERSION = "2026-07-28" as const;
 interface FrontBase { tools: () => Promise<ToolInfo[]>; }
 export interface StdioFrontOptions extends FrontBase { mode: "stdio"; }
 /**
- * Streamable HTTP, revision 2026-07-28: stateless (no initialize handshake, no Mcp-Session-Id; every POST carries
- * MCP-Protocol-Version, Mcp-Method and, for tools/call, Mcp-Name). The front MUST validate Origin (403 on a
+ * Dual-era Streamable HTTP: modern requests are stateless; headerless initialize selects bearer-bound legacy sessions.
+ * Modern POSTs carry
+ * MCP-Protocol-Version, Mcp-Method and, for tools/call, Mcp-Name. The front MUST validate Origin (403 on a
  * mismatch) and SHOULD bind to localhost when run locally; both come from these options.
  */
 export interface HttpFrontOptions extends FrontBase {
+  tls?: { cert: Buffer; key: Buffer };
   mode: "http";
   port?: number;
   /** Interface to listen on. Default "127.0.0.1"; server mode in a container sets "0.0.0.0" on purpose. */
@@ -34,6 +37,10 @@ export interface HttpFrontOptions extends FrontBase {
   drainTimeoutMs?: number;
 }
 export type FrontOptions = StdioFrontOptions | HttpFrontOptions;
+export const FRONT_LEGACY_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26"] as const;
+export const FRONT_MAX_LEGACY_SESSIONS = 1024;
+export const FRONT_MAX_LEGACY_SESSIONS_PER_BEARER = 32;
+export const FRONT_LEGACY_SESSION_IDLE_MS = 3_600_000;
 export const DEFAULT_BIND_HOST = "127.0.0.1";
 export const DEFAULT_PORT = 8787;
 export const DEFAULT_MAX_IN_FLIGHT = 64;
@@ -111,15 +118,15 @@ export function buildExposedTable(tools: ToolInfo[], naming: "server__tool" | "t
   return new Map([...table.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
 }
 
-/**
- * Our IncomingCall.callId is per call; the pipeline's sessionId is OURS (identity.startSession), not an MCP
- * session: MCP 2026-07-28 has no protocol-level sessions, so nothing here reads or mints Mcp-Session-Id.
- */
-export async function startFront(handler: CallHandler, opts: FrontOptions): Promise<RunningFront> {
+type FrontServer = Server | HttpsServer;
+const lifecycles = new WeakMap<FrontServer, { ready: Promise<void>; stop(): Promise<void> }>();
+/** Build without binding a port. tools() initializes once; requests await that initialization, and startFront awaits it before listen. */
+export function createFrontServer(handler: CallHandler, opts: FrontOptions): Server | HttpsServer {
   if (typeof handler !== "function") throw new Error("front: a CallHandler is required");
   if (!opts || typeof opts !== "object") throw new Error("front: options are required");
   if (opts.mode === "stdio") throw notImplemented("front.startFront(stdio)");
   if (opts.mode !== "http") throw new Error("front: unknown mode");
+  if (opts.tls !== undefined && (!isRecord(opts.tls) || !Buffer.isBuffer(opts.tls.cert) || opts.tls.cert.length === 0 || !Buffer.isBuffer(opts.tls.key) || opts.tls.key.length === 0)) throw new Error("front: tls requires non-empty cert and key Buffers");
   if (!Array.isArray(opts.allowedOrigins) || opts.allowedOrigins.some((o) => typeof o !== "string" || o.length === 0)) throw new Error("front: allowedOrigins must be an array of non-empty strings");
   const port = opts.port ?? DEFAULT_PORT;
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("front: port must be an integer 0-65535");
@@ -130,26 +137,42 @@ export async function startFront(handler: CallHandler, opts: FrontOptions): Prom
   const drainTimeoutMs = opts.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS;
   if (!Number.isInteger(drainTimeoutMs) || drainTimeoutMs < 0 || drainTimeoutMs > 600_000) throw new Error("front: drainTimeoutMs must be an integer 0-600000");
   if (typeof opts.tools !== "function") throw new Error("front: tools() is required");
-  const table = buildExposedTable(await opts.tools(), opts.naming ?? "server__tool");
   const allowed = new Set(opts.allowedOrigins);
   const serverInfo = { name: SERVER_NAME, version: packageVersion };
-  const toolsResult = {
-    resultType: "complete", tools: [...table.values()].map(({ exposed, server, info }) => {
-      const t: Record<string, unknown> = { name: exposed, description: `[${server}] ${info.description ?? ""}`.trimEnd() };
-      t["inputSchema"] = info.inputSchema ?? { type: "object" };
-      if (info.annotations !== undefined) t["annotations"] = info.annotations;
-      return t;
-    }), ttlMs: TOOLS_TTL_MS, cacheScope: "private", _meta: { [META_SERVER_INFO]: serverInfo },
-  };
+  let table: Map<string, ExposedTool>;
+  let toolsResult: Record<string, unknown>;
+  const ready = (async () => {
+    table = buildExposedTable(await opts.tools(), opts.naming ?? "server__tool");
+    toolsResult = {
+      resultType: "complete", tools: [...table.values()].map(({ exposed, server, info }) => {
+        const t: Record<string, unknown> = { name: exposed, description: `[${server}] ${info.description ?? ""}`.trimEnd() };
+        t["inputSchema"] = info.inputSchema ?? { type: "object" };
+        if (info.annotations !== undefined) t["annotations"] = info.annotations;
+        return t;
+      }), ttlMs: TOOLS_TTL_MS, cacheScope: "private", _meta: { [META_SERVER_INFO]: serverInfo },
+    };
+  })();
+  void ready.catch(() => undefined); // startFront/route observes initialization failures; never an unhandled rejection
   const discoverResult = { resultType: "complete", supportedVersions: [MCP_PROTOCOL_VERSION], capabilities: { tools: {} }, _meta: { [META_SERVER_INFO]: serverInfo }, instructions: DISCOVER_INSTRUCTIONS, ttlMs: DISCOVER_TTL_MS, cacheScope: "private" };
   const inflight = new Set<Promise<void>>(); // admitted tools/call invocations (F10 bound, F3 drain)
   let stopping = false;
+  let admitted = 0;
+  const sessions = new Map<string, { tokenHash: Buffer; version: string; touched: number }>();
+  const expire = () => { const now = Date.now(); for (const [id, session] of sessions) if (now - session.touched >= FRONT_LEGACY_SESSION_IDLE_MS) sessions.delete(id); };
+  const ownedSession = (id: string | undefined, token: string) => {
+    expire(); const session = id === undefined ? undefined : sessions.get(id);
+    return session && timingSafeEqual(session.tokenHash, createHash("sha256").update(token).digest()) ? session : undefined;
+  };
 
-  const server: Server = createServer((req, res) => { void route(req, res).catch(() => { if (!res.headersSent) sendJson(res, 500, rpcError(null, JSONRPC_INTERNAL_ERROR, "internal error")); else res.destroy(); }); });
+  const listener = (req: IncomingMessage, res: ServerResponse) => { void route(req, res).catch(() => { if (!res.headersSent) sendJson(res, 500, rpcError(null, JSONRPC_INTERNAL_ERROR, "internal error")); else res.destroy(); }); };
+  const server = opts.tls ? createHttpsServer({ ...opts.tls, minVersion: "TLSv1.2" }, listener) : createServer(listener);
+  const originalClose = server.close.bind(server);
+  server.close = ((callback?: (err?: Error) => void) => { stopping = true; sessions.clear(); return originalClose(callback); }) as typeof server.close;
   server.requestTimeout = 120_000;
   server.headersTimeout = 30_000;
 
   async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    await ready;
     res.setHeader("cache-control", "no-store");
     const path = (req.url ?? "/").split("?")[0];
     if (path === HEALTH_PATH) {
@@ -157,6 +180,15 @@ export async function startFront(handler: CallHandler, opts: FrontOptions): Prom
       res.writeHead(stopping ? 503 : 200, { "content-type": "application/json" }); res.end(req.method === "HEAD" ? undefined : stopping ? '{"ok":false}' : '{"ok":true}'); return;
     }
     if (path !== MCP_ENDPOINT_PATH) { res.writeHead(404); res.end(); return; }
+    if (req.method === "DELETE") {
+      const origin = req.headers.origin;
+      if (origin !== undefined && !allowed.has(origin)) { drain(req); sendJson(res, 403, rpcError(undefined, JSONRPC_INVALID_REQUEST, "Origin not allowed")); return; }
+      const auth = req.headers.authorization;
+      const match = typeof auth === "string" ? BEARER_RE.exec(auth) : null;
+      const id = header(req, "mcp-session-id");
+      if (!stopping && match && ownedSession(id, match[1]!)) { sessions.delete(id!); res.writeHead(204); res.end(); drain(req); return; }
+      res.writeHead(405, { allow: "POST" }); res.end(); drain(req); return;
+    }
     if (req.method !== "POST") { res.writeHead(405, { allow: "POST" }); res.end(); req.resume(); return; }
     if (stopping) { drain(req); res.setHeader("connection", "close"); sendJson(res, 503, rpcError(undefined, JSONRPC_OVERLOADED, "shutting down")); return; }
     const origin = req.headers.origin;
@@ -171,6 +203,7 @@ export async function startFront(handler: CallHandler, opts: FrontOptions): Prom
     if (ct !== "application/json") { drain(req); sendJson(res, 415, rpcError(undefined, JSONRPC_INVALID_REQUEST, "Content-Type must be application/json")); return; }
     const raw = await readBody(req, res);
     if (raw === undefined) return; // 413 already sent
+    if (stopping) { sendJson(res, 503, rpcError(undefined, JSONRPC_OVERLOADED, "shutting down")); return; }
     let msg: unknown;
     try { msg = JSON.parse(raw); } catch { sendJson(res, 400, rpcError(null, JSONRPC_PARSE_ERROR, "Parse error")); return; }
     if (!isRecord(msg)) { sendJson(res, 400, rpcError(null, JSONRPC_INVALID_REQUEST, "Invalid Request: expected one JSON-RPC message object")); return; }
@@ -183,47 +216,81 @@ export async function startFront(handler: CallHandler, opts: FrontOptions): Prom
     const method = rpc["method"];
     // Every error to an `initialize` names the versions we speak (versioning page: "SHOULD name the protocol versions it supports in any error it returns to an initialize request") (F6)
     const fail = (status: number, code: number, message: string, data?: Record<string, unknown>): void => {
-      if (method === "initialize") { if (!message.includes(INITIALIZE_MESSAGE)) message = `${message}; ${INITIALIZE_MESSAGE}`; data = { ...(data ?? {}), supported: [MCP_PROTOCOL_VERSION] }; }
+      if (method === "initialize") {
+        const params = rpc["params"], meta = isRecord(params) ? params["_meta"] : undefined;
+        const modern = header(req, "mcp-protocol-version") !== undefined || (isRecord(meta) && Object.hasOwn(meta, META_VERSION));
+        if (modern) { if (!message.includes(INITIALIZE_MESSAGE)) message = `${message}; ${INITIALIZE_MESSAGE}`; }
+        data = { ...(data ?? {}), supported: modern ? [MCP_PROTOCOL_VERSION] : [...FRONT_LEGACY_VERSIONS] };
+      }
       sendJson(res, status, rpcError(rid, code, message, data));
     };
     if (rpc["jsonrpc"] !== "2.0" || typeof method !== "string" || !validId) { fail(400, JSONRPC_INVALID_REQUEST, "Invalid Request"); return; }
     const params = rpc["params"];
     if (params !== undefined && !isRecord(params)) { fail(400, JSONRPC_INVALID_REQUEST, "Invalid Request: params must be an object"); return; }
     const p = params ?? {};
-    // 1. Transport §Server Validation (-32020): required headers present and equal to the body (header/body agreement comes BEFORE version support: pin 3 order, F5)
+    const sessionHeaderPresent = Object.hasOwn(req.headers, "mcp-session-id");
     const versionHeader = header(req, "mcp-protocol-version");
-    if (versionHeader === undefined) { fail(400, JSONRPC_HEADER_MISMATCH, "Header mismatch: MCP-Protocol-Version header is required"); return; }
-    const methodHeader = header(req, "mcp-method");
-    if (methodHeader !== method) { fail(400, JSONRPC_HEADER_MISMATCH, methodHeader === undefined ? "Header mismatch: Mcp-Method header is required" : "Header mismatch: Mcp-Method header does not match the body method"); return; }
-    if (method === "tools/call") {
-      const nameHeader = header(req, "mcp-name");
-      if (nameHeader === undefined) { fail(400, JSONRPC_HEADER_MISMATCH, "Header mismatch: Mcp-Name header is required on tools/call"); return; }
-      const decoded = decodeSentinel(nameHeader);
-      if (decoded === undefined) { fail(400, JSONRPC_HEADER_MISMATCH, "Header mismatch: Mcp-Name header is a malformed Base64 sentinel"); return; }
-      if (decoded !== p["name"]) { fail(400, JSONRPC_HEADER_MISMATCH, "Header mismatch: Mcp-Name header does not match params.name"); return; }
+    let legacy = false;
+    if (sessionHeaderPresent) {
+      const session = ownedSession(header(req, "mcp-session-id"), token);
+      if (!session) { sendJson(res, 404, rpcError(rid, JSONRPC_INVALID_REQUEST, "unknown legacy session")); return; }
+      if (versionHeader !== session.version && !(versionHeader === undefined && session.version === "2025-03-26")) { fail(400, JSONRPC_INVALID_REQUEST, "legacy protocol version mismatch"); return; }
+      session.touched = Date.now(); legacy = true;
+      const sessionId = header(req, "mcp-session-id")!;
+      sessions.delete(sessionId); sessions.set(sessionId, session); // insertion order is LRU, even within one clock tick
+      // 2025-11-25 transport: 404 means a terminated session; unsupported RPC methods do not terminate it.
+      if (isNotification) { res.writeHead(202); res.end(); return; }
+      if (method === "ping") { sendJson(res, 200, { jsonrpc: "2.0", id: rid, result: {} }); return; }
+      if (method === "tools/list") { sendJson(res, 200, { jsonrpc: "2.0", id: rid, result: { tools: toolsResult["tools"] } }); return; }
+      if (method !== "tools/call") { fail(200, JSONRPC_METHOD_NOT_FOUND, "Method not found"); return; }
+    } else if (method === "initialize" && versionHeader === undefined && !(isRecord(p["_meta"]) && Object.hasOwn(p["_meta"], META_VERSION))) {
+      if (isNotification || typeof p["protocolVersion"] !== "string" || !isRecord(p["capabilities"])) { fail(400, JSONRPC_INVALID_PARAMS, "initialize requires protocolVersion and capabilities"); return; }
+      expire();
+      const tokenHash = createHash("sha256").update(token).digest();
+      let ownCount = 0, oldestOwned: string | undefined;
+      for (const [id, session] of sessions) if (timingSafeEqual(session.tokenHash, tokenHash)) { ownCount++; oldestOwned ??= id; }
+      if (ownCount >= FRONT_MAX_LEGACY_SESSIONS_PER_BEARER) sessions.delete(oldestOwned!);
+      if (sessions.size >= FRONT_MAX_LEGACY_SESSIONS) sessions.delete(sessions.keys().next().value!);
+      const version = (FRONT_LEGACY_VERSIONS as readonly string[]).includes(p["protocolVersion"]) ? p["protocolVersion"] : FRONT_LEGACY_VERSIONS[0];
+      const id = randomUUID(); sessions.set(id, { tokenHash, version, touched: Date.now() });
+      res.setHeader("Mcp-Session-Id", id);
+      sendJson(res, 200, { jsonrpc: "2.0", id: rid, result: { protocolVersion: version, capabilities: { tools: {} }, serverInfo, instructions: DISCOVER_INSTRUCTIONS } }); return;
     }
-    const meta = p["_meta"];
-    const metaObj = isRecord(meta) ? meta : undefined;
-    if (typeof metaObj?.[META_VERSION] === "string" && metaObj[META_VERSION] !== versionHeader) { fail(400, JSONRPC_HEADER_MISMATCH, "Header mismatch: MCP-Protocol-Version header does not match _meta protocolVersion"); return; }
-    // 2. Versioning (-32022)
-    if (versionHeader !== MCP_PROTOCOL_VERSION) { fail(400, JSONRPC_UNSUPPORTED_VERSION, "Unsupported protocol version", { supported: [MCP_PROTOCOL_VERSION], requested: versionHeader.slice(0, 64) }); return; }
-    // 3. Base protocol per-request fields (-32602): protocolVersion string, clientCapabilities object, clientInfo (optional) an Implementation (F5)
-    const clientInfo = metaObj?.[META_CLIENT_INFO];
-    if (!metaObj || typeof metaObj[META_VERSION] !== "string" || !isRecord(metaObj[META_CAPS]) || (clientInfo !== undefined && !(isRecord(clientInfo) && typeof clientInfo["name"] === "string" && typeof clientInfo["version"] === "string"))) {
-      fail(400, JSONRPC_INVALID_PARAMS, `Invalid params: _meta must carry ${META_VERSION} (string) and ${META_CAPS} (object)`); return;
+    if (!legacy) {
+      // 1. Transport §Server Validation (-32020): required headers present and equal to the body (header/body agreement comes BEFORE version support: pin 3 order, F5)
+      if (versionHeader === undefined) { fail(400, JSONRPC_HEADER_MISMATCH, "Header mismatch: MCP-Protocol-Version header is required"); return; }
+      const methodHeader = header(req, "mcp-method");
+      if (methodHeader !== method) { fail(400, JSONRPC_HEADER_MISMATCH, methodHeader === undefined ? "Header mismatch: Mcp-Method header is required" : "Header mismatch: Mcp-Method header does not match the body method"); return; }
+      if (method === "tools/call") {
+        const nameHeader = header(req, "mcp-name");
+        if (nameHeader === undefined) { fail(400, JSONRPC_HEADER_MISMATCH, "Header mismatch: Mcp-Name header is required on tools/call"); return; }
+        const decoded = decodeSentinel(nameHeader);
+        if (decoded === undefined) { fail(400, JSONRPC_HEADER_MISMATCH, "Header mismatch: Mcp-Name header is a malformed Base64 sentinel"); return; }
+        if (decoded !== p["name"]) { fail(400, JSONRPC_HEADER_MISMATCH, "Header mismatch: Mcp-Name header does not match params.name"); return; }
+      }
+      const meta = p["_meta"];
+      const metaObj = isRecord(meta) ? meta : undefined;
+      if (typeof metaObj?.[META_VERSION] === "string" && metaObj[META_VERSION] !== versionHeader) { fail(400, JSONRPC_HEADER_MISMATCH, "Header mismatch: MCP-Protocol-Version header does not match _meta protocolVersion"); return; }
+      // 2. Versioning (-32022)
+      if (versionHeader !== MCP_PROTOCOL_VERSION) { fail(400, JSONRPC_UNSUPPORTED_VERSION, "Unsupported protocol version", { supported: [MCP_PROTOCOL_VERSION], requested: versionHeader.slice(0, 64) }); return; }
+      // 3. Base protocol per-request fields (-32602): protocolVersion string, clientCapabilities object, clientInfo (optional) an Implementation (F5)
+      const clientInfo = metaObj?.[META_CLIENT_INFO];
+      if (!metaObj || typeof metaObj[META_VERSION] !== "string" || !isRecord(metaObj[META_CAPS]) || (clientInfo !== undefined && !(isRecord(clientInfo) && typeof clientInfo["name"] === "string" && typeof clientInfo["version"] === "string"))) {
+        fail(400, JSONRPC_INVALID_PARAMS, `Invalid params: _meta must carry ${META_VERSION} (string) and ${META_CAPS} (object)`); return;
+      }
+      if (isNotification) { res.writeHead(202); res.end(); return; }
+      if (method === "server/discover") { sendJson(res, 200, { jsonrpc: "2.0", id: rid, result: discoverResult }); return; }
+      if (method === "tools/list") { sendJson(res, 200, { jsonrpc: "2.0", id: rid, result: toolsResult }); return; }
+      if (method === "initialize") { fail(404, JSONRPC_METHOD_NOT_FOUND, INITIALIZE_MESSAGE); return; } // an otherwise valid request for the one method a legacy client would send
+      if (method !== "tools/call") { fail(404, JSONRPC_METHOD_NOT_FOUND, `Method not found: ${method.slice(0, 64)}`); return; }
     }
-    if (isNotification) { res.writeHead(202); res.end(); return; }
-    if (method === "server/discover") { sendJson(res, 200, { jsonrpc: "2.0", id: rid, result: discoverResult }); return; }
-    if (method === "tools/list") { sendJson(res, 200, { jsonrpc: "2.0", id: rid, result: toolsResult }); return; }
-    if (method === "initialize") { fail(404, JSONRPC_METHOD_NOT_FOUND, INITIALIZE_MESSAGE); return; } // an otherwise valid request for the one method a legacy client would send
-    if (method !== "tools/call") { fail(404, JSONRPC_METHOD_NOT_FOUND, `Method not found: ${method.slice(0, 64)}`); return; }
     const name = p["name"];
     const entry = typeof name === "string" ? table.get(name) : undefined;
     if (!entry) { fail(400, JSONRPC_INVALID_PARAMS, `Unknown tool: ${typeof name === "string" ? name.slice(0, 160) : ""}`); return; }
     const args = p["arguments"];
     if (args !== undefined && !isRecord(args)) { fail(400, JSONRPC_INVALID_PARAMS, "Invalid params: arguments must be an object"); return; }
     // 4. Transport §Custom Headers: every advertised x-mcp-header parameter present in the body must have a matching Mcp-Param-* header (F4)
-    for (const hp of entry.headerParams) {
+    for (const hp of legacy ? [] : entry.headerParams) {
       const v = valueAt(args ?? {}, hp.path);
       const h = header(req, `mcp-param-${hp.name.toLowerCase()}`);
       if (v === undefined || v === null) { if (h !== undefined) { fail(400, JSONRPC_HEADER_MISMATCH, `Header mismatch: Mcp-Param-${hp.name} header is present but the body carries no value for it`); return; } continue; }
@@ -235,39 +302,53 @@ export async function startFront(handler: CallHandler, opts: FrontOptions): Prom
       if (!same) { fail(400, JSONRPC_HEADER_MISMATCH, `Header mismatch: Mcp-Param-${hp.name} header does not match the body`); return; }
     }
     // 5. Admission (tools page: servers MUST rate limit tool invocations; F10)
-    if (inflight.size >= maxInFlight) { res.setHeader("retry-after", "1"); fail(503, JSONRPC_OVERLOADED, "overloaded: too many tool invocations in flight"); return; }
+    if (admitted >= maxInFlight) { res.setHeader("retry-after", "1"); fail(503, JSONRPC_OVERLOADED, "overloaded: too many tool invocations in flight"); return; }
+    admitted++;
+    let released = false;
+    const release = () => { if (!released) { released = true; admitted--; } };
+    // Keep capacity until handler settlement: transport disconnect does not cancel pipeline/Slack work.
     const incoming: IncomingCall = { callId: randomUUID(), credential: { kind: "api_key", value: token }, server: entry.server, tool: entry.tool, args: (args ?? {}) as Record<string, unknown>, receivedAt: new Date().toISOString() };
     const run = (async () => {
       let result: unknown;
       try { result = await handler(incoming); }
       catch { sendJson(res, 500, rpcError(rid, JSONRPC_INTERNAL_ERROR, "internal error")); return; }
       if (!validToolResult(result)) { sendJson(res, 500, rpcError(rid, JSONRPC_INTERNAL_ERROR, "internal error")); return; } // never an empty success (F2)
-      sendJson(res, 200, { jsonrpc: "2.0", id: rid, result: { resultType: "complete", content: result.content, isError: result.isError, _meta: { [META_SERVER_INFO]: serverInfo } } });
+      sendJson(res, 200, { jsonrpc: "2.0", id: rid, result: { ...(!legacy ? { resultType: "complete", _meta: { [META_SERVER_INFO]: serverInfo } } : {}), content: result.content, isError: result.isError } });
     })();
     inflight.add(run);
-    try { await run; } finally { inflight.delete(run); }
+    try { await run; } finally { release(); inflight.delete(run); }
   }
 
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(port, bindHost, () => { server.off("error", reject); resolve(); });
-  });
-  const address = server.address();
-  const boundPort = typeof address === "object" && address !== null ? address.port : port;
-  return {
-    port: boundPort,
-    /** Stop admitting (new POSTs 503, health 503), let admitted invocations settle for up to drainTimeoutMs, then close every connection (F3). */
-    async stop() {
-      stopping = true;
+  let stopPromise: Promise<void> | undefined;
+  lifecycles.set(server, { ready, stop() {
+    stopPromise ??= (async () => {
+      stopping = true; sessions.clear();
       const closed = new Promise<void>((resolve) => server.close(() => resolve()));
       server.closeIdleConnections();
       await withTimeout(Promise.allSettled([...inflight]).then(() => undefined), drainTimeoutMs);
       server.closeIdleConnections();
-      await withTimeout(closed, 1_000); // a finished response on a closing server ends its connection by itself; give it a moment
+      await withTimeout(closed, 1_000);
       server.closeAllConnections();
       await closed;
-    },
-  };
+    })();
+    return stopPromise;
+  } });
+  return server;
+}
+
+/** Bind only after the exposed tool table has passed validation. */
+export async function startFront(handler: CallHandler, opts: FrontOptions): Promise<RunningFront> {
+  const server = createFrontServer(handler, opts);
+  const lifecycle = lifecycles.get(server)!;
+  try { await lifecycle.ready; } catch (e) { server.close(); throw e; }
+  if (opts.mode !== "http") throw notImplemented("front.startFront(stdio)");
+  const port = opts.port ?? DEFAULT_PORT;
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, opts.bindHost ?? DEFAULT_BIND_HOST, () => { server.off("error", reject); resolve(); });
+  });
+  const address = server.address();
+  return { port: typeof address === "object" && address !== null ? address.port : port, stop: () => lifecycle.stop() };
 }
 
 // ---------- helpers ----------
@@ -291,7 +372,7 @@ export function decodeSentinel(value: string): string | undefined {
   if (!BASE64_RE.test(b64)) return undefined;
   const buf = Buffer.from(b64, "base64");
   if (buf.toString("base64") !== b64) return undefined;
-  try { return new TextDecoder("utf-8", { fatal: true }).decode(buf); } catch { return undefined; }
+  try { return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(buf); } catch { return undefined; }
 }
 /** Tools page "Tool Result" content block types and their required fields; a handler result outside this is a 500, never a success (F2). Same rule as the upstream client. */
 export function validToolResult(r: unknown): r is ToolResult & { content: unknown[] } {
@@ -355,6 +436,8 @@ function readBody(req: IncomingMessage, res: ServerResponse): Promise<string | u
 // Identical to src/upstream/contract.ts (modules do not import each other; keep the two copies the same).
 export interface HeaderParam { path: string[]; name: string; type: "string" | "integer" | "boolean"; }
 const TCHAR_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+const SCHEMA_SINGLE_KEYWORDS = new Set(["items", "additionalItems", "additionalProperties", "unevaluatedItems", "unevaluatedProperties", "contains", "propertyNames", "not", "if", "then", "else", "contentSchema"]);
+const SCHEMA_ARRAY_KEYWORDS = new Set(["allOf", "anyOf", "oneOf", "prefixItems"]);
 const SCHEMA_MAP_KEYWORDS = new Set(["properties", "patternProperties", "$defs", "definitions", "dependentSchemas"]);
 /** The valid `x-mcp-header` parameters of an `inputSchema`, or a thrown `Error("x-mcp-header: <reason>")` when any annotation violates the transport's constraints. Bounded walk. */
 export function headerParams(schema: unknown): HeaderParam[] {
@@ -378,7 +461,8 @@ export function headerParams(schema: unknown): HeaderParam[] {
     for (const [k, v] of Object.entries(node)) {
       if (k === "x-mcp-header") continue;
       if (SCHEMA_MAP_KEYWORDS.has(k) && isRecord(v)) { for (const [prop, sub] of Object.entries(v)) walk(sub, k === "properties" && path !== undefined ? [...path, prop] : undefined, depth + 1); }
-      else walk(v, undefined, depth + 1);
+      else if (SCHEMA_SINGLE_KEYWORDS.has(k) || SCHEMA_ARRAY_KEYWORDS.has(k)) walk(v, undefined, depth + 1);
+      else if (k === "dependencies" && isRecord(v)) { for (const sub of Object.values(v)) if (!Array.isArray(sub)) walk(sub, undefined, depth + 1); }
     }
   };
   walk(schema, [], 0);

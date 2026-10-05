@@ -34,7 +34,7 @@ spec:
             - |-
               const {spawnSync}=require('node:child_process'); const fs=require('node:fs');
               function run(args){const r=spawnSync(process.execPath,args,{encoding:'utf8',timeout:120000}); if(r.stdout)process.stdout.write(r.stdout); if(r.stderr)process.stderr.write(r.stderr); if(r.error || r.status!==0)process.exit(1); return r.stdout;}
-              run(['dist/server/smoke.js','--url','http://proxy:8787/mcp','--key-file','/mnt/key/api-key','--expect-upstream-401','http://demo-upstream:3001/mcp']);
+              run(['dist/server/smoke.js','--url','https://proxy.agent-ledger.svc:8787/mcp','--key-file','/mnt/key/api-key','--approvals','slack','--ca-file','/mnt/ca/ca.crt','--expect-legacy','everything','--expect-upstream-401','http://demo-upstream:3001/mcp']);
               const args=['--ledger','postgres://ledger_reader@postgres:5432/ledger','--dir','/work'];
               run(['dist/cli/main.js','anchor',...args]);
               const verified=run(['dist/cli/main.js','verify',...args]);
@@ -67,6 +67,9 @@ spec:
             - name: key
               mountPath: /mnt/key
               readOnly: true
+            - name: ca
+              mountPath: /mnt/ca
+              readOnly: true
       volumes:
         - name: work
           emptyDir: {}
@@ -77,3 +80,10 @@ spec:
             items:
               - key: api-key
                 path: api-key
+        # Slice 2b pin 11 step 11: the lab CA certificate (public), created in HOMELAB step 5b.
+        - name: ca
+          configMap:
+            name: proxy-ca
+            items:
+              - key: ca.crt
+                path: ca.crt

@@ -1,0 +1,9 @@
+{
+  "name": "agent-ledger-upstream-everything",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pinned build input for the server-everything upstream image (Slice 2b pin 10). Lockfile integrity is asserted by deploy/check.mjs.",
+  "dependencies": {
+    "@modelcontextprotocol/server-everything": "2026.8.31"
+  }
+}

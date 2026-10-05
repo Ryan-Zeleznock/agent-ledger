@@ -7,9 +7,8 @@ Status: implemented
 
 ## Slice 2a (Fable, 2026-10-03; pin 4): the 2026-07-28 Streamable HTTP client
 
-`connectUpstreams(config, secrets)` implements `transport: "http"` only. **Not implemented (2b):** `stdio`
-(`not implemented: upstream.connectUpstreams(stdio)`), the legacy-era (`initialize`) fallback for third-party servers
-(every published MCP server is legacy today, pins §0; ADR-013 names the dual-era client as 2b), tool-list refresh.
+`connectUpstreams(config, secrets)` implements HTTP with modern discovery and legacy initialization (Slice 2b,
+ADR-016). stdio and tool-list refresh/listChanged remain 2c.
 
 **Primary source**, re-read 2026-10-03: https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http
 (request metadata headers, `Accept`, response content types, Base64 sentinel), `basic/versioning` (`-32022` shape,
@@ -77,3 +76,39 @@ envelope and result validation (malformed → `UpstreamError`, through the real 
 `x-mcp-header` mirroring and tool-definition rejection with `rejectedTools` (additive member, flagged); F7 incremental
 SSE with the framed terminal event as the completion boundary (WHATWG: an incomplete event at EOF is discarded). Tests in
 `test/upstream.test.ts` ("F1", "F2", "F4", "F7" describes) and `test/server.test.ts` (root-level F1/F2).
+
+## Slice 2b (Astra, 2026-10-04; pin 2, ADR-016)
+
+Discovery runs once per configured upstream. A valid 200 discover result selects modern framing. Only non-modern
+400/404/405 selects legacy; recognized modern errors (-32020/-32021/-32022) and 401/403 refuse downgrade. Startup
+network failures, timeouts and 5xx become `UpstreamUnavailable` for the composition root's retry policy. Diagnostics
+omit upstream text. The real client always supplies a frozen `eras` map (the interface field is optional, like
+`rejectedTools`, to preserve injected implementations).
+
+Legacy initializes with 2025-11-25, accepts 2025-06-18/2025-03-26, validates an optional visible-ASCII session header,
+and sends notifications/initialized. Subsequent requests carry the negotiated version and session, without modern
+headers/metadata. Legacy schemas' x-mcp-header annotations are validated and invalid tools enter `rejectedTools`, so
+they cannot prevent the front from starting; valid annotations are never mirrored into legacy request headers.
+This refines pin 2 per the coordinator's explicit P2-3 decision on 2026-10-04. Pagination and result validation stay shared.
+A session 404 triggers one shared reinitialization and one resend, even for concurrent callers. If reinitialization
+fails, the next call retries the shared handshake before sending work. A partially initialized session is deleted;
+sessionless upstreams continue without unnecessary handshakes. Server-to-client
+requests fail immediately. Shutdown aborts calls then best-effort DELETEs each session within 2 s; failed startup also
+cleans up sessions. No GET or deprecated HTTP+SSE negotiation is attempted.
+
+The CR SSE regression now dispatches on CR immediately, swallowing a following LF across chunks. Header annotation
+validation walks only schema keywords; default/example/examples/const/enum instance data cannot reject a valid tool.
+The SDK 1.x empty-data priming event (`id: x\ndata: \n\n`) is ignored before the terminal JSON-RPC response, with a
+dedicated legacy SSE regression (Fable review P3-4, 2026-10-04; existing behavior preserved).
+
+Primary sources [V], architect-verified 2026-10-04 in the binding pins:
+https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http (Backward Compatibility),
+https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle and
+https://modelcontextprotocol.io/specification/2025-11-25/basic/transports (initialization, sessions, 404 recovery).
+`test/upstream-dual-era.test.ts` uses a stubbed fetch and in-memory legacy/modern servers. Coordinator runs the existing
+loopback suite and the real SDK reference server. An on-path forced legacy downgrade remains the stated ADR-016 risk.
+
+Coordinator fix (2026-10-04): POST fetch, body reads and stream cancellation explicitly race the request AbortSignal,
+so the existing 30 s deadline also bounds non-cooperating injected transports/streams. A reflected 404/-32603 still
+selects legacy per pin 2; a silent initialize fails value-free as UpstreamUnavailable. The server regression fixture
+now explicitly refuses initialize instead of silently waiting beyond its 5 s test limit.

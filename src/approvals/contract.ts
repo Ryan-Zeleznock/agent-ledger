@@ -1,5 +1,7 @@
 import type { ApprovalChannel, ApprovalResult, PolicyDecision, ToolCall } from "../types/index.js";
-import { notImplemented } from "../types/not-implemented.js";
+import { requestApprovalImpl, validateSlackChannelImpl, getRouter } from "./slack.js";
+export { configureSlackApprovals, probeSlack, closeSlackApprovals, SLACK_API_BASE_URL, SLACK_PROXY_MAX_TIMEOUT_MS, SLACK_HTTP_TIMEOUT_MS } from "./slack.js";
+export type { SlackApprovalsConfig, WebSocketLike } from "./slack.js";
 
 export type { ApprovalChannel };
 /** The only channel that actually asks anyone: `hook-ask` is resolved inside the pipeline and never reaches this module. */
@@ -92,7 +94,7 @@ export interface SlackApprovalRouter {
   /** Number of approvals currently pending; the socket is open iff > 0. */
   readonly pendingCount: number;
 }
-export function getSlackApprovalRouter(channel: SlackChannel): SlackApprovalRouter { throw notImplemented("approvals.getSlackApprovalRouter"); }
+export function getSlackApprovalRouter(channel: SlackChannel): SlackApprovalRouter { return getRouter(channel); }
 
 /**
  * Posts the call to Slack and waits up to the EFFECTIVE wait: `channel.timeoutMs`, capped by `deadlineAt` when the
@@ -115,7 +117,7 @@ export function getSlackApprovalRouter(channel: SlackChannel): SlackApprovalRout
  * The result is bound to `call.callId` AND this request's nonce and message; a click can never be reused for another
  * call or another request for the same call. `timeout`, `unavailable`, `denied` all mean deny in the pipeline (spec §7).
  */
-export function requestApproval(call: ToolCall, decision: PolicyDecision, channel: SlackChannel, deadlineAt?: number): Promise<ApprovalResult> { throw notImplemented("approvals.requestApproval"); }
+export function requestApproval(call: ToolCall, decision: PolicyDecision, channel: SlackChannel, deadlineAt?: number): Promise<ApprovalResult> { return requestApprovalImpl(call, decision, channel, deadlineAt); }
 
 /**
  * Validates a Slack channel config at init (called by the handler and the proxy before any call is served). Problems
@@ -124,4 +126,4 @@ export function requestApproval(call: ToolCall, decision: PolicyDecision, channe
  * exactly `socket-mode`; `approvers` non-empty, each a Slack user id (`^[UW][A-Z0-9]{8,}$`); both secrets resolvable
  * through `secrets` (env var set, or file readable), value never returned.
  */
-export function validateSlackChannel(channel: SlackChannel): Promise<string[]> { throw notImplemented("approvals.validateSlackChannel"); }
+export function validateSlackChannel(channel: SlackChannel): Promise<string[]> { return validateSlackChannelImpl(channel); }

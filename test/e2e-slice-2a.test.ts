@@ -110,7 +110,7 @@ beforeAll(async () => {
   const demoListening = await demo.waitFor((e) => e["event"] === "listening");
   demoUrl = `http://127.0.0.1:${String(demoListening["port"])}/mcp`;
   write(join(configDir, "upstreams.yaml"), `version: 1\nupstreams:\n  - name: demo\n    transport: http\n    url: ${demoUrl}\n`);
-  serverEnv = { ...base, AGENT_LEDGER_CONFIG_DIR: configDir, AGENT_LEDGER_LEDGER_URL: PG_URL ?? pathToFileURL(ledgerPath).toString(), AGENT_LEDGER_PORT: "0", AGENT_LEDGER_BIND_HOST: "127.0.0.1", AGENT_LEDGER_ALLOWED_ORIGINS: "", AGENT_LEDGER_APPROVALS: "none" };
+  serverEnv = { ...base, AGENT_LEDGER_CONFIG_DIR: configDir, AGENT_LEDGER_LEDGER_URL: PG_URL ?? pathToFileURL(ledgerPath).toString(), AGENT_LEDGER_PORT: "0", AGENT_LEDGER_BIND_HOST: "127.0.0.1", AGENT_LEDGER_ALLOWED_ORIGINS: "", AGENT_LEDGER_APPROVALS: "none", AGENT_LEDGER_TLS: "off", AGENT_LEDGER_UPSTREAM_CONNECT_BUDGET_MS: "0" };
   cliEnv = { ...base, NODE_OPTIONS: `--title=${NODE_OPTIONS_CANARY}`, ...(process.env["PGPASSWORD"] ? { PGPASSWORD: process.env["PGPASSWORD"] } : {}) };
   proxy = await startProxy();
   // the seam probe: does the ledger under test accept channel "none" yet?
@@ -127,7 +127,7 @@ describe.sequential("Slice 2a demo path: proxy → policy → ledger → demo up
   it("1. GET /healthz is 200 before any auth; the proxy stderr shows the ledger head line, the upstream line and the listening line, and no key, token or URL", async () => {
     const r = await fetch(`http://127.0.0.1:${proxyPort}/healthz`);
     expect(r.status).toBe(200); expect(await r.json()).toEqual({ ok: true });
-    const ev = proxy.events();
+    const ev = proxy.events().filter((e) => !(e["event"] === "warning" && e["tls"] === "off")); // Slice 2b: AGENT_LEDGER_TLS=off warns first
     expect(ev.map((e) => e["event"])).toEqual(["ledger", "upstreams", "listening"]);
     expect(ev[0]).toMatchObject({ backend: PG_URL ? "postgres" : "jsonl", head: expect.stringMatching(/^(0|[0-9a-f]{64})$/) });
     expect(ev[1]).toMatchObject({ servers: ["demo"], tools: 5 });
@@ -217,9 +217,9 @@ describe.sequential("Slice 2a demo path: proxy → policy → ledger → demo up
     const evil = await post({ token: K, method: "server/discover", headers: { origin: "https://evil.example" } });
     expect(evil.status).toBe(403); expect(Object.hasOwn(evil.json as object, "id")).toBe(false);
     expect((await post({ token: K, method: "server/discover", httpMethod: "GET" })).status).toBe(405);
-    // F6: a legacy initialize (no headers) fails HTTP validation first (400 -32020, versioning matrix) and the error still names 2026-07-28; a modern-framed initialize is the unknown method (404 -32601)
+    // ADR-016: a headerless legacy initialize now negotiates a session; modern-framed initialize still receives 404 -32601.
     const init = await post({ token: K, method: "initialize", meta: false, params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "legacy", version: "1" } }, headers: { "mcp-protocol-version": null, "mcp-method": null } });
-    expect(init.status).toBe(400); expect(rpcErr(init)!.code).toBe(-32020); expect(rpcErr(init)!.message).toContain("2026-07-28"); expect(rpcErr(init)!.data).toEqual({ supported: ["2026-07-28"] });
+    expect(init.status).toBe(200); expect(init.headers.get("mcp-session-id")).toMatch(/^[\x21-\x7e]{1,256}$/); expect((init.json as { result: { protocolVersion: string } }).result.protocolVersion).toBe("2025-11-25");
     const initModern = await post({ token: K, method: "initialize" });
     expect(initModern.status).toBe(404); expect(rpcErr(initModern)!.code).toBe(-32601); expect(rpcErr(initModern)!.message).toContain("2026-07-28");
     const note = await post({ token: K, method: "notifications/initialized", notification: true });

@@ -1,15 +1,39 @@
 # approvals
-**Job:** Ask a human in Slack (Socket Mode, Block Kit buttons) and return the FINAL `ApprovalResult`; timeout and unavailable both count as deny
-**Depends on:** types (and, at init, `secrets` to resolve the two token references)
-**Does NOT:** decide what is risky, or handle `hook-ask` (that channel never reaches this module: the pipeline resolves it, to `ask` under Claude Code and to a recorded `no-channel` deny under Codex)
-**Spec:** docs/spec.md §4, 6, 7 · ADR-006
+Status: implemented
 
-`ApprovalChannel` is a union in `src/types/`: `{ kind: "slack", channelId, timeoutMs, transport: "socket-mode", botToken, appToken, approvers }` or `{ kind: "hook-ask" }`. It is required in `PipelineDeps`, so "no channel" is an explicit choice, never a missing field. Results: `approved` / `denied` from a human (with `approver` = Slack user id and a `reason`), `timeout` (no answer in `timeoutMs`), `unavailable` (configured but unreachable or erroring), `no-channel` (Codex + hook-ask: cannot ask, nothing configured), `delegated` (Claude Code hook-ask only). Only `approved` can turn into an allow, and only after the intent record carrying it has persisted.
+Asks a human in Slack and returns a final `ApprovalResult`. The pipeline supplies the stored, redacted `ToolCall`;
+only an approved result may permit execution. This module imports only shared types and its own implementation.
+Spec: §4, §6, §7; ADR-006 and accepted ADR-015; binding Slice 2b pin 1.
 
-**Why Socket Mode.** Verified 2026-09-29 (docs.slack.dev): Socket Mode delivers events and interactive payloads over a WebSocket the app opens with `apps.connections.open` (app-level `xapp-` token, scope `connections:write`), so no public Request URL is needed: it fits a homelab or a customer's private network. Limits: 10 concurrent connections per app; not listable in the Slack Marketplace (irrelevant for a private app). Each envelope is acknowledged by `envelope_id`. Messages use `chat.postMessage` (bot `xoxb-` token, `chat:write`) with an `actions` block of two buttons whose `value` and `block_id` carry the callId; the click arrives as `block_actions` with `user.id`; the message is closed out with `chat.update`.
+Configure optional transports once with `configureSlackApprovals` before validation or router creation. Production uses
+Slack's HTTPS API and Node's WebSocket; tests inject fetch, WebSocket, clock, randomness and secret readers. API calls
+have a 10 s deadline, reject redirects, and sanitize error codes. A rate-limited post retries once when Retry-After is
+at most 5 s and fits the approval wait. File secrets require a regular, owned, private file opened without following
+symlinks, bounded to 4 KiB. Tokens never appear in diagnostics or message text.
 
-**Anti-replay and identity.** A click counts only if `actions[0].value === call.callId`, `channel.id` matches, and `user.id` is in `approvers`. The approver stored in the ledger is the Slack user id, not a display name. The first valid click wins; later clicks are ignored and the message already shows the outcome.
+`probeSlack` checks bot identity, opens Socket Mode, waits for hello and closes. Requests share one process-wide router
+and channel configuration. Every envelope is acknowledged synchronously; only a single block action with matching
+app, team, callId, CSPRNG nonce, message timestamp, channel and allowed user can settle. Settlement is atomic; duplicate,
+competing and late clicks cannot revise it. Unauthorized users receive best-effort ephemeral feedback. The pending entry
+is removed and the message's actions are replaced with the outcome; an update failure does not change that outcome.
 
-**Timing.** A human needs minutes, not seconds, so under Codex + Slack the hook `timeout`, the watchdog deadline and `timeoutMs` are configured together and validated at init: `timeoutMs + APPROVAL_MIN_MARGIN_MS ≤ deadlineMs` and `deadlineMs + WATCHDOG_MIN_MARGIN_MS ≤ hookTimeoutS × 1000` (`hooks.validateHookTiming`; violation → init failure → watchdog deny + exit 2). Defaults: `SLACK_HOOK_TIMING` in `src/hooks/`.
+Socket refresh opens the replacement before retiring the old connection. An unexpected close retries after 1, 2 and 4 s;
+three failures or link_disabled settle remaining requests unavailable. The final settlement closes sockets. Shutdown is
+idempotent and returns unavailable for pending/new approvals. Waits are capped by the supplied absolute deadline minus
+5 s; server configuration is limited to 240 s. No pending approval is an allow.
 
-**`none` (ADR-012, Slice 2a).** `ApprovalChannel` also admits `{ kind: "none" }`: the proxy's explicit "nobody can approve" choice for server mode before Slack exists. It never reaches this module either: the pipeline resolves it in proxy mode to a RECORDED final deny (`decision: "no-channel"`, `channel: "none"`, `reason: PROXY_NO_CHANNEL_REASON`, written into the intent record, then a `blocked` outcome, then an `isError` result to the agent; upstream is never called). `none` with a `hookAgent` is refused at construction, so hook semantics are unchanged. `APPROVAL_CHANNEL_KINDS = ["slack", "hook-ask", "none"]` (`src/types/`) is the one enum the ledger validator reads `ApprovalResult.channel` against. The report already labels `no-channel` as `denied: no channel`. When Slack lands, operators switch `AGENT_LEDGER_APPROVALS` from `none` to `slack`; records written under `none` keep their meaning.
+Fable review fixes (2026-10-04): a failed secret read or auth.test clears the cached credential attempt, allowing the
+next request to retry with concurrent callers sharing that attempt. Socket Mode WSS URLs must use a `*.slack.com` host;
+the explicitly configured loopback WS test seam remains available. Late losing clicks receive best-effort feedback for
+30 s when a socket is available, using at most 1024 settled message bindings and outcomes. Expired entries are pruned
+on access; pending closures and call arguments are not retained in this cache. Shutdown clears it.
+
+Primary research [V], verified by the architect 2026-10-04 and supplied in `docs/slices/slice-2b-pins.md` §0:
+https://docs.slack.dev/apis/events-api/using-socket-mode/ (hello, envelopes, acknowledgement, refresh, payload distribution),
+https://docs.slack.dev/reference/interaction-payloads/block_actions-payload/ (user/team/app and message binding),
+https://docs.slack.dev/reference/methods/chat.postMessage/ and https://docs.slack.dev/reference/methods/apps.connections.open/.
+No network research or live Slack validation was possible in Astra's sandbox. Fake transport acceptance tests are in
+`test/approvals*.test.ts`; the coordinator owns live/loopback validation and cross-review.
+
+Residuals: server mode only; one dedicated Slack app and one proxy process (ADR-015). Decide-only hook Slack, display
+names, and cancellation when an agent disconnects are deferred to 2c. A message update may fail after a recorded decision.

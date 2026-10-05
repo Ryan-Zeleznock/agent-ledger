@@ -47,9 +47,9 @@ describe("Slack approval channel contract (ADR-006)", () => {
     const result: ApprovalResult = { callId: reply.callId, decision: "approved", approver: reply.userId, reason: "Approve", decidedAt: reply.receivedAt, channel: "slack" };
     expect(result.approver).toMatch(/^U/); // a Slack member id, never a display name
   });
-  it("the module exposes requestApproval, validateSlackChannel and the one-per-process router as stubs (ADR-002)", () => {
-    expect(() => approvals.requestApproval(undefined as never, undefined as never, channel)).toThrow(/^not implemented: approvals.requestApproval/);
-    expect(() => approvals.validateSlackChannel(channel)).toThrow(/^not implemented: approvals.validateSlackChannel/);
-    expect(() => approvals.getSlackApprovalRouter(channel)).toThrow(/^not implemented: approvals.getSlackApprovalRouter/);
+  it("the module exposes the frozen approval entry points", () => {
+    expect(approvals.requestApproval).toBeTypeOf("function");
+    expect(approvals.validateSlackChannel).toBeTypeOf("function");
+    expect(approvals.getSlackApprovalRouter).toBeTypeOf("function");
   });
 });

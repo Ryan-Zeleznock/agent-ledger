@@ -103,7 +103,7 @@ describe("upstream: connectUpstreams over Streamable HTTP 2026-07-28", () => {
     expect(b.seen.every((s) => s.headers.authorization === undefined)).toBe(true);
     expect((a.seen.at(-1)!.body["params"] as Record<string, unknown>)["arguments"]).toEqual({ message: "hi" });
     // the token is held in a closure: not on the object, not serialisable, not in any own property descriptor
-    expect(JSON.stringify(up)).toBe('{"rejectedTools":[]}'); expect(JSON.stringify(Object.getOwnPropertyDescriptors(up))).not.toContain(TOKEN_A);
+    expect(JSON.parse(JSON.stringify(up))).toEqual({ eras: { demo: "modern", open: "modern" }, rejectedTools: [] }); expect(JSON.stringify(Object.getOwnPropertyDescriptors(up))).not.toContain(TOKEN_A);
     expect(JSON.stringify(await up.listTools())).not.toContain(TOKEN_A);
     await up.close();
   });

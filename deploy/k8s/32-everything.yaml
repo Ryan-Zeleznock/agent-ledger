@@ -1,0 +1,84 @@
+# Slice 2b pins 7, 9, 10 (ADR-016): the first REAL third-party upstream, @modelcontextprotocol/server-everything
+# 2026.8.31 (SDK 1.x, legacy-era: initialize + Mcp-Session-Id), built from deploy/upstreams/everything (lockfile pinned by
+# sha512 integrity). It has no auth of its own: NetworkPolicy 25-everything (ingress only from the proxy, no egress) is its
+# boundary. Its `get-env` tool returns the process environment, so the Pod carries no Secret, no Service links and one
+# variable (PORT).
+apiVersion: v1
+kind: Service
+metadata:
+  name: everything
+  namespace: agent-ledger
+  labels:
+    app: everything
+spec:
+  selector:
+    app: everything
+  ports:
+    - name: tcp
+      port: 3001
+      targetPort: 3001
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: everything
+  namespace: agent-ledger
+  labels:
+    app: everything
+    component: runtime
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: everything
+  template:
+    metadata:
+      labels:
+        app: everything
+    spec:
+      serviceAccountName: everything
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: ghcr-pull
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: everything
+          # Kustomize `images` maps this placeholder to ghcr.io/ryan-zeleznock/agent-ledger:everything-2026.8.31@sha256:...
+          # (same repository as the proxy, so the Kyverno image and digest rules apply unchanged; HOMELAB step 4b).
+          image: agent-ledger-everything
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: PORT
+              value: "3001"
+          ports:
+            - containerPort: 3001
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          # server-everything has no health route; a TCP check on the MCP port is the readiness signal.
+          readinessProbe:
+            tcpSocket:
+              port: 3001
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 3001
+            initialDelaySeconds: 10
+            periodSeconds: 10
