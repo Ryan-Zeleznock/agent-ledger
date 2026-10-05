@@ -88,8 +88,7 @@ Tests: `test/report.test.ts`, plus the real-ledger/process export in `test/cli-p
 
 The six ordered sections are Executive summary, CC6.1 logical access, CC7.2 monitoring,
 CC8.1 change management, Record evidence and Vocabulary. Tables are semantic HTML with column
-headers and grayscale print styles; PDF has the same titles/order. Existing record blocks retain
-all their fields. CSV retains its original 25 columns, then appends `agent_session_id`,
+headers and grayscale print styles; PDF has the same titles/order. Expandable record details retain all non-empty fields; the compact index lists every record. CSV retains its original 25 columns, then appends `agent_session_id`,
 `evidence_class`, `anchor_status` in that order. Missing session ids display as
 "pre-1c, no agent session id"; missing anchor context displays "not supplied" in CSV.
 
@@ -150,3 +149,22 @@ CLI and merged e2e seams require coordinator integration and independent review.
 
 Regression tests: `test/report-slice-1c.test.ts`, `test/report-pdf.test.ts`. Fable's full review
 is retained at `docs/reviews/2026-10-03-fable-slice-1c-pack-review.md`; fixes need his scoped verification.
+
+## Auditor layout (2026-10-04 design audit)
+
+HTML leads with chain/anchor/findings status expressed in text as well as color, followed by
+a definition grid and the unchanged trust-boundary callout. Contents links retain all six pin-8
+section IDs and include record/check counts. Monitoring lists every anomaly check even at zero,
+and emits detail tables only for populated checks. Heartbeat counts remain explicit.
+
+Charter/Iowan/Cambria/Georgia are offline prose fonts chosen for long-form reading; system sans
+labels and tables distinguish navigation from evidence. Prose is limited to 72ch inside a 1180px
+page. Only IDs/hashes use monospace; time/count columns use tabular numerals. Table timestamps
+are normalized to UTC with dates in captions and full source timestamps in titles. Multi-date
+tables retain each row's date. Full IDs/hashes remain in titles and record details. Grayscale
+print rules preserve text statuses, repeat table headers, and expose details in browsers supporting
+`::details-content`; browser print behavior requires coordinator visual verification. No remote assets.
+
+The redesign request explicitly supersedes pin 8's original raw-block presentation; fields,
+verbatim caveats, classifications, CSV bytes and section order are preserved. The CSV regression
+fingerprint was captured before changing the renderer, including hostile strings and HMAC data.

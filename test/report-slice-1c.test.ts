@@ -67,7 +67,7 @@ it("finds exactly the session without a heartbeat, never a pre-1c record; heartb
   const p = await pack([heartbeat(1, "healthy"), rec(2, "healthy"), rec(3, "missing-session"), rec(4, "missing-session"), rec(5)]);
   const monitoring = section(p.html, "cc7-2");
   expect(monitoring).toContain("Sessions without heartbeat (1)");
-  expect(monitoring).toMatch(/missing-session<\/td><td>rec-3<\/td><td>2/);
+  expect(monitoring).toMatch(/title="missing-session">missing-session<\/code><\/td><td><code title="rec-3">rec-3<\/code><\/td><td class="number">2/);
   expect(p.html).toContain("pre-1c, no agent session id");
   expect(section(p.html, "cc6-1")).not.toContain("SessionStart");
   expect(section(p.html, "cc8-1")).not.toContain("SessionStart");
@@ -132,7 +132,7 @@ it.each(["policy", "denied", "timeout", "unavailable", "no-channel"] as const)("
   expect(section(p.html, "cc8-1")).toContain(">executed despite deny</td>");
   for (const id of [r.id, outcome.id]) {
     expect(section(p.html, "summary")).toContain(`executed despite deny: ${id};`);
-    expect(section(p.html, "cc7-2")).toContain(`<td>${id}</td>`);
+    expect(section(p.html, "cc7-2")).toContain(`<code title="${id}">${id}</code>`);
   }
   expect(section(p.html, "cc7-2")).toContain("executed despite deny");
   expect(p.csv.split("\r\n")[1]).toContain('"executed despite deny"');
@@ -145,7 +145,7 @@ it("review #1: prior-range deny still flags every in-range execution outcome", a
   const outcome = { ...result(r, "ok"), writtenAt: range.from };
   const p = await pack([r, outcome]);
   expect(section(p.html, "summary")).toContain(`executed despite deny: ${outcome.id};`);
-  expect(section(p.html, "cc7-2")).toContain(`<td>${outcome.id}</td>`);
+  expect(section(p.html, "cc7-2")).toContain(`<code title="${outcome.id}">${outcome.id}</code>`);
 });
 it.each([false, true])("review #2: handoff outcome uses its preceding intent (proxy present: %s)", async withProxy => {
   const h = rec(202); h.handoff = { kind: "to-proxy", proxyServerName: "agentledger_proxy_1234" };
@@ -180,4 +180,52 @@ it.each(["tool", "server", "rule"] as const)("review #7: heartbeat %s mismatch s
   expect(section(p.html, "summary")).toContain(`heartbeat discriminator mismatch: ${h.id};`);
   expect(section(p.html, "cc7-2")).toContain("heartbeat discriminator mismatch");
   expect(p.csv.split("\r\n")[1]).toContain("heartbeat discriminator mismatch");
+});
+
+it("design: status comes before definition facts, with contents, labeled downloads and an offline print layout", async () => {
+  const p = await pack([rec(1)]);
+  const summary = section(p.html, "summary");
+  expect(summary).toContain('class="status-band"');
+  expect(summary.indexOf('class="status-band"')).toBeLessThan(summary.indexOf('<dl class="facts">'));
+  expect(summary).toContain('class="trust-boundary"');
+  expect(summary).toContain(`title="${rec(1).hash}"`);
+  expect(p.html).toContain('aria-label="Contents"');
+  for (const id of ["summary", "cc6-1", "cc7-2", "cc8-1", "records", "legend"]) expect(p.html).toContain(`href="#${id}"`);
+  expect(p.html).toContain('href="report.pdf" download>Download PDF');
+  expect(p.html).toContain('href="records.csv" download>Download CSV');
+  expect(p.html).toContain("font-variant-numeric:tabular-nums");
+  expect(p.html).toContain("@media print");
+  expect(p.html).not.toMatch(/<(script|link)\b/);
+});
+it("design: compact record table and non-empty details retain full evidence and escape attribute values", async () => {
+  const r = rec(1); r.call.args = {}; r.call.declaredPlan = ''; r.call.onBehalfOf = '\"><script>hostile</script>';
+  const p = await pack([r]); const s = section(p.html, "records");
+  expect(s.match(/<table>/g)).toHaveLength(1);
+  for (const title of ["Time", "Phase", "Tool", "Decision", "Evidence class", "Criteria"]) expect(s).toContain(`>${title}</th>`);
+  expect(s.match(/<details\b/g)).toHaveLength(1);
+  const details = s.split('<details')[1]!;
+  for (const absent of ["approval", "outcome", "handoff", "parent_record_id", "declared_plan", "arguments_labeled"]) expect(details).not.toContain(`<dt>${absent}</dt>`);
+  for (const present of ["record_id", "hash", "received_at", "on_behalf_of"]) expect(details).toContain(`<dt>${present}</dt>`);
+  expect(details).toContain(r.hash);
+  expect(s).toContain('&quot;&gt;&lt;script&gt;hostile&lt;/script&gt;');
+  expect(s).not.toContain('<script>');
+  expect(s).toMatch(/<caption>[^<]*2026-09-30/);
+  expect(s).toContain('class="time"');
+});
+it("design: monitoring check list reports zero checks without empty detail tables", async () => {
+  const p = await pack([]); const s = section(p.html, "cc7-2");
+  expect(s).toContain('class="anomaly-checks"');
+  expect(s).toContain("Sessions without heartbeat (0)");
+  expect(s).toContain("OK");
+  expect(s).not.toContain('<table>');
+  const flagged = section((await pack([rec(1, "missing")])).html, "cc7-2");
+  expect(flagged).toContain("FLAG");
+  expect(flagged).toContain('<table>');
+});
+it("design: CSV bytes remain frozen across presentation changes", async () => {
+  const { createHash } = await import('node:crypto');
+  const r = rec(2, '=hostile<script>'); approve(r, 'delegated', 'hook-ask');
+  r.call.args = { digest: `hmac-sha256:${'a'.repeat(64)}`, clear: '"x",é\n=SUM(A1)' };
+  const p = await pack([heartbeat(1, 'healthy'), r, result(r, 'ok')], { anchor: { status: 'head', latest: { hash: r.hash, at: range.from } } });
+  expect(createHash('sha256').update(p.csv).digest('hex')).toBe('14a75575c75df78c86ff72a6945ee767381172dfc008d344bbd97300ad47c206');
 });
