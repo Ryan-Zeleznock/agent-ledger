@@ -177,3 +177,15 @@ fixed failure line. `hook`, `init` and `install-hooks` refuse `--ledger` (strict
 codes are unchanged. `test/cli.test.ts` "--ledger" covers parsing, the refusal rows and the no-URL output with a fake
 `createLedger` injected through `CliDeps`; `test/e2e-slice-2a.test.ts` step 10 runs the real binary (`--ledger` form when
 `AGENT_LEDGER_E2E_LEDGER` is set, jsonl form otherwise).
+
+
+Runtime policy (C10, 2026-10-05): Node.js **24 or newer** is required (`package.json` engines).
+Use a maintained Node release with current security patches; older runtimes are unsupported.
+This round was exercised locally on Node 25.8.2; the coordinator runs the Node 24 deployment checks.
+
+ADR-018 (C2/C3): `anchor` checks that the latest non-genesis checkpoint is the verified head or an
+ancestor before writing. A missing checkpoint in a valid truncated chain returns exit 1 with
+`anchor-mismatch`, preserves the anchor file and leaves subsequent `verify` failing. An empty ledger
+still refuses anchoring. `report` writes its diagnostic HTML/PDF/CSV pack on an anchor mismatch but
+returns exit 1. Missing anchors retain their existing report behavior. Test: `C2/C3: truncation remains
+a mismatch after refused re-anchor and writes a failing diagnostic pack` (`test/cli.test.ts`).

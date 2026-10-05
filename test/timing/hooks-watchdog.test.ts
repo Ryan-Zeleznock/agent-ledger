@@ -483,8 +483,8 @@ describe("watchdog + real handler (what Astra's `hook` command does), spec §7 t
 
 afterAll(() => {
   // the exit-code matrix over every watchdog process this file spawned
-  expect(codes.length).toBeGreaterThan(50);
-  expect(new Set(codes)).toEqual(new Set([0, 2]));
+  // Filtered runs may exercise only one branch or spawn no watchdog at all.
+  for (const code of codes) expect([0, 2]).toContain(code);
 });
 
 

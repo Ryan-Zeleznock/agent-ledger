@@ -317,3 +317,19 @@ Primary-source diligence, 2026-10-03:
 ADR-015 amendment (2026-10-05): optional `approval.approverName` is a normal bounded string in both append projection and strict read. Existing records remain valid; the additive field is covered by the record hash. Tests: `ADR-015 optional approverName` and `round-trips and hashes optional approverName alongside older approvals`.
 
 Release compatibility (fixes-2b, ADR-015): older CLIs reject records containing `approval.approverName` as an unknown field during strict read/verification. Upgrade auditor/read-only CLIs to fixes-2b or later before reading ledgers written with names; the new CLI continues to accept older records without names.
+
+
+Security round C6–C8 (2026-10-05): JSONL reads decode UTF-8 fatally, preserving BOM bytes for canonical
+validation; invalid byte sequences cannot impersonate hashed U+FFFD characters. Each operation opens
+with `O_NOFOLLOW | O_NONBLOCK`, rejects non-regular files with `fstat`, and uses that descriptor for
+its checks and reads/writes. New ledgers use exclusive creation and mode 0600. Ancestor-directory
+ownership remains part of the local trust boundary; these checks protect the final data pathname.
+
+Stored lines are capped at 8 MiB before parsing, including tail reads and incremental ID scans.
+Argument validation caps structure at 100,000 JSON nodes, includes keys in the 4 MiB aggregate
+character budget even for numeric/null values, and caps individual keys at 256 KiB like strings.
+The ID index remains proportional to ledger history; refreshes read bounded chunks rather than
+allocating the entire appended suffix. File replacement/shrink resets that index. Shared stored-line
+validation also applies the byte cap to Postgres rows. Older oversized evidence is rejected explicitly,
+never silently skipped; retain the original files for recovery. Tests: `test/core-security.test.ts`,
+`test/ledger-jsonl.test.ts`, and the existing multi-process suite. Postgres needs coordinator validation.

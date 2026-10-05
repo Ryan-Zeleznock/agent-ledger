@@ -17,6 +17,8 @@ export class ValidationError extends Error {
 const fail = (field: string, what: string): never => { throw new ValidationError(`ledger: ${field} ${what}`); };
 
 // ---------- limits ----------
+export const MAX_JSON_NODES = 100_000;
+export const MAX_LEDGER_LINE_BYTES = 8 * 1024 * 1024;
 export const MAX_DEPTH = 64;                       // nesting levels inside args
 export const MAX_STRING_CHARS = 256 * 1024;        // one string value
 export const MAX_TOTAL_CHARS = 4 * 1024 * 1024;    // all string content in one record
@@ -70,7 +72,7 @@ const isPlainObject = (v: unknown): v is Record<string, unknown> => {
 };
 const isPlainArray = (v: unknown): v is unknown[] => Array.isArray(v) && Object.getPrototypeOf(v) === Array.prototype;
 
-interface Budget { chars: number; }
+interface Budget { chars: number; nodes: number; }
 /**
  * Returns a plain deep COPY of `v`, accepting exactly what JSON.parse can produce: null, finite numbers, well-formed
  * strings, booleans, dense plain arrays and plain objects (prototype Object.prototype or null) whose properties are
@@ -79,7 +81,8 @@ interface Budget { chars: number; }
  * bigint, undefined, accessors, holes, class instances (Date, Map, ...) and own `toJSON` functions. Enforces depth and
  * size limits before any expensive processing. Callers use the snapshot, never the original.
  */
-export function snapshotJsonData(v: unknown, field: string, depth = 0, budget: Budget = { chars: 0 }): unknown {
+export function snapshotJsonData(v: unknown, field: string, depth = 0, budget: Budget = { chars: 0, nodes: 0 }): unknown {
+  if (++budget.nodes > MAX_JSON_NODES) fail(field, "exceeds JSON structure limit");
   if (depth > MAX_DEPTH) fail(field, `is nested deeper than ${MAX_DEPTH} levels`);
   switch (typeof v) {
     case "string":
@@ -95,6 +98,7 @@ export function snapshotJsonData(v: unknown, field: string, depth = 0, budget: B
       if (types.isProxy(v)) fail(field, "is a Proxy, not data");
       if (isPlainArray(v)) {
         const len = v.length;
+        if (len > MAX_JSON_NODES - budget.nodes) fail(field, "exceeds JSON structure limit");
         if (Object.keys(v).length !== len) fail(field, "is a sparse array or carries extra properties");
         const out: unknown[] = new Array(len);
         for (let i = 0; i < len; i++) {
@@ -112,7 +116,9 @@ export function snapshotJsonData(v: unknown, field: string, depth = 0, budget: B
         if (!("value" in desc)) fail(`${field}.${key}`, "is an accessor property, not data");
         if (desc.value === undefined) fail(`${field}.${key}`, "is undefined");
         if (!wellFormed(key)) fail(`${field}.${key}`, "has a key with a lone surrogate");
+        if (key.length > MAX_STRING_CHARS) fail(field, "key exceeds string size limit");
         budget.chars += key.length;
+        if (budget.chars > MAX_TOTAL_CHARS) fail(field, "keys exceed total character limit");
         const value = snapshotJsonData(desc.value, `${field}.${key}`, depth + 1, budget);
         Object.defineProperty(out, key, { value, enumerable: true, writable: true, configurable: true }); // `__proto__` stays data
       }

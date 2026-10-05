@@ -57,3 +57,10 @@ Due diligence, checked 2026-09-30:
 - [H] Provisioned API keys have high entropy. A SHA-256 digest is not password hardening;
   `local` credentials may simply identify a configured local principal. This file is trusted
   configuration for local visibility/best-effort gating, not proof against the machine's owner.
+
+
+Security round C8 (2026-10-05): the shared config reader limits files to 1 MiB, including growth
+after the descriptor's size check, decodes UTF-8 fatally, and rejects symlinks and non-regular files.
+YAML is limited to 100,000 AST nodes and 64 levels before conversion; aliases are refused to prevent
+expansion/cycles. Existing owner/mode checks still use the descriptor being read. Oversized historical
+configuration now fails explicitly. Tests: `test/config-hardening.test.ts`, `test/core-security.test.ts`.

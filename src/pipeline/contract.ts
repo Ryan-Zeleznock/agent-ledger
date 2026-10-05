@@ -3,8 +3,10 @@ import { APPROVAL_CHANNEL_KINDS, BUILTIN_SERVERS, BUILTIN_SERVER_KEYS, CODEX_MCP
 import type { IdentityService } from "../identity/contract.js";
 import type { ToolRegistry } from "../policy/contract.js";
 import { clearArgFields, evaluate } from "../policy/contract.js";
+import { redactArgs, redactString } from "../ledger/redact.js";
+import { snapshotJsonData } from "../ledger/validate.js";
 import type { LedgerStore } from "../ledger/contract.js";
-import type { Upstream } from "../upstream/contract.js";
+import { UpstreamError, type Upstream } from "../upstream/contract.js";
 import { requestApproval, validateSlackChannel } from "../approvals/contract.js";
 import { APPROVAL_MIN_MARGIN_MS, MAX_REASON_CHARS, WATCHDOG_DEADLINE_AT_ENV, WATCHDOG_DEADLINE_ENV, WATCHDOG_MIN_MARGIN_MS, validateHookTiming } from "../hooks/contract.js";
 import { createHmac, randomUUID } from "node:crypto";
@@ -129,7 +131,6 @@ export function projectArgs(args: Record<string, unknown>, clear: readonly strin
 
 // ---------- helpers ----------
 
-const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const now = () => new Date().toISOString();
 const isBuiltinKey = (server: string) => (BUILTIN_SERVER_KEYS as readonly string[]).includes(server);
 const clip = (s: string) => (s.length > MAX_REASON_CHARS ? `${s.slice(0, MAX_REASON_CHARS - 1)}…` : s);
@@ -213,22 +214,21 @@ export function createPipeline(deps: PipelineDeps): Pipeline {
   // and a `pre` whose clocks are wrong can only produce a deny line (under the watchdog: `handler-deny`, exit 2).
   // `createPipeline` is synchronous and the Slack validator is not: it starts here and its verdict gates every call.
   const slackProblems: Promise<string[]> = approvals.kind === "slack"
-    ? Promise.resolve().then(() => validateSlackChannel(approvals)).catch((e: unknown) => [`validateSlackChannel failed: ${message(e)}`])
+    ? Promise.resolve().then(() => validateSlackChannel(approvals)).catch(() => ["validateSlackChannel failed"])
     : Promise.resolve([]);
 
-  /** callId → what the intent record said, for outcome records in the same process (proxy mode); the ledger is the fallback. */
-  const intents = new Map<string, { call: ToolCall; policy: PolicyDecision }>();
+  // Proxy outcomes already carry their intent; hook outcomes read persisted evidence. No retained intent cache.
 
-  const deny = (callId: string, reason: string): HookDecision => ({ decision: "deny", reason: clip(reason), callId, kind: "decided" });
-  const appendIntent = async (record: UnsealedRecord): Promise<{ ok: true } | { ok: false; error: string }> => {
-    try { await ledger.append(record); intents.set(record.call.callId, { call: record.call, policy: record.policy }); return { ok: true }; }
-    catch (e) { return { ok: false, error: message(e) }; }
+  const deny = (callId: string, reason: string): HookDecision => ({ decision: "deny", reason: clip(redactString(reason)), callId, kind: "decided" });
+  const appendIntent = async (record: UnsealedRecord): Promise<{ ok: true } | { ok: false }> => {
+    try { await ledger.append(record); return { ok: true }; }
+    catch { return { ok: false }; }
   };
   /** Best effort: a blocked outcome after a deny. Its failure changes nothing (the answer is already deny). */
   const appendBlocked = async (call: ToolCall, policy: PolicyDecision) => {
     try { await ledger.append(outcomeRecord(call, policy, { status: "blocked" })); } catch { /* deny stands */ }
   };
-  const ledgerDenied = (callId: string, error: string) => deny(callId, `agent-ledger: denied: ledger unavailable (${error}); fail closed (spec §7)`);
+  const ledgerDenied = (callId: string) => deny(callId, "agent-ledger: denied: ledger unavailable; fail closed (spec §7)");
   /**
    * ADR-011, decide-only mode: the watchdog's absolute deadline (`AGENT_LEDGER_WATCHDOG_DEADLINE_AT_MS`) is read on EVERY
    * call, before any registry lookup or append; absent, non-integer or already past → deny. With a Slack channel the
@@ -261,19 +261,23 @@ export function createPipeline(deps: PipelineDeps): Pipeline {
 
     let agentId: string;
     try { agentId = await identity.resolveAgent(incoming.credential); }
-    catch (e) { return { decision: deny(callId, `agent-ledger: denied: unknown agent (${message(e)})`) }; }
+    catch { return { decision: deny(callId, "agent-ledger: denied: unknown agent") }; }
     let sessionId: string;
     try { sessionId = await identity.startSession(agentId, incoming.onBehalfOf); }
-    catch (e) { return { decision: deny(callId, `agent-ledger: denied: session refused (${message(e)})`) }; }
+    catch { return { decision: deny(callId, "agent-ledger: denied: session refused") }; }
 
     // Policy and upstream see the RAW args; the ledger sees the projection (ADR-009). Under Codex an mcp__ server segment
     // is not an identity (ADR-006), so a registry row's allowlist is never consulted for it: the routing decision comes
     // first and every Codex MCP hook argument is hashed, handoffs and denials alike (Astra P1 #2, 2026-09-30).
     const codexMcp = hookAgent === "codex" && !isBuiltinKey(incoming.server);
-    const rawCall = toolCall(incoming, sessionId, agentId, JSON.parse(JSON.stringify(incoming.args)) as Record<string, unknown>);
+    let rawCall: ToolCall;
     let call: ToolCall;
-    try { call = toolCall(incoming, sessionId, agentId, projectArgs(incoming.args, codexMcp ? [] : clearArgFields(registry, incoming.server, incoming.tool), hmacKey)); }
-    catch (e) { return { decision: deny(callId, `agent-ledger: denied: arguments cannot be recorded (${message(e)})`) }; }
+    try {
+      const snapshot = snapshotJsonData(incoming.args, "args") as Record<string, unknown>;
+      rawCall = toolCall(incoming, sessionId, agentId, snapshot);
+      const projected = projectArgs(snapshot, codexMcp ? [] : clearArgFields(registry, incoming.server, incoming.tool), hmacKey);
+      call = toolCall(incoming, sessionId, agentId, redactArgs(projected));
+    } catch { return { decision: deny(callId, "agent-ledger: denied: arguments cannot be recorded") }; }
     const done = (decision: HookDecision, policy: PolicyDecision): Decided => ({ decision, exec: rawCall, stored: call, policy });
 
     if (codexMcp) {
@@ -282,12 +286,12 @@ export function createPipeline(deps: PipelineDeps): Pipeline {
         const policy: PolicyDecision = { verdict: "allow", risk: "unreviewed", ruleId: `${HANDOFF_TO_PROXY_RULE_PREFIX}${proxyName}`, reason: HANDOFF_TO_PROXY_REASON };
         const record: UnsealedRecord = { ...intentRecord(call, policy), handoff: { kind: "to-proxy", proxyServerName: proxyName } };
         const r = await appendIntent(record);
-        if (!r.ok) return done(ledgerDenied(callId, r.error), policy);
+        if (!r.ok) return done(ledgerDenied(callId), policy);
         return done({ decision: "allow", reason: HANDOFF_TO_PROXY_REASON, callId, kind: "governed-by-proxy" }, policy);
       }
       const policy: PolicyDecision = { verdict: "deny", risk: "unreviewed", ruleId: `codex-mcp-not-proxied:${call.server}/${call.tool}`, reason: CODEX_MCP_NOT_PROXIED_REASON };
       const r = await appendIntent(intentRecord(call, policy));
-      if (!r.ok) return done(ledgerDenied(callId, r.error), policy);
+      if (!r.ok) return done(ledgerDenied(callId), policy);
       await appendBlocked(call, policy);
       return done(deny(callId, `agent-ledger: denied (${policy.ruleId}): ${CODEX_MCP_NOT_PROXIED_REASON}`), policy);
     }
@@ -296,12 +300,12 @@ export function createPipeline(deps: PipelineDeps): Pipeline {
     const tag = `${policy.risk}; ${policy.ruleId}`;
     if (policy.verdict === "allow") {
       const r = await appendIntent(intentRecord(call, policy));
-      if (!r.ok) return done(ledgerDenied(callId, r.error), policy);
-      return done({ decision: "allow", reason: clip(`agent-ledger: allowed (${tag}): ${policy.reason}`), callId, kind: "decided" }, policy);
+      if (!r.ok) return done(ledgerDenied(callId), policy);
+      return done({ decision: "allow", reason: clip(redactString(`agent-ledger: allowed (${tag}): ${policy.reason}`)), callId, kind: "decided" }, policy);
     }
     if (policy.verdict === "deny") {
       const r = await appendIntent(intentRecord(call, policy));
-      if (!r.ok) return done(ledgerDenied(callId, r.error), policy);
+      if (!r.ok) return done(ledgerDenied(callId), policy);
       await appendBlocked(call, policy);
       return done(deny(callId, `agent-ledger: denied (${tag}): ${policy.reason}`), policy);
     }
@@ -310,12 +314,12 @@ export function createPipeline(deps: PipelineDeps): Pipeline {
       if (hookAgent === "claude-code") {
         const approval: ApprovalResult = { callId, decision: "delegated", reason: DELEGATED_REASON, decidedAt: now(), channel: "hook-ask" };
         const r = await appendIntent(intentRecord(call, policy, approval));
-        if (!r.ok) return done(ledgerDenied(callId, r.error), policy);
-        return done({ decision: "ask", reason: clip(`agent-ledger: approval required (${tag}): ${policy.reason}`), callId, kind: "decided" }, policy);
+        if (!r.ok) return done(ledgerDenied(callId), policy);
+        return done({ decision: "ask", reason: clip(redactString(`agent-ledger: approval required (${tag}): ${policy.reason}`)), callId, kind: "decided" }, policy);
       }
       const approval: ApprovalResult = { callId, decision: "no-channel", reason: CODEX_NO_CHANNEL_REASON, decidedAt: now(), channel: "hook-ask" };
       const r = await appendIntent(intentRecord(call, policy, approval));
-      if (!r.ok) return done(ledgerDenied(callId, r.error), policy);
+      if (!r.ok) return done(ledgerDenied(callId), policy);
       await appendBlocked(call, policy);
       return done(deny(callId, `agent-ledger: denied (${tag}): ${CODEX_NO_CHANNEL_REASON}`), policy);
     }
@@ -324,7 +328,7 @@ export function createPipeline(deps: PipelineDeps): Pipeline {
     if (approvals.kind === "none") {
       const approval: ApprovalResult = { callId, decision: "no-channel", reason: PROXY_NO_CHANNEL_REASON, decidedAt: now(), channel: "none" };
       const r = await appendIntent(intentRecord(call, policy, approval));
-      if (!r.ok) return done(ledgerDenied(callId, r.error), policy);
+      if (!r.ok) return done(ledgerDenied(callId), policy);
       await appendBlocked(call, policy);
       return done(deny(callId, `agent-ledger: denied (${tag}): ${PROXY_NO_CHANNEL_REASON}`), policy);
     }
@@ -332,34 +336,36 @@ export function createPipeline(deps: PipelineDeps): Pipeline {
     try {
       approval = await requestApproval(call, policy, approvals, deadlineAt);
       if (!approval || approval.callId !== callId || approval.channel !== "slack") throw new Error("approval result is not bound to this call");
-    } catch (e) {
-      approval = { callId, decision: "unavailable", reason: `Slack unreachable: ${message(e)}`, decidedAt: now(), channel: "slack" };
+    } catch {
+      approval = { callId, decision: "unavailable", reason: "Slack unreachable", decidedAt: now(), channel: "slack" };
     }
     const r = await appendIntent(intentRecord(call, policy, approval));
-    if (!r.ok) return done(ledgerDenied(callId, r.error), policy);
+    if (!r.ok) return done(ledgerDenied(callId), policy);
     if (approval.decision === "approved") {
-      return done({ decision: "allow", reason: clip(`agent-ledger: approved by ${approval.approver ?? "?"} (${tag}): ${approval.reason ?? ""}`), callId, kind: "decided" }, policy);
+      return done({ decision: "allow", reason: clip(redactString(`agent-ledger: approved by ${approval.approver ?? "?"} (${tag}): ${approval.reason ?? ""}`)), callId, kind: "decided" }, policy);
     }
     await appendBlocked(call, policy);
     return done(deny(callId, `agent-ledger: denied (approval ${approval.decision}; ${tag}): ${approval.reason ?? ""}`), policy);
   }
 
   /**
-   * The intent this outcome belongs to: same process first, then the ledger. One callId can carry TWO intents in a
+   * The intent this outcome belongs to is read from persisted evidence. One callId can carry TWO intents in a
    * combined ledger (the Codex hook's `handoff-to-proxy` record and the proxy's own record), so the hook (hookAgent
-   * set) prefers the handoff intent and the proxy (no hookAgent) prefers a non-handoff intent; the last matching record
-   * wins within each preference (Astra P2 #5, 2026-09-30).
+   * set) prefers the handoff intent and the proxy (no hookAgent) prefers a non-handoff intent. Multiple candidates
+   * within that preference are ambiguous: the frozen API supplies no caller/session, so retain an orphan (C5).
    */
   async function findIntent(callId: string): Promise<{ call: ToolCall; policy: PolicyDecision } | undefined> {
-    const cached = intents.get(callId);
-    if (cached) return cached;
     let handoff: LedgerRecord | undefined;
     let plain: LedgerRecord | undefined;
+    let handoffCount = 0, plainCount = 0;
     for await (const rec of ledger.read({ from: "1970-01-01T00:00:00.000Z", to: new Date(Date.now() + 86_400_000).toISOString() })) {
       if (rec.phase !== "intent" || rec.call.callId !== callId) continue;
-      if (rec.handoff !== undefined) handoff = rec; else plain = rec;
+      if (rec.handoff !== undefined) { handoff = rec; handoffCount++; }
+      else { plain = rec; plainCount++; }
     }
-    const found = decideOnly ? (handoff ?? plain) : (plain ?? handoff);
+    const preferHandoff = decideOnly ? handoffCount > 0 : plainCount === 0;
+    if ((preferHandoff ? handoffCount : plainCount) !== 1) return undefined;
+    const found = preferHandoff ? handoff : plain;
     return found ? { call: found.call, policy: found.policy } : undefined;
   }
 
@@ -407,7 +413,10 @@ export function createPipeline(deps: PipelineDeps): Pipeline {
       try { result = await upstream.execute(d.exec); } // the RAW authenticated call, never the storage projection
       catch (e) {
         try { await ledger.append(outcomeRecord(d.stored, d.policy, { status: "error", errorClass: e instanceof Error ? e.name : "upstream-error", durationMs: Date.now() - started })); } catch { /* the error result is returned regardless */ }
-        return { content: [{ type: "text", text: `agent-ledger: upstream failed: ${message(e)}` }], isError: true };
+        // UpstreamError carries the reviewed, value-free transport diagnostic (Slice 2a F1).
+        // Other exceptions have no such contract; matching the error's name is insufficient.
+        const text = e instanceof UpstreamError ? `agent-ledger: upstream failed: ${e.message}` : "agent-ledger: upstream failed";
+        return { content: [{ type: "text", text }], isError: true };
       }
       const outcome: Outcome = { status: result?.isError ? "error" : "ok", durationMs: Date.now() - started };
       if (outcome.status === "error") outcome.errorClass = "tool-error";

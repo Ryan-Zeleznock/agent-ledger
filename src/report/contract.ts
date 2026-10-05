@@ -1,3 +1,4 @@
+import { evidenceBudget } from "./limits.js";
 import type { DateRange } from "../types/index.js";
 import type { LedgerStore } from "../ledger/contract.js";
 import { checkedRange, findHandoffs, renderReport, HANDOFF_RECONCILE_GRACE_MS } from "./render.js";
@@ -19,6 +20,7 @@ export { HANDOFF_RECONCILE_GRACE_MS } from "./render.js";
 export async function reconcileHandoffs(ledger: LedgerStore, range: DateRange, graceMs = HANDOFF_RECONCILE_GRACE_MS): Promise<UnreconciledHandoff[]> {
   const { extended } = checkedRange(range, graceMs);
   const records = [];
-  for await (const record of ledger.read({ from: range.from, to: extended })) records.push(record);
+  const checkEvidence = evidenceBudget();
+  for await (const record of ledger.read({ from: range.from, to: extended })) { checkEvidence(record); records.push(record); }
   return findHandoffs(records, range);
 }

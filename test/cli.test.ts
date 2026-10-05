@@ -212,7 +212,7 @@ describe("anchor", () => {
   const HEAD = "b".repeat(64);
   const fakes = (o: { heads?: string[]; ok?: boolean; latest?: { hash: string; at: string } | null; torn?: boolean } = {}) => {
     const heads = [...(o.heads ?? [HEAD])];
-    const ledger: LedgerStore = { append: vi.fn(), verify: vi.fn(async () => ({ ok: o.ok ?? true, checked: 3 })), head: vi.fn(async () => heads.length > 1 ? heads.shift()! : heads[0]!), async *read() {} };
+    const ledger: LedgerStore = { append: vi.fn(), verify: vi.fn(async () => ({ ok: o.ok ?? true, checked: 3 })), head: vi.fn(async () => heads.length > 1 ? heads.shift()! : heads[0]!), async *read() { if (o.latest) yield { hash: o.latest.hash } as never; } };
     const write = vi.fn(async () => {});
     const latest = vi.fn(async () => { if (o.torn) throw new Error("anchor: torn tail secret-canary"); return o.latest ?? null; });
     return { ledger, write, latest, createLedger: () => ledger, createAnchor: vi.fn((_k: "file" | "s3", _t: string) => ({ latest, write })) };
@@ -279,7 +279,7 @@ it.each(["head", "ancestor", "mismatch", "untrusted"])("report context carries a
   const latest = { hash: (scenario === "head" ? "b" : scenario === "ancestor" ? "a" : "c").repeat(64), at: "2026-09-30T12:00:00.000Z" };
   const generateReport = vi.fn<CliDeps["generateReport"]>(async store => { await store.verify(); return { pdfPath: "pack/report.pdf", csvPath: "pack/records.csv" }; });
   const r = run(["report", "--dir", dir, "--from", "2026-09-30T00:00:00Z", "--to", "2026-10-01T00:00:00Z", "--out", "pack"], { createLedger: () => ledger, createAnchor: () => ({ latest: async () => latest, write: vi.fn() }), generateReport });
-  expect(await r.result).toBe(scenario === "untrusted" ? 1 : 0);
+  expect(await r.result).toBe(["untrusted", "mismatch"].includes(scenario) ? 1 : 0);
   expect(generateReport.mock.calls[0]![3]).toEqual({ anchor: { status: scenario, latest } });
   expect(JSON.parse(r.output()).anchor.status).toBe(scenario);
 });
@@ -393,4 +393,27 @@ describe("--ledger <postgres url> (Slice 2a pin 7; createLedger injected through
     const segments = u.replace(/^Usage: agent-ledger /, "").trim().split(" | ");
     expect(segments.filter(s => s.includes("--ledger")).map(s => s.split(" ")[0])).toEqual(["anchor", "verify", "report"]);
   });
+});
+
+it("C2/C3: truncation remains a mismatch after refused re-anchor and writes a failing diagnostic pack", async () => {
+  const dir = await initialized(), path = join(dir, "ledger", "records.jsonl");
+  const ledger = createLedger("jsonl", path);
+  const { unsealed } = await import("./helpers/ledger-fixtures.js");
+  await ledger.append(unsealed(1));
+  const prefix = await readFile(path);
+  await ledger.append(unsealed(2));
+  expect(await run(["anchor", "--dir", dir]).result).toBe(0);
+  const checkpoint = await readFile(join(dir, "anchors.jsonl"));
+  await writeFile(path, prefix);
+  expect(await run(["verify", "--dir", dir]).result).toBe(1);
+  const attempt = run(["anchor", "--dir", dir]);
+  expect(await attempt.result).toBe(1);
+  expect(JSON.parse(attempt.output()).reason).toBe("anchor-mismatch");
+  expect(await readFile(join(dir, "anchors.jsonl"))).toEqual(checkpoint);
+  expect(await run(["verify", "--dir", dir]).result).toBe(1);
+  const out = join(dir, "diagnostic");
+  expect(await run(["report", "--dir", dir, "--from", "2020-01-01T00:00:00Z", "--to", "2090-01-01T00:00:00Z", "--out", out]).result).toBe(1);
+  expect(await readFile(join(out, "report.html"), "utf8")).toContain("MISMATCH");
+  expect((await stat(join(out, "report.pdf"))).size).toBeGreaterThan(0);
+  expect((await stat(join(out, "records.csv"))).size).toBeGreaterThan(0);
 });

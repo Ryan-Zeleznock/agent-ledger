@@ -92,3 +92,10 @@ Null/non-object `args` are treated as an empty argument mapping. Unknown classes
 registries receive the complete `require_approval / unreviewed` decision.
 The ReDoS regression runs in a supervised child with a 2-second SIGKILL deadline; the reported
 pattern must be refused or its 41-character attack must escalate in under 50 ms.
+
+
+Security round C8 (2026-10-05): the shared config reader limits files to 1 MiB, including growth
+after the descriptor's size check, decodes UTF-8 fatally, and rejects symlinks and non-regular files.
+YAML is limited to 100,000 AST nodes and 64 levels before conversion; aliases are refused to prevent
+expansion/cycles. Existing owner/mode checks still use the descriptor being read. Oversized historical
+configuration now fails explicitly. Tests: `test/config-hardening.test.ts`, `test/core-security.test.ts`.

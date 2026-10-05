@@ -51,7 +51,8 @@ CC7.2: their placeholder allow/unreviewed policy is not a second access/approval
   they are findings to investigate, not automatic proof of bypass.
 - Orphan detection reads prior available history (supported timestamps from year 0100) and requires
   a preceding intent for the outcome's callId. A standalone blocked outcome can be a valid denial.
-  Intent/outcome joins use callId, **not** `parentRecordId`, which links neighboring chain records.
+  Intent/outcome joins use callId, agentId, sessionId and optional agentSessionId in ledger order;
+  `parentRecordId` links neighboring chain records.
 - An intent with no observed outcome through the grace boundary is listed separately. `delegated`
   means a terminal ask, **not** a recorded approval; no outcome cannot distinguish denial,
   cancellation and lost telemetry. Codex `ok` means ran-and-returned, not necessarily success.
@@ -118,8 +119,8 @@ grace window. Pre-1c records are never counted as sessions without heartbeat.
 Outcome joins still stop at range end plus 60 seconds; future outcomes beyond grace do not
 turn an unobserved action into observed execution. Orphans require a preceding tool intent;
 an orphan in a heartbeated session is labelled "intent gap". No collector provenance or
-transactional snapshot is implied. The report uses the latest observed outcome for an intent;
-a reused callId remains ambiguous. Handoff placeholders are excluded from tool decision counts.
+transactional snapshot is implied. The report attaches each outcome to the latest preceding intent with matching callId, agentId,
+sessionId and optional agentSessionId, then keeps the latest outcome for that intent record. Handoff placeholders are excluded from tool decision counts.
 
 `delegated` and `require_approval` indicate an ask, not a named terminal approval. Recorded
 approvals count only `approved`; denial counts group policy, no-channel, Slack decisions and
@@ -225,3 +226,13 @@ ADR-015 amendment (2026-10-05): CC8.1 renders `approved, Ryan Zeleznock (U0C6UV8
 Fable review P2-1 (2026-10-05): the HTML CC8.1 approval cell wraps only the escaped display name in `<bdi>`, leaving
 the member id outside its direction context. This also isolates controls in older stored names; PDF/CSV preserve their
 existing text representation. Tests cover RLO in historical names, ordinary RTL names, id-like name text and HTML escaping.
+
+
+Security round C5/C8 (2026-10-05): outcome lookup is scoped by identity and session and stored by
+intent record ID. A later reused callId cannot borrow a preceding call's outcome or another agent's
+execution. Full reuse of all identifiers remains correlation, not proof of provenance; changing the
+frozen record schema is outside this round. Reports and standalone handoff reconciliation stop before
+rendering when evidence exceeds 10,000 records or 32 MiB of serialized records. The report limit covers
+all history read for heartbeat/orphan evidence, not just the selected range. Oversized input fails
+explicitly and writes no pack; streaming larger histories remains future work. C5 agent/session/order
+and C8 record/byte-budget regressions are in `test/report-slice-1c.test.ts`.

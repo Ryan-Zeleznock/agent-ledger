@@ -1,3 +1,4 @@
+import { evidenceBudget } from "./limits.js";
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import type { DateRange, LedgerRecord } from "../types/index.js";
@@ -99,8 +100,9 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
   const { from, to, extended } = checkedRange(range, HANDOFF_RECONCILE_GRACE_MS);
   const head = await ledger.head(); const verify = await ledger.verify();
   const all: LedgerRecord[] = [];
+  const checkEvidence = evidenceBudget();
   // Pin 8 heartbeat coverage is anywhere in history, including outside the report/grace window.
-  for await (const r of ledger.read({ from: HISTORY_START, to: "9999-12-31T23:59:59.999Z" })) all.push(r);
+  for await (const r of ledger.read({ from: HISTORY_START, to: "9999-12-31T23:59:59.999Z" })) { checkEvidence(r); all.push(r); }
   if (await ledger.head() !== head) throw new Error("Ledger changed during report; retry with writers paused");
   const history = all.filter(r => Date.parse(r.writtenAt) <= Date.parse(extended));
   const records = history.filter(r => Date.parse(r.writtenAt) >= from && Date.parse(r.writtenAt) <= to);
@@ -112,22 +114,23 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
   const missingFirst = new Set(missing.map(([, rs]) => rs[0]!.id));
   const handoffs = findHandoffs(history.filter(r => Date.parse(r.writtenAt) >= from), range);
   const handoffIds = new Set(handoffs.map(h => h.hookRecordId));
+  const correlationKey = (r: LedgerRecord) => JSON.stringify([r.call.callId, r.call.agentId, r.call.sessionId, r.call.agentSessionId ?? null]);
   const intents = new Map<string, LedgerRecord>(), outcomes = new Map<string, LedgerRecord>();
   const orphanIds = new Set<string>();
   const precedingIntent = new Map<string, LedgerRecord>();
   for (const r of history) {
-    if (r.phase === "intent" && !isHeartbeat(r)) intents.set(r.call.callId, r);
+    if (r.phase === "intent" && !isHeartbeat(r)) intents.set(correlationKey(r), r);
     else if (r.phase === "outcome") {
-      const intent = intents.get(r.call.callId);
+      const intent = intents.get(correlationKey(r));
       if (!intent) orphanIds.add(r.id); else precedingIntent.set(r.id, intent);
-      outcomes.set(r.call.callId, r);
+      if (intent) outcomes.set(intent.id, r);
     }
   }
   const orphans = records.filter(r => orphanIds.has(r.id));
-  const unobserved = tools.filter(r => !outcomes.has(r.call.callId));
+  const unobserved = tools.filter(r => !outcomes.has(r.id));
   const unobservedIds = new Set(unobserved.map(r => r.id));
   const label = (r: LedgerRecord) => {
-    if (r.phase === "intent") return evidenceClass(r, outcomes.get(r.call.callId));
+    if (r.phase === "intent") return evidenceClass(r, outcomes.get(r.id));
     // Orphans carry no reconstructed approval/policy decision, except the explicit auto-mode cause.
     const intent = precedingIntent.get(r.id);
     return intent ? evidenceClass(intent, r) : r.outcome?.status === "blocked" && r.outcome.errorClass === "permission-denied:auto-mode" ? "denied: auto mode" : "";
@@ -274,7 +277,7 @@ export async function renderReport(ledger: LedgerStore, range: DateRange, outDir
       detailTable("Orphan outcomes", ["record_id", "call_id", "agent_session_id", "finding"], orphans.map(r => [r.id, r.call.callId, sessionLabel(r), heartbeatSessions.has(agentSession(r) ?? "") ? "intent gap" : "orphan outcome"])) +
       detailTable("Unreconciled handoffs", ["call_id", "proxy_server_name", "hook_record_id", "handed_off_at"], handoffs.map(h => [h.callId, h.proxyServerName, h.hookRecordId, h.handedOffAt])) +
       detailTable("Intents with no outcome observed", ["record_id", "call_id"], unobserved.map(r => [r.id, r.call.callId]))),
-    section("cc8-1", "CC8.1 change management", () => text(["[V] Scope: controlled, authorized changes (AICPA TSC, printed p. 44). [H] Mapping: write/risky/unreviewed tool decisions; a shell call need not be a production change."]) + table(["written_at", "agent_session_id", "server/tool", "risk", "approval (decision, approver)", "outcome (status, errorClass)", "evidence_class"], tools.filter(r => r.policy.risk !== "read").map(r => [r.writtenAt, sessionLabel(r), `${r.call.server}/${r.call.tool}`, r.policy.risk, approvalLabel(r), outcomes.get(r.call.callId)?.outcome ? json(outcomes.get(r.call.callId)!.outcome) : "no outcome observed", label(r)]), "Change decisions", true, tools.filter(r => r.policy.risk !== "read")) + text([denial])),
+    section("cc8-1", "CC8.1 change management", () => text(["[V] Scope: controlled, authorized changes (AICPA TSC, printed p. 44). [H] Mapping: write/risky/unreviewed tool decisions; a shell call need not be a production change."]) + table(["written_at", "agent_session_id", "server/tool", "risk", "approval (decision, approver)", "outcome (status, errorClass)", "evidence_class"], tools.filter(r => r.policy.risk !== "read").map(r => [r.writtenAt, sessionLabel(r), `${r.call.server}/${r.call.tool}`, r.policy.risk, approvalLabel(r), outcomes.get(r.id)?.outcome ? json(outcomes.get(r.id)!.outcome) : "no outcome observed", label(r)]), "Change decisions", true, tools.filter(r => r.policy.risk !== "read")) + text([denial])),
     section("records", "Record evidence", () => {
       // Presentation derives from the unchanged CSV projection; retain every non-empty source field.
       const compact = table(["Chain", "Time", "Phase", "Tool", "Decision", "Evidence class", "Criteria"], records.map((r, i) => [`${reference(i)}\nprev ${display(r.prevHash).slice(0, 12)}\nhash ${display(r.hash).slice(0, 12)}`, r.writtenAt, r.phase, r.call.tool, isHeartbeat(r) ? "health record" : r.handoff ? "handoff" : r.policy.verdict, label(r), rows[i]![16]!]), "Record index; full fields follow in numbered details", false, records);

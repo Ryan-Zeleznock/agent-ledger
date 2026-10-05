@@ -11,6 +11,7 @@ import type { ToolRegistry } from "../src/policy/contract.js";
 import type { ApprovalResult, IncomingCall, LedgerRecord, SessionHeartbeat, ToolCall, ToolResult, UnsealedRecord } from "../src/types/index.js";
 import { APPROVAL_DECISIONS, CODEX_MCP_NOT_PROXIED_REASON, HANDOFF_TO_PROXY_REASON, HEARTBEAT_REASON, HEARTBEAT_RULE_ID, HEARTBEAT_TOOL, PERMISSION_DENIED_ERROR_CLASS, PROXY_NO_CHANNEL_REASON } from "../src/types/index.js";
 import * as approvalsMod from "../src/approvals/contract.js";
+import { UpstreamError } from "../src/upstream/contract.js";
 
 // The approvals module is a stub until the Slack slice; the pipeline's contract with it is what these tests pin.
 vi.mock("../src/approvals/contract.js", () => ({
@@ -81,6 +82,57 @@ afterEach(() => { delete process.env[WATCHDOG_DEADLINE_AT_ENV]; delete process.e
 
 const intents = () => ledger.records.filter((r) => r.phase === "intent");
 const outcomes = () => ledger.records.filter((r) => r.phase === "outcome");
+
+it("C1: real pipeline redacts clear values and secret-bearing argument names before approval", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipeline-security-"));
+  try {
+    const real = createLedger("jsonl", join(dir, "ledger.jsonl"));
+    const reviewed = structuredClone(registry);
+    reviewed.servers.github!.tools.delete_repo!.storeArgs = ["description"];
+    const p = createPipeline(deps({ ledger: real, registry: reviewed, hookAgent: undefined, approvals: slack }));
+    requestApproval.mockImplementation(async c => approval("approved")(c.callId));
+    const secret = "password=clear-field-canary";
+    const secretName = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+    await p.handle(call("github", "delete_repo", { description: secret, password: "withheld" }));
+    await p.handle(call("unknown", "unreviewed", { [secretName]: "withheld" }));
+    expect(requestApproval).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(requestApproval.mock.calls)).not.toContain("clear-field-canary");
+    expect(JSON.stringify(requestApproval.mock.calls)).not.toContain(secretName);
+    expect(requestApproval.mock.calls[0]![0].args.password).toMatch(/^hmac-sha256:[a-f0-9]{64}$/);
+    expect(Object.values(requestApproval.mock.calls[1]![0].args)[0]).toMatch(/^hmac-sha256:[a-f0-9]{64}$/);
+    expect(upstream.execute.mock.calls[0]![0].args.description).toBe(secret);
+    expect(upstream.execute.mock.calls[1]![0].args).toHaveProperty(secretName);
+    expect((await real.verify()).ok).toBe(true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it("C1: ledger failures return value-free agent errors", async () => {
+  ledger.append.mockRejectedValue(new Error("password=ledger-error-canary"));
+  const p = createPipeline(deps({ ledger: ledger as never }));
+  const answer = await p.decide(call("github", "list_repos"));
+  expect(answer.decision).toBe("deny");
+  expect(answer.reason).toContain("ledger unavailable");
+  expect(answer.reason).not.toContain("ledger-error-canary");
+});
+
+it("C1/F1: preserves the contracted UpstreamError message exactly", async () => {
+  const message = "upstream demo: tools/call failed (JSON-RPC error -32000)";
+  upstream.execute.mockRejectedValueOnce(new UpstreamError(message));
+  const p = createPipeline(deps({ ledger: ledger as never, hookAgent: undefined, approvals: { kind: "none" } }));
+  expect(await p.handle(call("github", "list_repos"))).toEqual({
+    content: [{ type: "text", text: `agent-ledger: upstream failed: ${message}` }], isError: true,
+  });
+  expect(outcomes()[0]!.outcome).toMatchObject({ status: "error", errorClass: "UpstreamError" });
+});
+
+it.each(["Error", "UpstreamError"])("C1/F1: strips non-UpstreamError messages even with name %s", async name => {
+  const error = new Error("password=upstream-error-canary"); error.name = name;
+  upstream.execute.mockRejectedValueOnce(error);
+  const p = createPipeline(deps({ ledger: ledger as never, hookAgent: undefined, approvals: { kind: "none" } }));
+  expect(await p.handle(call("github", "list_repos"))).toEqual({
+    content: [{ type: "text", text: "agent-ledger: upstream failed" }], isError: true,
+  });
+});
 
 describe("createPipeline: construction-time refusals", () => {
   it("argsHmacKey shorter than 32 bytes, or not a Uint8Array, throws (ADR-009 amendment)", () => {
@@ -239,7 +291,7 @@ describe("decide(): mapping, records, no upstream", () => {
       ledger.failNext = 1;
       const d = await p.decide(call(s!, t!));
       expect(d.decision, `${s}/${t}`).toBe("deny");
-      expect(d.reason).toMatch(/ledger unavailable \(ledger: lock is held\); fail closed/);
+      expect(d.reason).toMatch(/ledger unavailable; fail closed/);
     }
     expect(ledger.records).toEqual([]);
   });
@@ -338,7 +390,7 @@ describe("decide(): Slack approvals (module mocked; the pipeline's contract with
     const p = codexSlack();
     const d = await p.decide(call("builtin:codex", "Bash", {}, "s3"));
     expect(d.decision).toBe("deny");
-    expect(intents()[0]!.approval).toMatchObject({ decision: "unavailable", reason: expect.stringContaining("ECONNRESET"), channel: "slack" });
+    expect(intents()[0]!.approval).toMatchObject({ decision: "unavailable", reason: "Slack unreachable", channel: "slack" });
     expect(outcomes()[0]!.outcome).toEqual({ status: "blocked" });
   });
   it("denied by U… → denied with approver and reason; timeout → timeout; every Codex approval.decision is in the final set (never delegated)", async () => {
@@ -778,4 +830,18 @@ describe("ADR-009 + pin 1: argument projection (clear fields kept, everything el
     expect(src).not.toMatch(/suggestions|suggestClass|loadSuggestions/);
     expect(src).toMatch(/evaluate\(registry, rawCall\)/);
   });
+});
+
+it.each(["agent", "session", "agentSession", "ordering"])("C5: ambiguous hook outcomes remain orphaned across %s", async boundary => {
+  const p = createPipeline(deps({ ledger: ledger as never }));
+  await p.decide({ ...call("builtin:claude-code", "Bash", {}, "reused"), agentSessionId: "first-session" });
+  const otherIdentity = {
+    resolveAgent: async () => boundary === "agent" ? "other-agent" : "fable",
+    startSession: async () => boundary === "session" ? "other-session" : "sess-1",
+  };
+  const later = createPipeline(deps({ ledger: ledger as never, identity: otherIdentity }));
+  await later.decide({ ...call("builtin:claude-code", "Bash", {}, "reused"), agentSessionId: boundary === "agentSession" ? "later-session" : "first-session" });
+  await p.recordOutcome("reused", { status: "ok" });
+  expect(outcomes()[0]!.call.agentId).toBe("unknown");
+  expect(outcomes()[0]!.policy.ruleId).toBe(`${ORPHAN_OUTCOME_RULE_PREFIX}reused`);
 });

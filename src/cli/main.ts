@@ -269,7 +269,7 @@ export async function main(argv: string[] = process.argv.slice(2), overrides: Pa
       if (!chain) throw new Error("Report did not verify the ledger");
       if (own.ok && await ledger.head() !== before) throw new Error("Ledger changed; retry");
       deps.stdout(JSON.stringify({ ...files, htmlPath: join(outDir!, "report.html"), chain, anchor }) + "\n");
-      return chain.ok ? 0 : 1;
+      return chain.ok && anchor.status !== "mismatch" ? 0 : 1;
     }
     if (name === "verify") {
       let before: string | null = null;
@@ -287,13 +287,16 @@ export async function main(argv: string[] = process.argv.slice(2), overrides: Pa
       let before: string | null = null;
       try { before = await ledger.head(); } catch { /* a damaged tail is a chain failure below */ }
       const chain = await ledger.verify();
-      const refuse = (reason: "chain-failed" | "empty-ledger" | "ledger-changed") => { deps.stdout(JSON.stringify({ anchored: false, reason, chain }) + "\n"); return 1; };
+      const refuse = (reason: "chain-failed" | "empty-ledger" | "ledger-changed" | "anchor-mismatch") => { deps.stdout(JSON.stringify({ anchored: false, reason, chain }) + "\n"); return 1; };
       if (!chain.ok) return refuse("chain-failed");
       if (before === null) throw new Error("Unable to capture ledger head");
       if (before === "0") return refuse("empty-ledger");
       if (await ledger.head() !== before) return refuse("ledger-changed");
       const anchor = deps.createAnchor("file", anchorsPath);
-      const previous = await anchor.latest(); // a torn anchor file throws here (exit 1); the anchor module never truncates
+      const state = await anchorState(ledger, anchor, before, chain.ok);
+      if (state.status === "mismatch") return refuse("anchor-mismatch");
+      if (await ledger.head() !== before) return refuse("ledger-changed");
+      const previous = state.latest;
       const entry: AnchorEntry = { hash: before, at: new Date().toISOString() };
       await anchor.write(entry);
       deps.stdout(JSON.stringify({ anchored: true, entry, line: canonicalize(entry), previous, chain, path: anchorsPath, note: ANCHOR_NOTE }) + "\n");

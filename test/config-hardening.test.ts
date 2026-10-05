@@ -56,7 +56,7 @@ it.skipIf(process.platform === "win32").each([0o666, 0o664, 0o646])("refuses wri
 it.skipIf(process.platform === "win32")("refuses a different owner for both loaders (mocked stat uid)", async () => {
   const policy = file(registry()), identity = file(agents);
   const stat = fs.fstatSync;
-  vi.spyOn(fs, "fstatSync").mockImplementation(((...args: Parameters<typeof stat>) => ({ ...stat(...args), uid: process.getuid!() + 1 })) as typeof stat);
+  vi.spyOn(fs, "fstatSync").mockImplementation(((...args: Parameters<typeof stat>) => Object.assign(stat(...args), { uid: process.getuid!() + 1 })) as typeof stat);
   await expect(loadRegistry(policy)).rejects.toThrow(/permissions/);
   expect(() => createIdentity("file", identity)).toThrow(/permissions/);
 });
