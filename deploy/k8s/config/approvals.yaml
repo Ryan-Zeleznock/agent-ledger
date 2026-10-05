@@ -2,6 +2,6 @@
 # #agent-ledger-approvals channel; each approver's Slack member id). No tokens here: they are the `slack-tokens` Secret.
 version: 1
 slack:
-  channelId: C0000000000        # PLACEHOLDER
-  approvers: [U0000000000]      # PLACEHOLDER
+  channelId: C0C6MQS08CV        # #agent-ledger-approvals (Lab workspace), set 2026-10-05
+  approvers: [U0C6UV8NMR7]      # Ryan, set 2026-10-05
   timeoutMs: 180000
